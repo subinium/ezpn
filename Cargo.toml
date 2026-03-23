@@ -1,0 +1,18 @@
+[package]
+name = "ezpn"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Dead simple terminal pane splitting — ezpn 2 3 gives you a 2x3 grid of shells"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/subinium/ezpn"
+homepage = "https://github.com/subinium/ezpn"
+keywords = ["terminal", "pane", "multiplexer", "tui", "cli"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+portable-pty = "0.8"
+vt100 = "0.15"
+crossterm = "0.28"
+anyhow = "1"

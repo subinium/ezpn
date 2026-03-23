@@ -1,0 +1,676 @@
+use std::collections::HashMap;
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Direction {
+    Horizontal, // panes arranged left | right
+    Vertical,   // panes arranged top / bottom
+}
+
+#[derive(Clone)]
+pub enum LayoutNode {
+    Leaf {
+        id: usize,
+    },
+    Split {
+        direction: Direction,
+        ratio: f32,
+        first: Box<LayoutNode>,
+        second: Box<LayoutNode>,
+    },
+}
+
+impl Default for LayoutNode {
+    fn default() -> Self {
+        LayoutNode::Leaf { id: 0 }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Rect {
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+}
+
+#[derive(Clone, Copy)]
+pub enum NavDir {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+pub struct SepLine {
+    pub horizontal: bool,
+    pub x: u16,
+    pub y: u16,
+    pub length: u16,
+}
+
+/// Result of hitting a separator line (for drag-to-resize).
+pub struct SepHit {
+    pub path: Vec<bool>,      // tree path: false=first, true=second
+    pub direction: Direction, // split direction (H or V)
+    pub area: Rect,           // content area of the Split node
+}
+
+pub struct Layout {
+    pub root: LayoutNode,
+    pub next_id: usize,
+}
+
+impl Layout {
+    pub fn from_grid(rows: usize, cols: usize) -> Self {
+        let mut next_id = 0;
+        let root = build_grid(rows, cols, &mut next_id);
+        Layout { root, next_id }
+    }
+
+    pub fn pane_ids(&self) -> Vec<usize> {
+        let mut ids = Vec::new();
+        collect_ids(&self.root, &mut ids);
+        ids
+    }
+
+    pub fn pane_count(&self) -> usize {
+        count_leaves(&self.root)
+    }
+
+    /// Content rects for all panes (area inside borders).
+    pub fn pane_rects(&self, inner: &Rect) -> HashMap<usize, Rect> {
+        let mut rects = HashMap::new();
+        collect_rects(&self.root, inner, &mut rects);
+        rects
+    }
+
+    /// Separator lines (for border rendering).
+    pub fn separators(&self, inner: &Rect, outer: &Rect) -> Vec<SepLine> {
+        let mut seps = Vec::new();
+        collect_seps(&self.root, inner, outer, &mut seps);
+        seps
+    }
+
+    /// Find pane at a screen position (checks content rects).
+    pub fn find_at(&self, x: u16, y: u16, inner: &Rect) -> Option<usize> {
+        find_at_node(&self.root, x, y, inner)
+    }
+
+    /// Split a pane. Returns new pane ID. Auto-equalizes ratios.
+    pub fn split(&mut self, target_id: usize, dir: Direction) -> usize {
+        let new_id = self.next_id;
+        self.next_id += 1;
+        let old = std::mem::take(&mut self.root);
+        self.root = split_node(old, target_id, new_id, dir);
+        self.equalize(); // auto-equalize after split
+        new_id
+    }
+
+    /// Equalize all pane sizes: set each split ratio so every leaf gets equal space.
+    pub fn equalize(&mut self) {
+        equalize_node(&mut self.root);
+    }
+
+    /// Remove a pane (collapses parent split). Returns false if it's the last pane.
+    pub fn remove(&mut self, target_id: usize) -> bool {
+        if self.pane_count() <= 1 {
+            return false;
+        }
+        let old = std::mem::take(&mut self.root);
+        if let Some(new_root) = remove_node(old, target_id) {
+            self.root = new_root;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Find which separator is at screen position (for drag-to-resize).
+    pub fn find_separator_at(&self, x: u16, y: u16, inner: &Rect) -> Option<SepHit> {
+        let mut path = Vec::new();
+        find_sep_at(&self.root, x, y, inner, &mut path)
+    }
+
+    /// Update the ratio of a Split node identified by tree path.
+    pub fn set_ratio_at_path(&mut self, path: &[bool], ratio: f32) {
+        set_ratio_at(&mut self.root, path, ratio);
+    }
+
+    /// Navigate to the nearest pane in a direction.
+    pub fn navigate(&self, from_id: usize, nav: NavDir, inner: &Rect) -> Option<usize> {
+        let rects = self.pane_rects(inner);
+        let from = rects.get(&from_id)?;
+        rects
+            .iter()
+            .filter(|(&id, r)| id != from_id && is_adjacent(from, r, nav))
+            .min_by_key(|(_, r)| nav_distance(from, r, nav))
+            .map(|(&id, _)| id)
+    }
+
+    /// Next pane ID in tree order (for cycling).
+    pub fn next_pane(&self, current: usize) -> usize {
+        let ids = self.pane_ids();
+        if ids.is_empty() {
+            return current;
+        }
+        let pos = ids.iter().position(|&id| id == current).unwrap_or(0);
+        ids[(pos + 1) % ids.len()]
+    }
+}
+
+// ─── Tree Construction ─────────────────────────────────────
+
+fn build_grid(rows: usize, cols: usize, next_id: &mut usize) -> LayoutNode {
+    if rows == 1 {
+        return build_row(cols, next_id);
+    }
+    LayoutNode::Split {
+        direction: Direction::Vertical,
+        ratio: 1.0 / rows as f32,
+        first: Box::new(build_row(cols, next_id)),
+        second: Box::new(build_grid(rows - 1, cols, next_id)),
+    }
+}
+
+fn build_row(cols: usize, next_id: &mut usize) -> LayoutNode {
+    if cols == 1 {
+        let id = *next_id;
+        *next_id += 1;
+        return LayoutNode::Leaf { id };
+    }
+    let id = *next_id;
+    *next_id += 1;
+    LayoutNode::Split {
+        direction: Direction::Horizontal,
+        ratio: 1.0 / cols as f32,
+        first: Box::new(LayoutNode::Leaf { id }),
+        second: Box::new(build_row(cols - 1, next_id)),
+    }
+}
+
+// ─── Equalize ──────────────────────────────────────────────
+
+fn equalize_node(node: &mut LayoutNode) {
+    if let LayoutNode::Split {
+        ratio,
+        first,
+        second,
+        ..
+    } = node
+    {
+        let left = count_leaves(first);
+        let total = left + count_leaves(second);
+        *ratio = left as f32 / total as f32;
+        equalize_node(first);
+        equalize_node(second);
+    }
+}
+
+// ─── Rect Calculation ──────────────────────────────────────
+
+fn collect_ids(node: &LayoutNode, ids: &mut Vec<usize>) {
+    match node {
+        LayoutNode::Leaf { id } => ids.push(*id),
+        LayoutNode::Split { first, second, .. } => {
+            collect_ids(first, ids);
+            collect_ids(second, ids);
+        }
+    }
+}
+
+fn count_leaves(node: &LayoutNode) -> usize {
+    match node {
+        LayoutNode::Leaf { .. } => 1,
+        LayoutNode::Split { first, second, .. } => count_leaves(first) + count_leaves(second),
+    }
+}
+
+fn collect_rects(node: &LayoutNode, area: &Rect, out: &mut HashMap<usize, Rect>) {
+    match node {
+        LayoutNode::Leaf { id } => {
+            out.insert(*id, area.clone());
+        }
+        LayoutNode::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } => {
+            let (a1, a2) = split_area(area, *direction, *ratio);
+            collect_rects(first, &a1, out);
+            collect_rects(second, &a2, out);
+        }
+    }
+}
+
+pub fn split_area(area: &Rect, dir: Direction, ratio: f32) -> (Rect, Rect) {
+    match dir {
+        Direction::Horizontal => {
+            let usable = area.w.saturating_sub(1); // 1 cell for separator
+            if usable < 2 {
+                return (area.clone(), Rect { w: 0, ..*area });
+            }
+            let fw = ((usable as f32 * ratio).round() as u16).clamp(1, usable - 1);
+            let sw = usable - fw;
+            (
+                Rect { w: fw, ..*area },
+                Rect {
+                    x: area.x + fw + 1,
+                    w: sw,
+                    ..*area
+                },
+            )
+        }
+        Direction::Vertical => {
+            let usable = area.h.saturating_sub(1);
+            if usable < 2 {
+                return (area.clone(), Rect { h: 0, ..*area });
+            }
+            let fh = ((usable as f32 * ratio).round() as u16).clamp(1, usable - 1);
+            let sh = usable - fh;
+            (
+                Rect { h: fh, ..*area },
+                Rect {
+                    y: area.y + fh + 1,
+                    h: sh,
+                    ..*area
+                },
+            )
+        }
+    }
+}
+
+// ─── Separators ────────────────────────────────────────────
+
+fn collect_seps(node: &LayoutNode, area: &Rect, outer: &Rect, seps: &mut Vec<SepLine>) {
+    if let LayoutNode::Split {
+        direction,
+        ratio,
+        first,
+        second,
+    } = node
+    {
+        let (a1, a2) = split_area(area, *direction, *ratio);
+
+        match direction {
+            Direction::Horizontal => {
+                let sx = a1.x + a1.w;
+                let y0 = area.y.saturating_sub(1).max(outer.y);
+                let y1 = (area.y + area.h).min(outer.y + outer.h - 1);
+                seps.push(SepLine {
+                    horizontal: false,
+                    x: sx,
+                    y: y0,
+                    length: y1.saturating_sub(y0) + 1,
+                });
+            }
+            Direction::Vertical => {
+                let sy = a1.y + a1.h;
+                let x0 = area.x.saturating_sub(1).max(outer.x);
+                let x1 = (area.x + area.w).min(outer.x + outer.w - 1);
+                seps.push(SepLine {
+                    horizontal: true,
+                    x: x0,
+                    y: sy,
+                    length: x1.saturating_sub(x0) + 1,
+                });
+            }
+        }
+
+        collect_seps(first, &a1, outer, seps);
+        collect_seps(second, &a2, outer, seps);
+    }
+}
+
+// ─── Hit Testing ───────────────────────────────────────────
+
+fn find_at_node(node: &LayoutNode, x: u16, y: u16, area: &Rect) -> Option<usize> {
+    match node {
+        LayoutNode::Leaf { id } => {
+            if x >= area.x && x < area.x + area.w && y >= area.y && y < area.y + area.h {
+                Some(*id)
+            } else {
+                None
+            }
+        }
+        LayoutNode::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } => {
+            let (a1, a2) = split_area(area, *direction, *ratio);
+            find_at_node(first, x, y, &a1).or_else(|| find_at_node(second, x, y, &a2))
+        }
+    }
+}
+
+// ─── Separator Hit Detection (Drag-to-Resize) ────────────
+
+fn find_sep_at(
+    node: &LayoutNode,
+    x: u16,
+    y: u16,
+    area: &Rect,
+    path: &mut Vec<bool>,
+) -> Option<SepHit> {
+    if let LayoutNode::Split {
+        direction,
+        ratio,
+        first,
+        second,
+    } = node
+    {
+        let (a1, a2) = split_area(area, *direction, *ratio);
+
+        // Check if (x, y) is on this split's separator (±1 cell tolerance)
+        let on_sep = match direction {
+            Direction::Horizontal => {
+                let sep_x = a1.x + a1.w;
+                x == sep_x && y >= area.y && y < area.y + area.h
+            }
+            Direction::Vertical => {
+                let sep_y = a1.y + a1.h;
+                y == sep_y && x >= area.x && x < area.x + area.w
+            }
+        };
+
+        if on_sep {
+            return Some(SepHit {
+                path: path.clone(),
+                direction: *direction,
+                area: area.clone(),
+            });
+        }
+
+        // Recurse into children
+        path.push(false);
+        if let Some(hit) = find_sep_at(first, x, y, &a1, path) {
+            return Some(hit);
+        }
+        path.pop();
+
+        path.push(true);
+        if let Some(hit) = find_sep_at(second, x, y, &a2, path) {
+            return Some(hit);
+        }
+        path.pop();
+    }
+    None
+}
+
+fn set_ratio_at(node: &mut LayoutNode, path: &[bool], ratio: f32) {
+    if path.is_empty() {
+        if let LayoutNode::Split { ratio: r, .. } = node {
+            *r = ratio.clamp(0.1, 0.9);
+        }
+    } else if let LayoutNode::Split { first, second, .. } = node {
+        if !path[0] {
+            set_ratio_at(first, &path[1..], ratio);
+        } else {
+            set_ratio_at(second, &path[1..], ratio);
+        }
+    }
+}
+
+// ─── Tree Modification ────────────────────────────────────
+
+fn split_node(node: LayoutNode, target: usize, new_id: usize, dir: Direction) -> LayoutNode {
+    match node {
+        LayoutNode::Leaf { id } if id == target => LayoutNode::Split {
+            direction: dir,
+            ratio: 0.5,
+            first: Box::new(LayoutNode::Leaf { id }),
+            second: Box::new(LayoutNode::Leaf { id: new_id }),
+        },
+        LayoutNode::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } => LayoutNode::Split {
+            direction,
+            ratio,
+            first: Box::new(split_node(*first, target, new_id, dir)),
+            second: Box::new(split_node(*second, target, new_id, dir)),
+        },
+        other => other,
+    }
+}
+
+fn remove_node(node: LayoutNode, target: usize) -> Option<LayoutNode> {
+    match node {
+        LayoutNode::Leaf { id } if id == target => None,
+        LayoutNode::Split {
+            first,
+            second,
+            direction,
+            ratio,
+        } => {
+            if contains(&first, target) {
+                match remove_node(*first, target) {
+                    Some(f) => Some(LayoutNode::Split {
+                        direction,
+                        ratio,
+                        first: Box::new(f),
+                        second,
+                    }),
+                    None => Some(*second),
+                }
+            } else if contains(&second, target) {
+                match remove_node(*second, target) {
+                    Some(s) => Some(LayoutNode::Split {
+                        direction,
+                        ratio,
+                        first,
+                        second: Box::new(s),
+                    }),
+                    None => Some(*first),
+                }
+            } else {
+                Some(LayoutNode::Split {
+                    direction,
+                    ratio,
+                    first,
+                    second,
+                })
+            }
+        }
+        other => Some(other),
+    }
+}
+
+fn contains(node: &LayoutNode, target: usize) -> bool {
+    match node {
+        LayoutNode::Leaf { id } => *id == target,
+        LayoutNode::Split { first, second, .. } => {
+            contains(first, target) || contains(second, target)
+        }
+    }
+}
+
+// ─── Navigation ────────────────────────────────────────────
+
+fn is_adjacent(from: &Rect, to: &Rect, dir: NavDir) -> bool {
+    match dir {
+        NavDir::Left => to.x + to.w <= from.x && v_overlap(from, to),
+        NavDir::Right => to.x >= from.x + from.w && v_overlap(from, to),
+        NavDir::Up => to.y + to.h <= from.y && h_overlap(from, to),
+        NavDir::Down => to.y >= from.y + from.h && h_overlap(from, to),
+    }
+}
+
+fn v_overlap(a: &Rect, b: &Rect) -> bool {
+    a.y < b.y + b.h && b.y < a.y + a.h
+}
+
+fn h_overlap(a: &Rect, b: &Rect) -> bool {
+    a.x < b.x + b.w && b.x < a.x + a.w
+}
+
+fn nav_distance(from: &Rect, to: &Rect, dir: NavDir) -> u16 {
+    match dir {
+        NavDir::Left => from.x.saturating_sub(to.x + to.w),
+        NavDir::Right => to.x.saturating_sub(from.x + from.w),
+        NavDir::Up => from.y.saturating_sub(to.y + to.h),
+        NavDir::Down => to.y.saturating_sub(from.y + from.h),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn inner_80x24() -> Rect {
+        Rect {
+            x: 1,
+            y: 1,
+            w: 78,
+            h: 22,
+        }
+    }
+
+    #[test]
+    fn grid_1x1() {
+        let layout = Layout::from_grid(1, 1);
+        assert_eq!(layout.pane_count(), 1);
+        assert_eq!(layout.pane_ids(), vec![0]);
+    }
+
+    #[test]
+    fn grid_2x3() {
+        let layout = Layout::from_grid(2, 3);
+        assert_eq!(layout.pane_count(), 6);
+        assert_eq!(layout.pane_ids(), vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn pane_rects_cover_inner() {
+        let layout = Layout::from_grid(2, 2);
+        let inner = inner_80x24();
+        let rects = layout.pane_rects(&inner);
+        assert_eq!(rects.len(), 4);
+        for rect in rects.values() {
+            assert!(rect.w > 0, "pane width should be > 0");
+            assert!(rect.h > 0, "pane height should be > 0");
+            assert!(rect.x >= inner.x);
+            assert!(rect.y >= inner.y);
+            assert!(rect.x + rect.w <= inner.x + inner.w);
+            assert!(rect.y + rect.h <= inner.y + inner.h);
+        }
+    }
+
+    #[test]
+    fn split_increases_count() {
+        let mut layout = Layout::from_grid(1, 1);
+        assert_eq!(layout.pane_count(), 1);
+        layout.split(0, Direction::Horizontal);
+        assert_eq!(layout.pane_count(), 2);
+        layout.split(0, Direction::Vertical);
+        assert_eq!(layout.pane_count(), 3);
+    }
+
+    #[test]
+    fn remove_decreases_count() {
+        let mut layout = Layout::from_grid(1, 2);
+        assert_eq!(layout.pane_count(), 2);
+        assert!(layout.remove(1));
+        assert_eq!(layout.pane_count(), 1);
+    }
+
+    #[test]
+    fn cannot_remove_last_pane() {
+        let mut layout = Layout::from_grid(1, 1);
+        assert!(!layout.remove(0));
+        assert_eq!(layout.pane_count(), 1);
+    }
+
+    #[test]
+    fn equalize_makes_equal_rects() {
+        let mut layout = Layout::from_grid(1, 3);
+        let inner = inner_80x24();
+        layout.equalize();
+        let rects = layout.pane_rects(&inner);
+        let widths: Vec<u16> = layout
+            .pane_ids()
+            .iter()
+            .filter_map(|id| rects.get(id).map(|r| r.w))
+            .collect();
+        let max_diff = widths.iter().max().unwrap() - widths.iter().min().unwrap();
+        assert!(
+            max_diff <= 1,
+            "widths should differ by at most 1, got {:?}",
+            widths
+        );
+    }
+
+    #[test]
+    fn find_at_returns_correct_pane() {
+        let layout = Layout::from_grid(1, 2);
+        let inner = inner_80x24();
+        let rects = layout.pane_rects(&inner);
+        for (&pid, rect) in &rects {
+            let found = layout.find_at(rect.x + rect.w / 2, rect.y + rect.h / 2, &inner);
+            assert_eq!(
+                found,
+                Some(pid),
+                "clicking center of pane {} should find it",
+                pid
+            );
+        }
+    }
+
+    #[test]
+    fn navigate_horizontal() {
+        let layout = Layout::from_grid(1, 3);
+        let inner = inner_80x24();
+        assert_eq!(layout.navigate(0, NavDir::Right, &inner), Some(1));
+        assert_eq!(layout.navigate(1, NavDir::Right, &inner), Some(2));
+        assert_eq!(layout.navigate(2, NavDir::Left, &inner), Some(1));
+        assert_eq!(layout.navigate(0, NavDir::Left, &inner), None);
+    }
+
+    #[test]
+    fn navigate_vertical() {
+        let layout = Layout::from_grid(2, 1);
+        let inner = inner_80x24();
+        assert_eq!(layout.navigate(0, NavDir::Down, &inner), Some(1));
+        assert_eq!(layout.navigate(1, NavDir::Up, &inner), Some(0));
+    }
+
+    #[test]
+    fn next_pane_cycles() {
+        let layout = Layout::from_grid(1, 3);
+        assert_eq!(layout.next_pane(0), 1);
+        assert_eq!(layout.next_pane(1), 2);
+        assert_eq!(layout.next_pane(2), 0); // wraps
+    }
+
+    #[test]
+    fn separators_count() {
+        let layout = Layout::from_grid(2, 3);
+        let inner = inner_80x24();
+        let outer = Rect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 24,
+        };
+        let seps = layout.separators(&inner, &outer);
+        // 2x3 grid: 2 horizontal separators (between 3 cols) + 1 vertical (between 2 rows)
+        // Actually with binary tree: each Split creates 1 separator
+        // Grid 2x3 tree: V(Row3, Row3) → 1 vertical sep + 2 H-seps per row = 5
+        assert_eq!(seps.len(), 5);
+    }
+
+    #[test]
+    fn set_ratio_and_verify() {
+        let mut layout = Layout::from_grid(1, 2);
+        let inner = inner_80x24();
+        layout.set_ratio_at_path(&[], 0.3);
+        let rects = layout.pane_rects(&inner);
+        let r0 = &rects[&0];
+        let r1 = &rects[&1];
+        assert!(r0.w < r1.w, "pane 0 should be narrower after 0.3 ratio");
+    }
+}
