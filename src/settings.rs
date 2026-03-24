@@ -5,57 +5,88 @@ use crossterm::{cursor, queue, style::*};
 
 use crate::render::BorderStyle;
 
-const PANEL_W: u16 = 86;
-const PANEL_H: u16 = 24;
+// ─── Layout constants ──────────────────────────────────
 
-const BACKDROP_BG: Color = Color::Rgb { r: 8, g: 10, b: 14 };
-const PANEL_BG: Color = Color::Rgb {
-    r: 18,
-    g: 22,
-    b: 28,
+const W: u16 = 52; // panel width
+const H: u16 = 20; // panel height
+const PAD: u16 = 4; // left/right inner padding
+
+// Item Y offsets (from panel top)
+const Y_TITLE: u16 = 1;
+const Y_HINT: u16 = 2;
+const Y_SEC1: u16 = 4; // "BORDER STYLE"
+const Y_I0: u16 = 5; // Single
+const Y_I1: u16 = 6; // Rounded
+const Y_I2: u16 = 7; // Heavy
+const Y_I3: u16 = 8; // Double
+const Y_DIV1: u16 = 9;
+const Y_SEC2: u16 = 10; // "PANE"
+const Y_I4: u16 = 11; // Split H
+const Y_I5: u16 = 12; // Split V
+const Y_DIV2: u16 = 13;
+const Y_SEC3: u16 = 14; // "DISPLAY"
+const Y_I6: u16 = 15; // Status Bar
+const Y_DIV3: u16 = 16;
+const Y_I7: u16 = 17; // Close
+
+const ITEM_Y: [u16; 8] = [Y_I0, Y_I1, Y_I2, Y_I3, Y_I4, Y_I5, Y_I6, Y_I7];
+const ITEM_COUNT: usize = 8;
+
+// ─── Colors ────────────────────────────────────────────
+
+const BG: Color = Color::Rgb {
+    r: 16,
+    g: 18,
+    b: 24,
 };
-const HEADER_FG: Color = Color::Rgb {
-    r: 240,
-    g: 242,
-    b: 245,
+const FOCUS_BG: Color = Color::Rgb {
+    r: 26,
+    g: 32,
+    b: 44,
 };
-const SECTION_FG: Color = Color::Rgb {
-    r: 120,
-    g: 145,
-    b: 170,
+const SEC_FG: Color = Color::Rgb {
+    r: 75,
+    g: 90,
+    b: 110,
 };
-const LABEL_FG: Color = Color::Rgb {
-    r: 205,
-    g: 214,
-    b: 224,
+const LBL_FG: Color = Color::Rgb {
+    r: 190,
+    g: 200,
+    b: 212,
 };
-const MUTED_FG: Color = Color::Rgb {
-    r: 130,
-    g: 138,
-    b: 148,
+const DIM_FG: Color = Color::Rgb {
+    r: 90,
+    g: 98,
+    b: 110,
 };
-const HIGHLIGHT: Color = Color::Rgb {
+const ACCENT: Color = Color::Rgb {
     r: 102,
     g: 217,
     b: 239,
 };
-const FOCUS_BG: Color = Color::Rgb {
-    r: 28,
-    g: 36,
-    b: 46,
+const DIV_FG: Color = Color::Rgb {
+    r: 36,
+    g: 42,
+    b: 52,
+};
+const WARN_FG: Color = Color::Rgb {
+    r: 255,
+    g: 110,
+    b: 110,
 };
 
-const ITEM_SINGLE: usize = 0;
-const ITEM_ROUNDED: usize = 1;
-const ITEM_HEAVY: usize = 2;
-const ITEM_DOUBLE: usize = 3;
-const ITEM_SPLIT_H: usize = 4;
-const ITEM_SPLIT_V: usize = 5;
-const ITEM_STATUS: usize = 6;
-const ITEM_CLOSE: usize = 7;
-const ITEM_COUNT: usize = 8;
+// ─── Item indices ──────────────────────────────────────
 
-const ITEM_ROWS: [u16; ITEM_COUNT] = [6, 8, 10, 12, 14, 16, 18, 20];
+const I_SINGLE: usize = 0;
+const I_ROUNDED: usize = 1;
+const I_HEAVY: usize = 2;
+const I_DOUBLE: usize = 3;
+const I_SPLIT_H: usize = 4;
+const I_SPLIT_V: usize = 5;
+const I_STATUS: usize = 6;
+const I_CLOSE: usize = 7;
+
+// ─── State ─────────────────────────────────────────────
 
 pub struct Settings {
     pub visible: bool,
@@ -79,19 +110,18 @@ impl Settings {
             visible: false,
             border_style: border,
             show_status_bar: true,
-            focused: ITEM_ROUNDED,
+            focused: I_ROUNDED,
         }
     }
 
     pub fn toggle(&mut self) {
         self.visible = !self.visible;
         if self.visible {
-            // Focus on the currently selected border style
             self.focused = match self.border_style {
-                BorderStyle::Single => ITEM_SINGLE,
-                BorderStyle::Rounded => ITEM_ROUNDED,
-                BorderStyle::Heavy => ITEM_HEAVY,
-                BorderStyle::Double => ITEM_DOUBLE,
+                BorderStyle::Single => I_SINGLE,
+                BorderStyle::Rounded => I_ROUNDED,
+                BorderStyle::Heavy => I_HEAVY,
+                BorderStyle::Double => I_DOUBLE,
             };
         }
     }
@@ -112,353 +142,276 @@ impl Settings {
             }
             KeyCode::Left | KeyCode::Char('h') => self.adjust(-1),
             KeyCode::Right | KeyCode::Char('l') => self.adjust(1),
-            KeyCode::Char('1') => self.select_border(BorderStyle::Single, ITEM_SINGLE),
-            KeyCode::Char('2') => self.select_border(BorderStyle::Rounded, ITEM_ROUNDED),
-            KeyCode::Char('3') => self.select_border(BorderStyle::Heavy, ITEM_HEAVY),
-            KeyCode::Char('4') => self.select_border(BorderStyle::Double, ITEM_DOUBLE),
+            KeyCode::Char('1') => self.set_border(BorderStyle::Single, I_SINGLE),
+            KeyCode::Char('2') => self.set_border(BorderStyle::Rounded, I_ROUNDED),
+            KeyCode::Char('3') => self.set_border(BorderStyle::Heavy, I_HEAVY),
+            KeyCode::Char('4') => self.set_border(BorderStyle::Double, I_DOUBLE),
             KeyCode::Enter | KeyCode::Char(' ') => self.activate(self.focused),
             _ => SettingsAction::None,
         }
     }
 
     pub fn handle_click(&mut self, mx: u16, my: u16, tw: u16, th: u16) -> SettingsAction {
-        let (ox, oy) = panel_origin(tw, th);
-        if mx < ox || mx >= ox + PANEL_W || my < oy || my >= oy + PANEL_H {
+        let (ox, oy) = origin(tw, th);
+        if mx < ox || mx >= ox + W || my < oy || my >= oy + H {
             self.visible = false;
             return SettingsAction::Close;
         }
-
-        for (index, row) in ITEM_ROWS.iter().enumerate() {
-            // Each item occupies 2 rows: [row, row+1]
-            let y0 = oy + row;
-            let y1 = oy + row + 1;
-            if my >= y0 && my <= y1 {
-                self.focused = index;
-                return self.activate(index);
+        for (i, &row) in ITEM_Y.iter().enumerate() {
+            if my == oy + row {
+                self.focused = i;
+                return self.activate(i);
             }
         }
-
         SettingsAction::None
     }
 
+    // ─── Render ────────────────────────────────────────
+
     pub fn render_overlay(&self, stdout: &mut io::Stdout, tw: u16, th: u16) -> anyhow::Result<()> {
-        if tw < PANEL_W + 2 || th < PANEL_H + 2 {
+        if tw < W + 4 || th < H + 2 {
             return Ok(());
         }
+        let (ox, oy) = origin(tw, th);
+        let inner_w = (W - PAD * 2) as usize;
 
-        let (ox, oy) = panel_origin(tw, th);
-
-        // Backdrop: single clear + bg color (instead of per-cell Print)
+        // Backdrop
         queue!(
             stdout,
-            SetBackgroundColor(BACKDROP_BG),
+            SetBackgroundColor(Color::Rgb { r: 4, g: 5, b: 8 }),
             crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
         )?;
 
-        // Panel background: use a pre-built row string
-        let pw = PANEL_W.min(tw.saturating_sub(2));
-        let ph = PANEL_H.min(th.saturating_sub(2));
-        let panel_row: String = " ".repeat(pw as usize);
-        for y in 0..ph {
+        // Panel background
+        let blank = " ".repeat(W as usize);
+        for dy in 0..H {
             queue!(
                 stdout,
-                cursor::MoveTo(ox, oy + y),
-                SetBackgroundColor(PANEL_BG),
-                SetForegroundColor(LABEL_FG),
-                Print(&panel_row)
+                cursor::MoveTo(ox, oy + dy),
+                SetBackgroundColor(BG),
+                Print(&blank)
             )?;
         }
 
-        self.draw_title(stdout, ox, oy)?;
-        self.draw_table_header(stdout, ox, oy + 4)?;
-        self.draw_border_item(
+        let x = ox + PAD; // content left edge
+        let xr = ox + W - PAD; // content right edge
+
+        // Title
+        text(stdout, x, oy + Y_TITLE, BG, Color::White, true, "Settings")?;
+        text(
             stdout,
-            ox,
-            oy + ITEM_ROWS[ITEM_SINGLE],
-            ITEM_SINGLE,
-            BorderStyle::Single,
-            "Single",
-            "clean straight joins",
+            x,
+            oy + Y_HINT,
+            BG,
+            DIM_FG,
+            false,
+            "j/k move  Enter apply  1-4 border  q close",
         )?;
-        self.draw_border_item(
+
+        // Section: Border Style
+        text(stdout, x, oy + Y_SEC1, BG, SEC_FG, true, "BORDER STYLE")?;
+        self.item_border(stdout, x, xr, oy, I_SINGLE, "Single", BorderStyle::Single)?;
+        self.item_border(
             stdout,
-            ox,
-            oy + ITEM_ROWS[ITEM_ROUNDED],
-            ITEM_ROUNDED,
-            BorderStyle::Rounded,
+            x,
+            xr,
+            oy,
+            I_ROUNDED,
             "Rounded",
-            "soft corners, default",
+            BorderStyle::Rounded,
         )?;
-        self.draw_border_item(
-            stdout,
-            ox,
-            oy + ITEM_ROWS[ITEM_HEAVY],
-            ITEM_HEAVY,
-            BorderStyle::Heavy,
-            "Heavy",
-            "high contrast dividers",
-        )?;
-        self.draw_border_item(
-            stdout,
-            ox,
-            oy + ITEM_ROWS[ITEM_DOUBLE],
-            ITEM_DOUBLE,
-            BorderStyle::Double,
-            "Double",
-            "dense framed look",
-        )?;
+        self.item_border(stdout, x, xr, oy, I_HEAVY, "Heavy", BorderStyle::Heavy)?;
+        self.item_border(stdout, x, xr, oy, I_DOUBLE, "Double", BorderStyle::Double)?;
 
-        self.draw_divider(stdout, ox, oy + 13)?;
-        self.draw_action_item(
-            stdout,
-            ox,
-            oy + ITEM_ROWS[ITEM_SPLIT_H],
-            ITEM_SPLIT_H,
-            "Split Left | Right",
-            "Ctrl+D",
-        )?;
-        self.draw_action_item(
-            stdout,
-            ox,
-            oy + ITEM_ROWS[ITEM_SPLIT_V],
-            ITEM_SPLIT_V,
-            "Split Top / Bottom",
-            "Ctrl+E",
-        )?;
+        // Divider + Section: Pane
+        div(stdout, x, oy + Y_DIV1, inner_w)?;
+        text(stdout, x, oy + Y_SEC2, BG, SEC_FG, true, "PANE")?;
+        self.item_action(stdout, x, xr, oy, I_SPLIT_H, "Split Left | Right", "Ctrl+D")?;
+        self.item_action(stdout, x, xr, oy, I_SPLIT_V, "Split Top / Bottom", "Ctrl+E")?;
 
-        self.draw_divider(stdout, ox, oy + 17)?;
-        self.draw_toggle_item(stdout, ox, oy + ITEM_ROWS[ITEM_STATUS])?;
-        self.draw_close_item(stdout, ox, oy + ITEM_ROWS[ITEM_CLOSE])?;
+        // Divider + Section: Display
+        div(stdout, x, oy + Y_DIV2, inner_w)?;
+        text(stdout, x, oy + Y_SEC3, BG, SEC_FG, true, "DISPLAY")?;
+        self.item_toggle(stdout, x, xr, oy)?;
+
+        // Divider + Close
+        div(stdout, x, oy + Y_DIV3, inner_w)?;
+        self.item_close(stdout, x, xr, oy)?;
 
         queue!(stdout, ResetColor, SetAttribute(Attribute::Reset))?;
         Ok(())
     }
 
-    fn draw_title(&self, stdout: &mut io::Stdout, ox: u16, oy: u16) -> anyhow::Result<()> {
-        queue!(
-            stdout,
-            cursor::MoveTo(ox + 4, oy + 1),
-            SetBackgroundColor(PANEL_BG),
-            SetForegroundColor(HEADER_FG),
-            SetAttribute(Attribute::Bold),
-            Print("SETTINGS :: CONTROL TABLE"),
-            SetAttribute(Attribute::Reset),
-            SetForegroundColor(MUTED_FG),
-            cursor::MoveTo(ox + 4, oy + 2),
-            Print(
-                "j/k or Arrows: move  h/l: adjust  Enter: apply  1-4: border style  q/Esc: close"
-            )
-        )?;
-        Ok(())
-    }
-
-    fn draw_table_header(&self, stdout: &mut io::Stdout, ox: u16, y: u16) -> anyhow::Result<()> {
-        let rule = "─".repeat((PANEL_W - 8) as usize);
-        queue!(
-            stdout,
-            cursor::MoveTo(ox + 4, y),
-            SetBackgroundColor(PANEL_BG),
-            SetForegroundColor(SECTION_FG),
-            SetAttribute(Attribute::Bold),
-            Print("GROUP    KEY      ITEM                      STATE     DETAIL"),
-            cursor::MoveTo(ox + 4, y + 1),
-            Print(&rule),
-            SetAttribute(Attribute::Reset)
-        )?;
-        Ok(())
-    }
-
-    fn draw_divider(&self, stdout: &mut io::Stdout, ox: u16, y: u16) -> anyhow::Result<()> {
-        let rule = "─".repeat((PANEL_W - 8) as usize);
-        queue!(
-            stdout,
-            cursor::MoveTo(ox + 4, y),
-            SetBackgroundColor(PANEL_BG),
-            SetForegroundColor(SECTION_FG),
-            Print(&rule)
-        )?;
-        Ok(())
-    }
+    // ─── Item renderers ────────────────────────────────
 
     #[allow(clippy::too_many_arguments)]
-    fn draw_border_item(
+    fn item_border(
         &self,
         stdout: &mut io::Stdout,
-        ox: u16,
-        y: u16,
+        x: u16,
+        xr: u16,
+        oy: u16,
         item: usize,
+        name: &str,
         style: BorderStyle,
-        title: &str,
-        desc: &str,
     ) -> anyhow::Result<()> {
-        let selected = self.border_style == style;
-        let focused = self.focused == item;
-        self.draw_table_row(
-            stdout,
-            ox,
-            y,
-            focused,
-            "VISUAL",
-            match item {
-                ITEM_SINGLE => "1",
-                ITEM_ROUNDED => "2",
-                ITEM_HEAVY => "3",
-                _ => "4",
-            },
-            title,
-            if selected { "ACTIVE" } else { "READY" },
-            desc,
-        )
-    }
+        let y = oy + ITEM_Y[item];
+        let f = self.focused == item;
+        let sel = self.border_style == style;
+        let bg = if f { FOCUS_BG } else { BG };
 
-    fn draw_action_item(
-        &self,
-        stdout: &mut io::Stdout,
-        ox: u16,
-        y: u16,
-        item: usize,
-        title: &str,
-        hint: &str,
-    ) -> anyhow::Result<()> {
-        self.draw_table_row(
-            stdout,
-            ox,
-            y,
-            self.focused == item,
-            "PANE",
-            "Enter",
-            title,
-            "ACTION",
-            hint,
-        )
-    }
-
-    fn draw_toggle_item(&self, stdout: &mut io::Stdout, ox: u16, y: u16) -> anyhow::Result<()> {
-        self.draw_table_row(
-            stdout,
-            ox,
-            y,
-            self.focused == ITEM_STATUS,
-            "UI",
-            "Space",
-            "Status Bar",
-            if self.show_status_bar { "ON" } else { "OFF" },
-            "footer hints and pane index",
-        )
-    }
-
-    fn draw_close_item(&self, stdout: &mut io::Stdout, ox: u16, y: u16) -> anyhow::Result<()> {
-        self.draw_table_row(
-            stdout,
-            ox,
-            y,
-            self.focused == ITEM_CLOSE,
-            "SYS",
-            "q/Esc",
-            "Close Settings",
-            "EXIT",
-            "return to workspace view",
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn draw_table_row(
-        &self,
-        stdout: &mut io::Stdout,
-        ox: u16,
-        y: u16,
-        focused: bool,
-        group: &str,
-        key: &str,
-        title: &str,
-        state: &str,
-        detail: &str,
-    ) -> anyhow::Result<()> {
-        let bg = if focused { FOCUS_BG } else { PANEL_BG };
-        let fg = if focused { Color::White } else { LABEL_FG };
-        let line_w = PANEL_W.saturating_sub(8);
-        let key_fg = if focused { HIGHLIGHT } else { SECTION_FG };
-        let state_fg = match state {
-            "ACTIVE" | "ON" => HIGHLIGHT,
-            "EXIT" => Color::Rgb {
-                r: 255,
-                g: 120,
-                b: 120,
-            },
-            _ => SECTION_FG,
-        };
-
-        for dy in 0..2 {
-            queue!(
-                stdout,
-                cursor::MoveTo(ox + 3, y + dy),
-                SetBackgroundColor(bg),
-                SetForegroundColor(fg)
-            )?;
-            // Left accent bar for focused items
-            if focused {
-                queue!(
-                    stdout,
-                    SetForegroundColor(HIGHLIGHT),
-                    Print("▎"),
-                    SetForegroundColor(fg)
-                )?;
-                for _ in 1..line_w {
-                    queue!(stdout, Print(" "))?;
-                }
-            } else {
-                for _ in 0..line_w {
-                    queue!(stdout, Print(" "))?;
-                }
-            }
+        row_bg(stdout, x - 1, y, (xr - x + 2) as usize, bg)?;
+        if f {
+            focus_marker(stdout, x - 1, y)?;
         }
 
+        let icon = if sel { "●" } else { "○" };
+        let icon_fg = if sel { ACCENT } else { DIM_FG };
+        let nx = if f { x + 3 } else { x + 1 };
+
         queue!(
             stdout,
-            cursor::MoveTo(ox + 5, y),
+            cursor::MoveTo(nx, y),
             SetBackgroundColor(bg),
-            SetForegroundColor(key_fg),
-            Print(if focused { "›" } else { " " }),
-            cursor::MoveTo(ox + 7, y),
-            Print(format!("{:<8}", group)),
-            cursor::MoveTo(ox + 16, y),
-            SetForegroundColor(key_fg),
-            Print(format!("{:<8}", key)),
-            cursor::MoveTo(ox + 26, y),
-            SetForegroundColor(fg),
-            SetAttribute(Attribute::Bold),
-            Print(format!("{:<24}", title)),
-            SetAttribute(Attribute::Reset),
-            cursor::MoveTo(ox + 52, y),
-            SetForegroundColor(state_fg),
-            Print(format!("{:<8}", state)),
-            cursor::MoveTo(ox + 62, y),
-            SetForegroundColor(MUTED_FG),
-            Print(detail)
+            SetForegroundColor(icon_fg),
+            Print(icon),
+            Print(" "),
+            SetForegroundColor(if f { Color::White } else { LBL_FG }),
         )?;
+        if f {
+            queue!(stdout, SetAttribute(Attribute::Bold))?;
+        }
+        queue!(stdout, Print(name))?;
+        if f {
+            queue!(stdout, SetAttribute(Attribute::Reset))?;
+        }
 
+        if sel {
+            right_tag(stdout, xr, y, bg, ACCENT, "active")?;
+        }
         Ok(())
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn item_action(
+        &self,
+        stdout: &mut io::Stdout,
+        x: u16,
+        xr: u16,
+        oy: u16,
+        item: usize,
+        name: &str,
+        hint: &str,
+    ) -> anyhow::Result<()> {
+        let y = oy + ITEM_Y[item];
+        let f = self.focused == item;
+        let bg = if f { FOCUS_BG } else { BG };
+
+        row_bg(stdout, x - 1, y, (xr - x + 2) as usize, bg)?;
+        if f {
+            focus_marker(stdout, x - 1, y)?;
+        }
+
+        let nx = if f { x + 3 } else { x + 1 };
+        queue!(
+            stdout,
+            cursor::MoveTo(nx, y),
+            SetBackgroundColor(bg),
+            SetForegroundColor(if f { Color::White } else { LBL_FG }),
+        )?;
+        if f {
+            queue!(stdout, SetAttribute(Attribute::Bold))?;
+        }
+        queue!(stdout, Print(name))?;
+        if f {
+            queue!(stdout, SetAttribute(Attribute::Reset))?;
+        }
+
+        right_tag(stdout, xr, y, bg, DIM_FG, hint)?;
+        Ok(())
+    }
+
+    fn item_toggle(&self, stdout: &mut io::Stdout, x: u16, xr: u16, oy: u16) -> anyhow::Result<()> {
+        let y = oy + ITEM_Y[I_STATUS];
+        let f = self.focused == I_STATUS;
+        let bg = if f { FOCUS_BG } else { BG };
+
+        row_bg(stdout, x - 1, y, (xr - x + 2) as usize, bg)?;
+        if f {
+            focus_marker(stdout, x - 1, y)?;
+        }
+
+        let nx = if f { x + 3 } else { x + 1 };
+        queue!(
+            stdout,
+            cursor::MoveTo(nx, y),
+            SetBackgroundColor(bg),
+            SetForegroundColor(if f { Color::White } else { LBL_FG }),
+        )?;
+        if f {
+            queue!(stdout, SetAttribute(Attribute::Bold))?;
+        }
+        queue!(stdout, Print("Status Bar"))?;
+        if f {
+            queue!(stdout, SetAttribute(Attribute::Reset))?;
+        }
+
+        let (tag, tag_fg) = if self.show_status_bar {
+            ("ON", ACCENT)
+        } else {
+            ("OFF", DIM_FG)
+        };
+        right_tag(stdout, xr, y, bg, tag_fg, tag)?;
+        Ok(())
+    }
+
+    fn item_close(&self, stdout: &mut io::Stdout, x: u16, xr: u16, oy: u16) -> anyhow::Result<()> {
+        let y = oy + ITEM_Y[I_CLOSE];
+        let f = self.focused == I_CLOSE;
+        let bg = if f { FOCUS_BG } else { BG };
+
+        row_bg(stdout, x - 1, y, (xr - x + 2) as usize, bg)?;
+        if f {
+            focus_marker(stdout, x - 1, y)?;
+        }
+
+        let nx = if f { x + 3 } else { x + 1 };
+        queue!(
+            stdout,
+            cursor::MoveTo(nx, y),
+            SetBackgroundColor(bg),
+            SetForegroundColor(if f { WARN_FG } else { DIM_FG }),
+        )?;
+        if f {
+            queue!(stdout, SetAttribute(Attribute::Bold))?;
+        }
+        queue!(stdout, Print("Close Settings"))?;
+        if f {
+            queue!(stdout, SetAttribute(Attribute::Reset))?;
+        }
+
+        right_tag(stdout, xr, y, bg, DIM_FG, "q / Esc")?;
+        Ok(())
+    }
+
+    // ─── Logic ─────────────────────────────────────────
 
     fn adjust(&mut self, delta: isize) -> SettingsAction {
         match self.focused {
-            ITEM_SINGLE | ITEM_ROUNDED | ITEM_HEAVY | ITEM_DOUBLE => {
-                let order = [
+            I_SINGLE | I_ROUNDED | I_HEAVY | I_DOUBLE => {
+                let o = [
                     BorderStyle::Single,
                     BorderStyle::Rounded,
                     BorderStyle::Heavy,
                     BorderStyle::Double,
                 ];
-                let index = order
-                    .iter()
-                    .position(|style| *style == self.border_style)
-                    .unwrap_or(1);
-                let next = ((index as isize + delta).rem_euclid(order.len() as isize)) as usize;
-                self.border_style = order[next];
-                self.focused = next;
+                let i = o.iter().position(|s| *s == self.border_style).unwrap_or(1);
+                let n = ((i as isize + delta).rem_euclid(4)) as usize;
+                self.border_style = o[n];
+                self.focused = n;
                 SettingsAction::Changed
             }
-            ITEM_STATUS => {
+            I_STATUS => {
                 self.show_status_bar = !self.show_status_bar;
                 SettingsAction::Changed
             }
@@ -468,23 +421,23 @@ impl Settings {
 
     fn activate(&mut self, item: usize) -> SettingsAction {
         match item {
-            ITEM_SINGLE => self.select_border(BorderStyle::Single, ITEM_SINGLE),
-            ITEM_ROUNDED => self.select_border(BorderStyle::Rounded, ITEM_ROUNDED),
-            ITEM_HEAVY => self.select_border(BorderStyle::Heavy, ITEM_HEAVY),
-            ITEM_DOUBLE => self.select_border(BorderStyle::Double, ITEM_DOUBLE),
-            ITEM_SPLIT_H => {
+            I_SINGLE => self.set_border(BorderStyle::Single, I_SINGLE),
+            I_ROUNDED => self.set_border(BorderStyle::Rounded, I_ROUNDED),
+            I_HEAVY => self.set_border(BorderStyle::Heavy, I_HEAVY),
+            I_DOUBLE => self.set_border(BorderStyle::Double, I_DOUBLE),
+            I_SPLIT_H => {
                 self.visible = false;
                 SettingsAction::SplitH
             }
-            ITEM_SPLIT_V => {
+            I_SPLIT_V => {
                 self.visible = false;
                 SettingsAction::SplitV
             }
-            ITEM_STATUS => {
+            I_STATUS => {
                 self.show_status_bar = !self.show_status_bar;
                 SettingsAction::Changed
             }
-            ITEM_CLOSE => {
+            I_CLOSE => {
                 self.visible = false;
                 SettingsAction::Close
             }
@@ -492,16 +445,89 @@ impl Settings {
         }
     }
 
-    fn select_border(&mut self, style: BorderStyle, focused: usize) -> SettingsAction {
+    fn set_border(&mut self, style: BorderStyle, focused: usize) -> SettingsAction {
         self.border_style = style;
         self.focused = focused;
         SettingsAction::Changed
     }
 }
 
-fn panel_origin(tw: u16, th: u16) -> (u16, u16) {
-    (
-        tw.saturating_sub(PANEL_W) / 2,
-        th.saturating_sub(PANEL_H) / 2,
-    )
+// ─── Drawing primitives ────────────────────────────────
+
+fn origin(tw: u16, th: u16) -> (u16, u16) {
+    (tw.saturating_sub(W) / 2, th.saturating_sub(H) / 2)
+}
+
+fn text(
+    out: &mut io::Stdout,
+    x: u16,
+    y: u16,
+    bg: Color,
+    fg: Color,
+    bold: bool,
+    s: &str,
+) -> anyhow::Result<()> {
+    queue!(
+        out,
+        cursor::MoveTo(x, y),
+        SetBackgroundColor(bg),
+        SetForegroundColor(fg)
+    )?;
+    if bold {
+        queue!(out, SetAttribute(Attribute::Bold))?;
+    }
+    queue!(out, Print(s))?;
+    if bold {
+        queue!(out, SetAttribute(Attribute::Reset))?;
+    }
+    Ok(())
+}
+
+fn div(out: &mut io::Stdout, x: u16, y: u16, w: usize) -> anyhow::Result<()> {
+    queue!(
+        out,
+        cursor::MoveTo(x, y),
+        SetBackgroundColor(BG),
+        SetForegroundColor(DIV_FG),
+        Print("─".repeat(w))
+    )?;
+    Ok(())
+}
+
+fn row_bg(out: &mut io::Stdout, x: u16, y: u16, w: usize, bg: Color) -> anyhow::Result<()> {
+    queue!(out, cursor::MoveTo(x, y), SetBackgroundColor(bg))?;
+    for _ in 0..w {
+        queue!(out, Print(" "))?;
+    }
+    Ok(())
+}
+
+fn focus_marker(out: &mut io::Stdout, x: u16, y: u16) -> anyhow::Result<()> {
+    queue!(
+        out,
+        cursor::MoveTo(x, y),
+        SetBackgroundColor(FOCUS_BG),
+        SetForegroundColor(ACCENT),
+        Print("▎›")
+    )?;
+    Ok(())
+}
+
+fn right_tag(
+    out: &mut io::Stdout,
+    xr: u16,
+    y: u16,
+    bg: Color,
+    fg: Color,
+    tag: &str,
+) -> anyhow::Result<()> {
+    let tx = xr.saturating_sub(tag.len() as u16);
+    queue!(
+        out,
+        cursor::MoveTo(tx, y),
+        SetBackgroundColor(bg),
+        SetForegroundColor(fg),
+        Print(tag)
+    )?;
+    Ok(())
 }

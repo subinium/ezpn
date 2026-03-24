@@ -42,7 +42,7 @@ Commands passed with `-e/--exec` run via `$SHELL -l -c`, so pipes, redirects, an
 | Drag border | Resize |
 | Scroll | Scroll active pane |
 
-**Keyboard:**
+**Keyboard (direct shortcuts):**
 
 | | |
 |---|---|
@@ -50,8 +50,22 @@ Commands passed with `-e/--exec` run via `$SHELL -l -c`, so pipes, redirects, an
 | `Ctrl+E` | Split top / bottom |
 | `F2` | Equalize all sizes |
 | `Ctrl+]` | Next pane |
-| `Ctrl+G` | Settings |
-| `Ctrl+\` | Quit |
+| `Ctrl+G` | Settings (j/k/Enter to navigate) |
+| `Ctrl+Q` | Quit |
+
+**tmux-compatible prefix keys (`Ctrl+B` then...):**
+
+| | |
+|---|---|
+| `%` | Split left \| right |
+| `"` | Split top / bottom |
+| `o` | Next pane |
+| `Arrow` | Navigate directionally |
+| `x` | Close pane |
+| `E` | Equalize |
+| `[` | Scroll mode (j/k/g/G/PgUp/PgDn, q to exit) |
+| `s` | Toggle status bar |
+| `d` | Quit (with confirmation if panes are live) |
 
 <details>
 <summary>macOS: Alt+Arrow for directional navigation</summary>
@@ -80,7 +94,13 @@ Commands passed with `-e/--exec` run via `$SHELL -l -c`, so pipes, redirects, an
 ezpn --layout '1/1:1' -e 'htop' -e 'npm run dev' -e 'tail -f app.log'
 ```
 
-**Settings panel** — `Ctrl+G` opens a larger borderless modal. Change border style, split panes, and toggle the status bar with either the mouse or keyboard.
+**Title bar buttons** — Each pane has `[━]` `[┃]` `[×]` buttons for split/close right in the title bar. Click to act.
+
+**tmux prefix keys** — `Ctrl+B` enters prefix mode (1s timeout). All standard tmux splits, navigation, and pane management work. Direct shortcuts (`Ctrl+D`, `Ctrl+E`, etc.) also remain.
+
+**Scroll mode** — `Ctrl+B [` enters scroll mode. Navigate with `j`/`k`, `g`/`G`, `PgUp`/`PgDn`, `Ctrl+U`/`Ctrl+D`. Press `q` to exit.
+
+**Settings panel** — `Ctrl+G` opens a clean dark modal. Navigate with `j`/`k`, apply with `Enter`, quick-select borders with `1`-`4`. Vim keys throughout.
 
 **Border styles** — `--border` flag or change in settings:
 
@@ -146,13 +166,15 @@ Each pane owns a PTY pair ([portable-pty](https://crates.io/crates/portable-pty)
 
 ```
 src/
-├── main.rs          Event loop, pane lifecycle, restore flow
+├── main.rs          Event loop, prefix key state machine, pane lifecycle
 ├── layout.rs        Binary split tree (split, remove, navigate, equalize)
-├── pane.rs          PTY + VT100 emulation + launch metadata
-├── render.rs        Dirty render path + border cache
-├── settings.rs      Large borderless settings modal
+├── pane.rs          PTY + VT100 emulation + scrollback + launch metadata
+├── render.rs        Dirty render path + border cache + title bar buttons
+├── settings.rs      Dark modal with vim navigation
 ├── ipc.rs           JSON IPC protocol + Unix socket listener
 ├── workspace.rs     Snapshot save/load and validation
+├── config.rs        Config file loading (prepared)
+├── tab.rs           Tab manager (prepared)
 └── bin/ezpn-ctl.rs  External control client
 ```
 
