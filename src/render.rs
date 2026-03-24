@@ -258,6 +258,10 @@ pub fn build_border_cache(
 
 // ─── Rendering ─────────────────────────────────────────────
 
+/// Selection range for a specific pane: (pane_id, start_row, start_col, end_row, end_col).
+/// Coordinates are normalized (start <= end).
+pub type PaneSelection = Option<(usize, u16, u16, u16, u16)>;
+
 #[allow(clippy::too_many_arguments)]
 pub fn render_panes(
     stdout: &mut io::Stdout,
@@ -272,6 +276,7 @@ pub fn render_panes(
     border_cache: &BorderCache,
     dirty_panes: &HashSet<usize>,
     full_redraw: bool,
+    selection: PaneSelection,
 ) -> anyhow::Result<()> {
     queue!(stdout, cursor::Hide)?;
 
@@ -337,6 +342,7 @@ pub fn render_panes(
             let is_alive = pane_ref.is_some_and(|p| p.is_alive());
             let label = pane_ref.map(|p| p.launch_label("")).unwrap_or_default();
             let is_scrolled = pane_ref.is_some_and(|p| p.is_scrolled());
+            let exit_code = pane_ref.and_then(|p| p.exit_code());
             draw_pane_title(
                 stdout,
                 rect,
@@ -346,9 +352,13 @@ pub fn render_panes(
                 &label,
                 is_scrolled,
                 &chars,
+                exit_code,
             )?;
             if let Some(pane) = panes.get(&pid) {
-                draw_content(stdout, pane, rect, is_alive)?;
+                let pane_sel = selection
+                    .filter(|(sel_pid, ..)| *sel_pid == pid)
+                    .map(|(_, sr, sc, er, ec)| (sr, sc, er, ec));
+                draw_content(stdout, pane, rect, is_alive, pane_sel)?;
             }
             // Dead pane overlay
             if !is_alive {
@@ -431,6 +441,7 @@ fn draw_pane_title(
     label: &str,
     is_scrolled: bool,
     chars: &BorderChars,
+    exit_code: Option<u32>,
 ) -> anyhow::Result<()> {
     let title_y = rect.y.saturating_sub(1);
     let title_x = rect.x;
@@ -441,7 +452,10 @@ fn draw_pane_title(
 
     let scroll_ind = if is_scrolled { " [SCROLL]" } else { "" };
     let title = if !is_alive {
-        format!(" {} [exited] ", idx + 1)
+        match exit_code {
+            Some(code) => format!(" {} [exit {}] ", idx + 1, code),
+            None => format!(" {} [exited] ", idx + 1),
+        }
     } else if label.is_empty() || avail < 12 {
         format!(" {}{} ", idx + 1, scroll_ind)
     } else {
@@ -587,6 +601,7 @@ fn draw_content(
     pane: &Pane,
     rect: &Rect,
     is_alive: bool,
+    selection: Option<(u16, u16, u16, u16)>,
 ) -> anyhow::Result<()> {
     let screen = pane.screen();
     if rect.w == 0 || rect.h == 0 {
@@ -604,6 +619,20 @@ fn draw_content(
         buf.clear();
 
         for c in 0..rect.w {
+            let is_selected = selection.is_some_and(|(sr, sc, er, ec)| {
+                if r < sr || r > er {
+                    false
+                } else if r == sr && r == er {
+                    c >= sc && c <= ec
+                } else if r == sr {
+                    c >= sc
+                } else if r == er {
+                    c <= ec
+                } else {
+                    true
+                }
+            });
+
             if let Some(cell) = screen.cell(r, c) {
                 // Skip wide character continuation cells — the wide char itself
                 // already occupies 2 display columns when printed.
@@ -618,8 +647,21 @@ fn draw_content(
                     continue;
                 }
 
-                let mut fg = vt100_to_crossterm(cell.fgcolor());
-                let bg = vt100_to_crossterm(cell.bgcolor());
+                let (mut fg, bg) = if is_selected {
+                    // Invert colors for selection highlight
+                    let f = vt100_to_crossterm(cell.bgcolor());
+                    let b = vt100_to_crossterm(cell.fgcolor());
+                    // Use readable defaults if both are Reset
+                    (
+                        if f == Color::Reset { Color::Black } else { f },
+                        if b == Color::Reset { Color::White } else { b },
+                    )
+                } else {
+                    (
+                        vt100_to_crossterm(cell.fgcolor()),
+                        vt100_to_crossterm(cell.bgcolor()),
+                    )
+                };
                 if !is_alive {
                     fg = Color::DarkGrey;
                 }
@@ -705,7 +747,7 @@ pub fn draw_status_bar(
     total: usize,
     mode_label: &str,
 ) -> anyhow::Result<()> {
-    draw_status_bar_full(stdout, term_w, term_h, active_idx, total, mode_label, "")
+    draw_status_bar_full(stdout, term_w, term_h, active_idx, total, mode_label, "", 0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -717,6 +759,7 @@ pub fn draw_status_bar_full(
     total: usize,
     mode_label: &str,
     pane_name: &str,
+    selection_chars: usize,
 ) -> anyhow::Result<()> {
     let y = term_h - 1;
     let w = term_w as usize;
@@ -746,8 +789,29 @@ pub fn draw_status_bar_full(
     queue!(stdout, Print(&left))?;
     let mut left_end = 1 + left.len();
 
-    // Mode indicator
-    if !mode_label.is_empty() {
+    // Mode indicator or selection char count
+    if selection_chars > 0 {
+        let sel_label = format!("{} chars", selection_chars);
+        queue!(
+            stdout,
+            SetAttribute(Attribute::Reset),
+            SetBackgroundColor(Color::Rgb {
+                r: 40,
+                g: 20,
+                b: 60
+            }),
+            SetForegroundColor(Color::Rgb {
+                r: 200,
+                g: 160,
+                b: 255
+            }),
+            SetAttribute(Attribute::Bold),
+            Print(format!(" {} ", sel_label)),
+            SetAttribute(Attribute::Reset),
+            SetBackgroundColor(STATUS_BG),
+        )?;
+        left_end += sel_label.len() + 2;
+    } else if !mode_label.is_empty() {
         queue!(
             stdout,
             SetAttribute(Attribute::Reset),
@@ -768,6 +832,13 @@ pub fn draw_status_bar_full(
         )?;
         left_end += mode_label.len() + 2;
     }
+
+    // Clock (HH:MM) on the far right
+    let clock = {
+        let now = now_hhmm();
+        format!(" {} ", now)
+    };
+    let clock_len = clock.len();
 
     // Right: context-aware hints based on mode
     queue!(
@@ -805,14 +876,15 @@ pub fn draw_status_bar_full(
         } else {
             format!("{}  {}", right_str, hint)
         };
-        if candidate.len() + left_end + 4 < w {
+        // Reserve space for clock on the far right
+        if candidate.len() + left_end + 4 + clock_len < w {
             right_str = candidate;
         } else {
             break;
         }
     }
     if !right_str.is_empty() {
-        let rx = (w as u16).saturating_sub(right_str.len() as u16 + 1);
+        let rx = (w as u16).saturating_sub(right_str.len() as u16 + clock_len as u16 + 1);
         queue!(
             stdout,
             cursor::MoveTo(rx, y),
@@ -821,8 +893,39 @@ pub fn draw_status_bar_full(
         )?;
     }
 
+    // Draw clock at far right
+    if clock_len + 1 < w {
+        let cx = (w as u16).saturating_sub(clock_len as u16);
+        queue!(
+            stdout,
+            cursor::MoveTo(cx, y),
+            SetBackgroundColor(STATUS_BG),
+            SetForegroundColor(Color::DarkGrey),
+            Print(&clock),
+        )?;
+    }
+
     queue!(stdout, ResetColor, SetAttribute(Attribute::Reset))?;
     Ok(())
+}
+
+/// Get current time as HH:MM using libc (no chrono dependency).
+fn now_hhmm() -> String {
+    #[cfg(unix)]
+    {
+        let mut t: libc::time_t = 0;
+        unsafe { libc::time(&mut t) };
+        let tm = unsafe { libc::localtime(&t) };
+        if tm.is_null() {
+            return "--:--".to_string();
+        }
+        let tm = unsafe { &*tm };
+        format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
+    }
+    #[cfg(not(unix))]
+    {
+        "--:--".to_string()
+    }
 }
 
 /// Close button hit detection — 2-cell wide hit area for " ×".
@@ -938,7 +1041,7 @@ pub fn render_zoomed_pane(
         w: term_w.saturating_sub(2),
         h: border_h.saturating_sub(2),
     };
-    draw_content(stdout, pane, &rect, pane.is_alive())?;
+    draw_content(stdout, pane, &rect, pane.is_alive(), None)?;
 
     // Cursor
     if pane.is_alive() {
@@ -966,7 +1069,9 @@ pub fn draw_help_overlay(stdout: &mut io::Stdout, term_w: u16, term_h: u16) -> a
         "  Ctrl+D        Split left|right",
         "  Ctrl+E        Split top/bottom",
         "  Ctrl+N        Next pane",
-        "  Ctrl+G        Settings panel",
+        "  Ctrl+G / F1   Settings panel",
+        "  F2            Equalize all pane sizes",
+        "  Alt+Arrow     Navigate directional",
         "  Ctrl+W        Quit",
         "",
         "  PREFIX MODE (Ctrl+B then)",
@@ -976,9 +1081,10 @@ pub fn draw_help_overlay(stdout: &mut io::Stdout, term_w: u16, term_h: u16) -> a
         "  Arrow         Navigate directional",
         "  x             Close pane",
         "  z             Zoom toggle",
-        "  R             Resize mode (arrows, q exit)",
+        "  B             Broadcast mode (type in all)",
+        "  R             Resize mode (arrows/hjkl, q)",
         "  { }           Swap pane prev/next",
-        "  [             Scroll mode (j/k/g/G, q exit)",
+        "  [             Scroll mode (j/k/g/G, q)",
         "  q             Show pane numbers + jump",
         "  E             Equalize sizes",
         "  s             Toggle status bar",
@@ -988,9 +1094,17 @@ pub fn draw_help_overlay(stdout: &mut io::Stdout, term_w: u16, term_h: u16) -> a
         "  MOUSE",
         "  Click         Select pane",
         "  Double-click  Zoom toggle",
-        "  Drag border   Resize",
-        "  Scroll        Scroll active pane",
+        "  Drag border   Resize panes",
+        "  Drag text     Select & copy to clipboard",
+        "  Scroll wheel  Scrollback history",
         "  [━][┃][×]     Split/close buttons",
+        "",
+        "  FEATURES",
+        "  .ezpn.toml    Project config (ezpn init)",
+        "  Layout DSL    -l '7:3/5:5' or presets",
+        "  Auto-restart  restart = always|on_failure",
+        "  Broadcast     Type in all panes at once",
+        "  Workspaces    Save/load via ezpn-ctl",
         "",
         "          Press any key to close",
     ];
@@ -1057,7 +1171,11 @@ pub fn draw_help_overlay(stdout: &mut io::Stdout, term_w: u16, term_h: u16) -> a
         let y = oy + 1 + i as u16;
         queue!(stdout, cursor::MoveTo(ox, y), SetBackgroundColor(bg))?;
 
-        if line.contains("SHORTCUTS") || line.contains("PREFIX MODE") || line.contains("MOUSE") {
+        if line.contains("SHORTCUTS")
+            || line.contains("PREFIX MODE")
+            || line.contains("MOUSE")
+            || line.contains("FEATURES")
+        {
             queue!(
                 stdout,
                 SetForegroundColor(Color::Rgb {
