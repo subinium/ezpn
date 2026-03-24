@@ -1,12 +1,15 @@
 use std::collections::HashMap;
 
-#[derive(Clone, Copy, PartialEq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Direction {
     Horizontal, // panes arranged left | right
     Vertical,   // panes arranged top / bottom
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum LayoutNode {
     Leaf {
         id: usize,
@@ -55,6 +58,7 @@ pub struct SepHit {
     pub area: Rect,           // content area of the Split node
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Layout {
     pub root: LayoutNode,
     pub next_id: usize,
@@ -65,6 +69,56 @@ impl Layout {
         let mut next_id = 0;
         let root = build_grid(rows, cols, &mut next_id);
         Layout { root, next_id }
+    }
+
+    /// Parse a layout spec: "7:3" or "1:1:1" or "7:3/5:5" or "1/1:1"
+    /// `/` separates rows, `:` separates columns within a row.
+    /// Numbers are relative weights.
+    pub fn from_spec(spec: &str) -> Result<Self, String> {
+        let rows: Vec<&str> = spec.split('/').collect();
+        if rows.is_empty() {
+            return Err("empty layout spec".into());
+        }
+
+        let mut next_id = 0;
+        let row_nodes: Vec<(LayoutNode, usize)> = rows
+            .iter()
+            .map(|row| {
+                let cols: Vec<u32> = row
+                    .split(':')
+                    .map(|s| {
+                        let weight = s
+                            .trim()
+                            .parse::<u32>()
+                            .map_err(|_| format!("invalid weight: '{}'", s))?;
+                        if (1..=9).contains(&weight) {
+                            Ok(weight)
+                        } else {
+                            Err(format!("weight must be 1-9: '{}'", s))
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if cols.is_empty() {
+                    return Err("empty row in layout spec".into());
+                }
+                let total: u32 = cols.iter().sum();
+                if total == 0 {
+                    return Err("row weights sum to 0".into());
+                }
+                let node = build_weighted_row(&cols, total, &mut next_id);
+                Ok((node, cols.len()))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        let total_panes: usize = row_nodes.iter().map(|(_, c)| *c).sum();
+        if total_panes > 100 {
+            return Err(format!("too many panes: {}", total_panes));
+        }
+
+        let row_count = row_nodes.len();
+        let nodes: Vec<LayoutNode> = row_nodes.into_iter().map(|(n, _)| n).collect();
+        let root = build_weighted_column(&nodes, row_count);
+        Ok(Layout { root, next_id })
     }
 
     pub fn pane_ids(&self) -> Vec<usize> {
@@ -159,6 +213,40 @@ impl Layout {
 }
 
 // ─── Tree Construction ─────────────────────────────────────
+
+/// Build a row from weighted columns: [7, 3] → 70:30 split
+fn build_weighted_row(weights: &[u32], total: u32, next_id: &mut usize) -> LayoutNode {
+    if weights.len() == 1 {
+        let id = *next_id;
+        *next_id += 1;
+        return LayoutNode::Leaf { id };
+    }
+    let first_w = weights[0];
+    let rest_total = total - first_w;
+    let ratio = first_w as f32 / total as f32;
+    let id = *next_id;
+    *next_id += 1;
+    LayoutNode::Split {
+        direction: Direction::Horizontal,
+        ratio,
+        first: Box::new(LayoutNode::Leaf { id }),
+        second: Box::new(build_weighted_row(&weights[1..], rest_total, next_id)),
+    }
+}
+
+/// Stack rows vertically with equal weight
+fn build_weighted_column(rows: &[LayoutNode], count: usize) -> LayoutNode {
+    if rows.len() == 1 {
+        return rows[0].clone();
+    }
+    let ratio = 1.0 / count as f32;
+    LayoutNode::Split {
+        direction: Direction::Vertical,
+        ratio,
+        first: Box::new(rows[0].clone()),
+        second: Box::new(build_weighted_column(&rows[1..], count - 1)),
+    }
+}
 
 fn build_grid(rows: usize, cols: usize, next_id: &mut usize) -> LayoutNode {
     if rows == 1 {
@@ -672,5 +760,56 @@ mod tests {
         let r0 = &rects[&0];
         let r1 = &rects[&1];
         assert!(r0.w < r1.w, "pane 0 should be narrower after 0.3 ratio");
+    }
+
+    // ── Layout Spec Tests ──
+
+    #[test]
+    fn spec_simple_ratio() {
+        let layout = Layout::from_spec("7:3").unwrap();
+        assert_eq!(layout.pane_count(), 2);
+        let inner = inner_80x24();
+        let rects = layout.pane_rects(&inner);
+        let ids = layout.pane_ids();
+        let w0 = rects[&ids[0]].w;
+        let w1 = rects[&ids[1]].w;
+        assert!(
+            w0 > w1,
+            "7:3 ratio — left should be wider: {} vs {}",
+            w0,
+            w1
+        );
+    }
+
+    #[test]
+    fn spec_three_equal() {
+        let layout = Layout::from_spec("1:1:1").unwrap();
+        assert_eq!(layout.pane_count(), 3);
+    }
+
+    #[test]
+    fn spec_two_rows() {
+        let layout = Layout::from_spec("7:3/5:5").unwrap();
+        assert_eq!(layout.pane_count(), 4);
+    }
+
+    #[test]
+    fn spec_mixed() {
+        let layout = Layout::from_spec("1/1:1").unwrap();
+        assert_eq!(layout.pane_count(), 3);
+    }
+
+    #[test]
+    fn spec_single() {
+        let layout = Layout::from_spec("1").unwrap();
+        assert_eq!(layout.pane_count(), 1);
+    }
+
+    #[test]
+    fn spec_invalid() {
+        assert!(Layout::from_spec("").is_err());
+        assert!(Layout::from_spec("abc").is_err());
+        assert!(Layout::from_spec("0:0").is_err());
+        assert!(Layout::from_spec("10").is_err());
     }
 }

@@ -3,6 +3,14 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneLaunch {
+    Shell,
+    Command(String),
+}
 
 pub struct Pane {
     master: Box<dyn MasterPty + Send>,
@@ -11,10 +19,41 @@ pub struct Pane {
     reader_rx: Receiver<Vec<u8>>,
     parser: vt100::Parser,
     alive: bool,
+    launch: PaneLaunch,
+    scroll_offset: usize, // 0 = live (bottom), >0 = scrolled up N lines
 }
 
 impl Pane {
     pub fn new(shell: &str, cols: u16, rows: u16) -> anyhow::Result<Self> {
+        Self::spawn(shell, PaneLaunch::Shell, cols, rows)
+    }
+
+    pub fn with_command(shell: &str, command: &str, cols: u16, rows: u16) -> anyhow::Result<Self> {
+        Self::spawn(shell, PaneLaunch::Command(command.to_string()), cols, rows)
+    }
+
+    #[allow(dead_code)]
+    pub fn with_scrollback(
+        shell: &str,
+        launch: PaneLaunch,
+        cols: u16,
+        rows: u16,
+        scrollback: usize,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_inner(shell, launch, cols, rows, scrollback)
+    }
+
+    fn spawn(shell: &str, launch: PaneLaunch, cols: u16, rows: u16) -> anyhow::Result<Self> {
+        Self::spawn_inner(shell, launch, cols, rows, 0)
+    }
+
+    fn spawn_inner(
+        shell: &str,
+        launch: PaneLaunch,
+        cols: u16,
+        rows: u16,
+        scrollback: usize,
+    ) -> anyhow::Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
             rows,
@@ -24,6 +63,11 @@ impl Pane {
         })?;
 
         let mut cmd = CommandBuilder::new(shell);
+        if let PaneLaunch::Command(command) = &launch {
+            cmd.arg("-l");
+            cmd.arg("-c");
+            cmd.arg(command);
+        }
         cmd.env("TERM", "xterm-256color");
         cmd.env("EZPN", "1"); // prevent nesting
 
@@ -34,7 +78,7 @@ impl Pane {
         let reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
 
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(32); // bounded: 32 * 4KB = 128KB max buffered
         std::thread::spawn(move || {
             let mut reader = reader;
             let mut buf = [0u8; 4096];
@@ -51,7 +95,7 @@ impl Pane {
             }
         });
 
-        let parser = vt100::Parser::new(rows, cols, 0);
+        let parser = vt100::Parser::new(rows, cols, scrollback);
 
         Ok(Self {
             master: pair.master,
@@ -60,16 +104,23 @@ impl Pane {
             reader_rx: rx,
             parser,
             alive: true,
+            launch,
+            scroll_offset: 0,
         })
     }
 
     /// Read pending output from PTY. Returns true if new data was received.
     pub fn read_output(&mut self) -> bool {
+        let was_alive = self.alive;
         let mut got_data = false;
         loop {
             match self.reader_rx.try_recv() {
                 Ok(data) => {
                     self.parser.process(&data);
+                    // New output snaps scroll to bottom
+                    if self.scroll_offset > 0 {
+                        self.scroll_offset = 0;
+                    }
                     got_data = true;
                 }
                 Err(TryRecvError::Empty) => break,
@@ -84,7 +135,7 @@ impl Pane {
                 self.alive = false;
             }
         }
-        got_data
+        got_data || was_alive != self.alive
     }
 
     pub fn write_key(&mut self, key: KeyEvent) {
@@ -126,6 +177,43 @@ impl Pane {
     pub fn kill(&mut self) {
         let _ = self.child.kill();
         self.alive = false;
+    }
+
+    #[allow(dead_code)]
+    pub fn scroll_up(&mut self, lines: usize) {
+        let max = self.parser.screen().scrollback();
+        self.scroll_offset = (self.scroll_offset + lines).min(max);
+    }
+
+    #[allow(dead_code)]
+    pub fn scroll_down(&mut self, lines: usize) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+    }
+
+    #[allow(dead_code)]
+    pub fn scroll_offset(&self) -> usize {
+        self.scroll_offset
+    }
+
+    #[allow(dead_code)]
+    pub fn is_scrolled(&self) -> bool {
+        self.scroll_offset > 0
+    }
+
+    #[allow(dead_code)]
+    pub fn snap_to_bottom(&mut self) {
+        self.scroll_offset = 0;
+    }
+
+    pub fn launch(&self) -> &PaneLaunch {
+        &self.launch
+    }
+
+    pub fn launch_label(&self, shell: &str) -> String {
+        match &self.launch {
+            PaneLaunch::Shell => shell.to_string(),
+            PaneLaunch::Command(command) => command.clone(),
+        }
     }
 }
 
