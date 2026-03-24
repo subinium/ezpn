@@ -674,11 +674,11 @@ pub fn draw_status_bar(
         SetBackgroundColor(STATUS_BG)
     )?;
     let hints = [
-        "Ctrl+D/E:split",
-        "Ctrl+N:next",
-        "F2:equalize",
-        "Ctrl+G:settings",
-        "Ctrl+W:quit",
+        "Ctrl+D/E split",
+        "Ctrl+N next",
+        "Ctrl+B prefix",
+        "Ctrl+G settings",
+        "Ctrl+W quit",
     ];
     let mut right_str = String::new();
     for hint in hints.iter() {

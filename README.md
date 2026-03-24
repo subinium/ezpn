@@ -4,11 +4,13 @@
 
 # ezpn
 
-A terminal pane splitter. Click to select. Drag to resize. No config needed.
+Split your terminal in one command. Click, drag, done.
 
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
-[![Crate](https://img.shields.io/badge/crates.io-v0.1.0-orange)](https://crates.io/crates/ezpn)
+[![Crate](https://img.shields.io/badge/crates.io-v0.2.0-orange)](https://crates.io/crates/ezpn)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)]()
+
+**English** | [한국어](docs/README.ko.md) | [日本語](docs/README.ja.md) | [中文](docs/README.zh.md) | [Español](docs/README.es.md) | [Français](docs/README.fr.md)
 
 ## Install
 
