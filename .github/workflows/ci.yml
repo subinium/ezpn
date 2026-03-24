@@ -34,4 +34,4 @@ jobs:
         with:
           toolchain: "1.70"
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check
+      - run: rm Cargo.lock && cargo check
