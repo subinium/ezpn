@@ -16,11 +16,16 @@ use crate::pane::Pane;
 const ACTIVE_COLOR: Color = Color::Cyan;
 const BORDER_COLOR: Color = Color::DarkGrey;
 const STATUS_BG: Color = Color::Rgb {
-    r: 30,
-    g: 30,
-    b: 30,
+    r: 36,
+    g: 38,
+    b: 48,
 };
 const STATUS_FG: Color = Color::White;
+const HINT_FG: Color = Color::Rgb {
+    r: 160,
+    g: 170,
+    b: 190,
+};
 const CLOSE_COLOR: Color = Color::DarkRed;
 const DEAD_FG: Color = Color::DarkGrey;
 const DRAG_COLOR: Color = Color::Yellow;
@@ -849,12 +854,15 @@ pub fn draw_status_bar_full(
     let hints: &[&str] = match mode_label {
         "PREFIX" => &[
             "%/\" split H/V",
+            "c new-pane",
             "o next",
+            "; last-pane",
             "←↑↓→ navigate",
             "z zoom",
             "B broadcast",
             "R resize",
             "[ scroll",
+            "Space equalize",
             "q pane-jump",
             "{/} swap",
             "x close",
@@ -882,28 +890,66 @@ pub fn draw_status_bar_full(
             "Ctrl+B ? help",
         ],
     };
-    let mut right_str = String::new();
+    // Compute which hints fit, then render with styled key portions
+    let separator = "  ";
+    let sep_len = separator.len();
+    let max_w = w.saturating_sub(left_end + 4 + clock_len);
+    let mut fitted: Vec<&str> = Vec::new();
+    let mut total_len = 0usize;
     for hint in hints.iter() {
-        let candidate = if right_str.is_empty() {
-            hint.to_string()
+        let added = if fitted.is_empty() {
+            hint.len()
         } else {
-            format!("{}  {}", right_str, hint)
+            sep_len + hint.len()
         };
-        // Reserve space for clock on the far right
-        if candidate.len() + left_end + 4 + clock_len < w {
-            right_str = candidate;
+        if total_len + added <= max_w {
+            total_len += added;
+            fitted.push(hint);
         } else {
             break;
         }
     }
-    if !right_str.is_empty() {
-        let rx = (w as u16).saturating_sub(right_str.len() as u16 + clock_len as u16 + 1);
-        queue!(
-            stdout,
-            cursor::MoveTo(rx, y),
-            SetForegroundColor(Color::Grey),
-            Print(&right_str)
-        )?;
+    if !fitted.is_empty() {
+        let rx = (w as u16).saturating_sub(total_len as u16 + clock_len as u16 + 1);
+        queue!(stdout, cursor::MoveTo(rx, y))?;
+        let key_fg = Color::Rgb {
+            r: 220,
+            g: 225,
+            b: 240,
+        };
+        let desc_fg = Color::Rgb {
+            r: 120,
+            g: 130,
+            b: 150,
+        };
+        for (i, hint) in fitted.iter().enumerate() {
+            if i > 0 {
+                queue!(stdout, SetForegroundColor(desc_fg), Print(separator))?;
+            }
+            // Split hint at first space: key part (bold) + desc part (dim)
+            if let Some(sp) = hint.find(' ') {
+                let (key, desc) = hint.split_at(sp);
+                queue!(
+                    stdout,
+                    SetForegroundColor(key_fg),
+                    SetAttribute(Attribute::Bold),
+                    Print(key),
+                    SetAttribute(Attribute::Reset),
+                    SetBackgroundColor(STATUS_BG),
+                    SetForegroundColor(desc_fg),
+                    Print(desc),
+                )?;
+            } else {
+                queue!(
+                    stdout,
+                    SetForegroundColor(key_fg),
+                    SetAttribute(Attribute::Bold),
+                    Print(*hint),
+                    SetAttribute(Attribute::Reset),
+                    SetBackgroundColor(STATUS_BG),
+                )?;
+            }
+        }
     }
 
     // Draw clock at far right
@@ -913,7 +959,7 @@ pub fn draw_status_bar_full(
             stdout,
             cursor::MoveTo(cx, y),
             SetBackgroundColor(STATUS_BG),
-            SetForegroundColor(Color::DarkGrey),
+            SetForegroundColor(HINT_FG),
             Print(&clock),
         )?;
     }

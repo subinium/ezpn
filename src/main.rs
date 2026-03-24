@@ -412,6 +412,9 @@ CONTROLS:
   Ctrl+W            Quit
 
 PREFIX KEYS (Ctrl+B then):
+  c                 New pane (split + focus)
+  ;                 Last active pane (toggle back)
+  Space             Equalize layout
   z                 Zoom toggle
   B                 Broadcast mode (type in all panes)
   R                 Resize mode (arrow/hjkl, q to exit)
@@ -530,6 +533,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
     let mut zoomed_pane: Option<usize> = None;
     let mut last_click: Option<(Instant, u16, u16)> = None;
     let mut broadcast = false;
+    let mut last_active: usize = active; // for Ctrl+B ; (last pane)
     let mut selection_anchor: Option<(usize, u16, u16)> = None; // (pane_id, rel_col, rel_row)
     let mut text_selection: Option<TextSelection> = None;
 
@@ -564,7 +568,14 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
         0,
     )?;
 
+    let mut prev_active = active;
     loop {
+        // Track last-active pane for Ctrl+B ;
+        if active != prev_active {
+            last_active = prev_active;
+            prev_active = active;
+        }
+
         let mut update = RenderUpdate::default();
 
         for (&pid, pane) in &mut panes {
@@ -667,7 +678,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
 
         // Prefix mode timeout
         if let InputMode::Prefix { entered_at } = &mode {
-            if entered_at.elapsed() > Duration::from_secs(1) {
+            if entered_at.elapsed() > Duration::from_secs(3) {
                 mode = InputMode::Normal;
                 update.full_redraw = true;
             }
@@ -965,6 +976,38 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                                 broadcast = !broadcast;
                                 update.full_redraw = true;
                             }
+                            // Last pane (tmux ;)
+                            KeyCode::Char(';') => {
+                                if panes.contains_key(&last_active) {
+                                    active = last_active;
+                                    update.full_redraw = true;
+                                }
+                            }
+                            // Cycle layout (tmux Space)
+                            KeyCode::Char(' ') => {
+                                layout.equalize();
+                                resize_all(&mut panes, &layout, tw, th, &settings);
+                                update.mark_all(&layout);
+                                update.border_dirty = true;
+                            }
+                            // New pane (tmux c) — split active pane horizontally
+                            KeyCode::Char('c') => {
+                                do_split(
+                                    &mut layout,
+                                    &mut panes,
+                                    active,
+                                    Direction::Horizontal,
+                                    &default_shell,
+                                    tw,
+                                    th,
+                                    &settings,
+                                    effective_scrollback,
+                                )?;
+                                // Focus the new pane
+                                active = layout.next_pane(active);
+                                update.mark_all(&layout);
+                                update.border_dirty = true;
+                            }
                             _ => {} // unknown prefix command, ignore
                         }
                         mode = next_mode;
@@ -1143,7 +1186,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
 
                     // Prefix mode timeout (1 second)
                     if let InputMode::Prefix { entered_at } = &mode {
-                        if entered_at.elapsed() > Duration::from_secs(1) {
+                        if entered_at.elapsed() > Duration::from_secs(3) {
                             mode = InputMode::Normal;
                             update.full_redraw = true;
                         }
