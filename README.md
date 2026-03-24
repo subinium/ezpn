@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/hero.gif" width="680" alt="ezpn in action">
+  <img src="assets/hero.png" width="720" alt="ezpn in action">
 </p>
 
 # ezpn
