@@ -2,7 +2,7 @@
 name = "ezpn"
 version = "0.3.1"
 edition = "2021"
-rust-version = "1.70"
+rust-version = "1.71"
 autobins = false
 description = "Dead simple terminal pane splitting — ezpn 2 3 gives you a 2x3 grid of shells"
 license = "MIT"
