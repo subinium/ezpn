@@ -21,18 +21,10 @@ pub struct Pane {
     alive: bool,
     launch: PaneLaunch,
     scroll_offset: usize, // 0 = live (bottom), >0 = scrolled up N lines
+    name: Option<String>,
 }
 
 impl Pane {
-    pub fn new(shell: &str, cols: u16, rows: u16) -> anyhow::Result<Self> {
-        Self::spawn(shell, PaneLaunch::Shell, cols, rows)
-    }
-
-    pub fn with_command(shell: &str, command: &str, cols: u16, rows: u16) -> anyhow::Result<Self> {
-        Self::spawn(shell, PaneLaunch::Command(command.to_string()), cols, rows)
-    }
-
-    #[allow(dead_code)]
     pub fn with_scrollback(
         shell: &str,
         launch: PaneLaunch,
@@ -40,11 +32,47 @@ impl Pane {
         rows: u16,
         scrollback: usize,
     ) -> anyhow::Result<Self> {
-        Self::spawn_inner(shell, launch, cols, rows, scrollback)
+        Self::spawn_inner(
+            shell,
+            launch,
+            cols,
+            rows,
+            scrollback,
+            None,
+            &std::collections::HashMap::new(),
+        )
     }
 
-    fn spawn(shell: &str, launch: PaneLaunch, cols: u16, rows: u16) -> anyhow::Result<Self> {
-        Self::spawn_inner(shell, launch, cols, rows, 0)
+    #[allow(dead_code)]
+    pub fn with_cwd(
+        shell: &str,
+        launch: PaneLaunch,
+        cols: u16,
+        rows: u16,
+        scrollback: usize,
+        cwd: &std::path::Path,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_inner(
+            shell,
+            launch,
+            cols,
+            rows,
+            scrollback,
+            Some(cwd),
+            &std::collections::HashMap::new(),
+        )
+    }
+
+    pub fn with_full_config(
+        shell: &str,
+        launch: PaneLaunch,
+        cols: u16,
+        rows: u16,
+        scrollback: usize,
+        cwd: Option<&std::path::Path>,
+        env: &std::collections::HashMap<String, String>,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_inner(shell, launch, cols, rows, scrollback, cwd, env)
     }
 
     fn spawn_inner(
@@ -53,6 +81,8 @@ impl Pane {
         cols: u16,
         rows: u16,
         scrollback: usize,
+        cwd: Option<&std::path::Path>,
+        env: &std::collections::HashMap<String, String>,
     ) -> anyhow::Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
@@ -68,8 +98,14 @@ impl Pane {
             cmd.arg("-c");
             cmd.arg(command);
         }
+        if let Some(dir) = cwd {
+            cmd.cwd(dir);
+        }
         cmd.env("TERM", "xterm-256color");
         cmd.env("EZPN", "1"); // prevent nesting
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
 
         let child = pair.slave.spawn_command(cmd)?;
         // Drop slave after spawning — reader gets EOF only when slave + master refs are gone
@@ -106,6 +142,7 @@ impl Pane {
             alive: true,
             launch,
             scroll_offset: 0,
+            name: None,
         })
     }
 
@@ -157,17 +194,42 @@ impl Pane {
         if cols == 0 || rows == 0 {
             return;
         }
-        let _ = self.master.resize(PtySize {
+        let result = self.master.resize(PtySize {
             rows,
             cols,
             pixel_width: 0,
             pixel_height: 0,
         });
+        if let Err(e) = &result {
+            eprintln!("ezpn: PTY resize failed: {e}");
+        }
         self.parser.set_size(rows, cols);
+        // Explicitly send SIGWINCH to the child's process group.
+        // portable_pty's ioctl(TIOCSWINSZ) should trigger this via the kernel,
+        // but we also send directly to cover edge cases.
+        #[cfg(unix)]
+        if let Some(pid) = self.child.process_id() {
+            unsafe {
+                // Send to process group (negative PID) to reach shell's children (e.g. claude)
+                libc::kill(-(pid as libc::pid_t), libc::SIGWINCH);
+            }
+        }
     }
 
     pub fn screen(&self) -> &vt100::Screen {
         self.parser.screen()
+    }
+
+    /// Sync the vt100 scrollback offset with our tracked scroll_offset.
+    /// Call this before drawing pane content so cell() returns scrollback.
+    pub fn sync_scrollback(&mut self) {
+        self.parser.set_scrollback(self.scroll_offset);
+    }
+
+    /// Reset vt100 scrollback offset to 0 (live view).
+    /// Call after rendering to avoid affecting process() behavior.
+    pub fn reset_scrollback_view(&mut self) {
+        self.parser.set_scrollback(0);
     }
 
     pub fn is_alive(&self) -> bool {
@@ -179,13 +241,16 @@ impl Pane {
         self.alive = false;
     }
 
-    #[allow(dead_code)]
     pub fn scroll_up(&mut self, lines: usize) {
-        let max = self.parser.screen().scrollback();
-        self.scroll_offset = (self.scroll_offset + lines).min(max);
+        // Set a large scrollback to discover the actual max,
+        // then read back the clamped value.
+        let probe = self.scroll_offset + lines;
+        self.parser.set_scrollback(probe);
+        self.scroll_offset = self.parser.screen().scrollback();
+        // Reset parser view to 0 so process() isn't affected
+        self.parser.set_scrollback(0);
     }
 
-    #[allow(dead_code)]
     pub fn scroll_down(&mut self, lines: usize) {
         self.scroll_offset = self.scroll_offset.saturating_sub(lines);
     }
@@ -195,14 +260,48 @@ impl Pane {
         self.scroll_offset
     }
 
-    #[allow(dead_code)]
     pub fn is_scrolled(&self) -> bool {
         self.scroll_offset > 0
     }
 
-    #[allow(dead_code)]
     pub fn snap_to_bottom(&mut self) {
         self.scroll_offset = 0;
+    }
+
+    /// Check if child has enabled mouse reporting
+    pub fn wants_mouse(&self) -> bool {
+        self.parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None
+    }
+
+    /// Forward a mouse event to the child in its requested encoding.
+    /// `col` and `row` are relative to the pane content area (0-indexed).
+    /// `button`: 0=left, 1=middle, 2=right, 64=scroll-up, 65=scroll-down
+    /// `release`: true for button release events
+    pub fn send_mouse_event(&mut self, button: u16, col: u16, row: u16, release: bool) {
+        let screen = self.parser.screen();
+        let encoding = screen.mouse_protocol_encoding();
+
+        match encoding {
+            vt100::MouseProtocolEncoding::Sgr => {
+                let end = if release { 'm' } else { 'M' };
+                let seq = format!("\x1b[<{};{};{}{}", button, col + 1, row + 1, end);
+                self.write_bytes(seq.as_bytes());
+            }
+            _ => {
+                // Default / UTF-8 encoding
+                let b = if release { 3u8 } else { (button as u8) & 0x7f };
+                let b = b.wrapping_add(32);
+                let c = ((col + 1).min(222) as u8).wrapping_add(32);
+                let r = ((row + 1).min(222) as u8).wrapping_add(32);
+                self.write_bytes(&[0x1b, b'[', b'M', b, c, r]);
+            }
+        }
+    }
+
+    /// Forward a mouse scroll event to the child.
+    pub fn send_mouse_scroll(&mut self, up: bool, col: u16, row: u16) {
+        let button: u16 = if up { 64 } else { 65 };
+        self.send_mouse_event(button, col, row, false);
     }
 
     pub fn launch(&self) -> &PaneLaunch {
@@ -210,10 +309,21 @@ impl Pane {
     }
 
     pub fn launch_label(&self, shell: &str) -> String {
+        if let Some(name) = &self.name {
+            return name.clone();
+        }
         match &self.launch {
             PaneLaunch::Shell => shell.to_string(),
             PaneLaunch::Command(command) => command.clone(),
         }
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    pub fn set_name(&mut self, name: Option<String>) {
+        self.name = name;
     }
 }
 

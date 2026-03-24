@@ -74,8 +74,27 @@ impl Layout {
     /// Parse a layout spec: "7:3" or "1:1:1" or "7:3/5:5" or "1/1:1"
     /// `/` separates rows, `:` separates columns within a row.
     /// Numbers are relative weights.
+    ///
+    /// Also supports named presets:
+    ///   "ide"     → 7:3/1:1  (editor + sidebar / two bottom panes)
+    ///   "dev"     → 7:3      (main + side)
+    ///   "monitor" → 1:1:1    (3 equal columns)
+    ///   "quad"    → 2x2 grid
+    ///   "stack"   → 1/1/1    (3 vertical rows)
+    ///   "main"    → 6:4/1    (wide top + full bottom)
     pub fn from_spec(spec: &str) -> Result<Self, String> {
-        let rows: Vec<&str> = spec.split('/').collect();
+        // Named presets
+        let resolved = match spec.trim() {
+            "ide" => "7:3/1:1",
+            "dev" => "7:3",
+            "monitor" => "1:1:1",
+            "quad" => return Ok(Self::from_grid(2, 2)),
+            "stack" => "1/1/1",
+            "main" => "6:4/1",
+            "trio" => "1/1:1",
+            other => other,
+        };
+        let rows: Vec<&str> = resolved.split('/').collect();
         if rows.is_empty() {
             return Err("empty layout spec".into());
         }
@@ -209,6 +228,48 @@ impl Layout {
         }
         let pos = ids.iter().position(|&id| id == current).unwrap_or(0);
         ids[(pos + 1) % ids.len()]
+    }
+
+    /// Previous pane ID in tree order (for cycling).
+    pub fn prev_pane(&self, current: usize) -> usize {
+        let ids = self.pane_ids();
+        if ids.is_empty() {
+            return current;
+        }
+        let pos = ids.iter().position(|&id| id == current).unwrap_or(0);
+        if pos == 0 {
+            ids[ids.len() - 1]
+        } else {
+            ids[pos - 1]
+        }
+    }
+
+    /// Swap two pane IDs in the tree (swap their positions).
+    pub fn swap_panes(&mut self, a: usize, b: usize) {
+        swap_leaf_ids(&mut self.root, a, b);
+    }
+
+    /// Resize a pane by moving the nearest matching separator.
+    /// Returns true if a resize was applied.
+    pub fn resize_pane(&mut self, pane_id: usize, dir: NavDir, delta: f32) -> bool {
+        let mut breadcrumbs = Vec::new();
+        collect_path_to_pane(&self.root, pane_id, &mut Vec::new(), &mut breadcrumbs);
+
+        let target_dir = match dir {
+            NavDir::Left | NavDir::Right => Direction::Horizontal,
+            NavDir::Up | NavDir::Down => Direction::Vertical,
+        };
+        let need_in_second = matches!(dir, NavDir::Left | NavDir::Up);
+
+        // Search from deepest to shallowest for the right split to adjust
+        for (path, split_dir, in_second) in breadcrumbs.iter().rev() {
+            if *split_dir == target_dir && *in_second == need_in_second {
+                let sign = if need_in_second { -1.0 } else { 1.0 };
+                adjust_ratio_at(&mut self.root, path, delta * sign);
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -451,15 +512,21 @@ fn find_sep_at(
     {
         let (a1, a2) = split_area(area, *direction, *ratio);
 
-        // Check if (x, y) is on this split's separator (±1 cell tolerance)
+        // Check if (x, y) is on this split's separator (±1 cell tolerance for easier grab)
         let on_sep = match direction {
             Direction::Horizontal => {
                 let sep_x = a1.x + a1.w;
-                x == sep_x && y >= area.y && y < area.y + area.h
+                x >= sep_x.saturating_sub(1)
+                    && x <= sep_x.saturating_add(1)
+                    && y >= area.y
+                    && y < area.y + area.h
             }
             Direction::Vertical => {
                 let sep_y = a1.y + a1.h;
-                y == sep_y && x >= area.x && x < area.x + area.w
+                y >= sep_y.saturating_sub(1)
+                    && y <= sep_y.saturating_add(1)
+                    && x >= area.x
+                    && x < area.x + area.w
             }
         };
 
@@ -573,6 +640,78 @@ fn contains(node: &LayoutNode, target: usize) -> bool {
         LayoutNode::Leaf { id } => *id == target,
         LayoutNode::Split { first, second, .. } => {
             contains(first, target) || contains(second, target)
+        }
+    }
+}
+
+// ─── Swap ──────────────────────────────────────────────────
+
+fn swap_leaf_ids(node: &mut LayoutNode, a: usize, b: usize) {
+    match node {
+        LayoutNode::Leaf { id } => {
+            if *id == a {
+                *id = b;
+            } else if *id == b {
+                *id = a;
+            }
+        }
+        LayoutNode::Split { first, second, .. } => {
+            swap_leaf_ids(first, a, b);
+            swap_leaf_ids(second, a, b);
+        }
+    }
+}
+
+// ─── Keyboard Resize ──────────────────────────────────────
+
+fn adjust_ratio_at(node: &mut LayoutNode, path: &[bool], delta: f32) {
+    if path.is_empty() {
+        if let LayoutNode::Split { ratio, .. } = node {
+            *ratio = (*ratio + delta).clamp(0.1, 0.9);
+        }
+    } else if let LayoutNode::Split { first, second, .. } = node {
+        if !path[0] {
+            adjust_ratio_at(first, &path[1..], delta);
+        } else {
+            adjust_ratio_at(second, &path[1..], delta);
+        }
+    }
+}
+
+/// Collect breadcrumbs from root to pane: (path_to_split, direction, pane_is_in_second).
+fn collect_path_to_pane(
+    node: &LayoutNode,
+    target: usize,
+    current_path: &mut Vec<bool>,
+    breadcrumbs: &mut Vec<(Vec<bool>, Direction, bool)>,
+) -> bool {
+    match node {
+        LayoutNode::Leaf { id } => *id == target,
+        LayoutNode::Split {
+            direction,
+            first,
+            second,
+            ..
+        } => {
+            let path_here = current_path.clone();
+
+            current_path.push(false);
+            if collect_path_to_pane(first, target, current_path, breadcrumbs) {
+                current_path.pop();
+                breadcrumbs.push((path_here, *direction, false));
+                return true;
+            }
+            current_path.pop();
+
+            current_path.push(true);
+            if collect_path_to_pane(second, target, current_path, breadcrumbs) {
+                current_path.pop();
+                breadcrumbs.push((path_here, *direction, true));
+                return true;
+            }
+            current_path.pop();
+
+            false
         }
     }
 }
@@ -811,5 +950,29 @@ mod tests {
         assert!(Layout::from_spec("abc").is_err());
         assert!(Layout::from_spec("0:0").is_err());
         assert!(Layout::from_spec("10").is_err());
+    }
+
+    #[test]
+    fn spec_presets() {
+        let ide = Layout::from_spec("ide").unwrap();
+        assert_eq!(ide.pane_count(), 4); // 7:3/1:1 = 2+2
+
+        let dev = Layout::from_spec("dev").unwrap();
+        assert_eq!(dev.pane_count(), 2); // 7:3
+
+        let monitor = Layout::from_spec("monitor").unwrap();
+        assert_eq!(monitor.pane_count(), 3); // 1:1:1
+
+        let quad = Layout::from_spec("quad").unwrap();
+        assert_eq!(quad.pane_count(), 4); // 2x2
+
+        let stack = Layout::from_spec("stack").unwrap();
+        assert_eq!(stack.pane_count(), 3); // 1/1/1
+
+        let main = Layout::from_spec("main").unwrap();
+        assert_eq!(main.pane_count(), 3); // 6:4/1
+
+        let trio = Layout::from_spec("trio").unwrap();
+        assert_eq!(trio.pane_count(), 3); // 1/1:1
     }
 }

@@ -31,7 +31,7 @@ ezpn -e 'make watch' -e 'npm dev'   # comando por panel
 
 ## Controles
 
-**Raton:** Clic para seleccionar / `x` para cerrar / Arrastrar borde para redimensionar / Scroll
+**Raton:** Clic para seleccionar / `x` para cerrar / Arrastrar borde para redimensionar / Doble clic para alternar zoom / Scroll
 
 **Teclado:**
 
@@ -52,6 +52,11 @@ ezpn -e 'make watch' -e 'npm dev'   # comando por panel
 | `o` | Panel siguiente |
 | `Arrow` | Navegacion direccional |
 | `x` | Cerrar panel |
+| `z` | Alternar zoom |
+| `R` | Modo redimensionar |
+| `q` | Numeros de panel + 1-9 para saltar (0 para el 10o) |
+| `{ }` | Intercambiar panel |
+| `?` | Ayuda |
 | `[` | Modo scroll (j/k/g/G, q para salir) |
 | `d` | Salir (con confirmacion) |
 
@@ -59,8 +64,13 @@ ezpn -e 'make watch' -e 'npm dev'   # comando por panel
 
 - **Diseños flexibles** — Cuadricula, proporciones, division libre, redimensionar arrastrando
 - **Comando por panel** — `-e` para lanzar comandos diferentes
-- **Botones en barra de titulo** — `[━] [┃] [×]` clic para dividir/cerrar
+- **Barra de titulo** — `[━] [┃] [×]` botones + muestra el comando en ejecucion
+- **Modo zoom** — `Ctrl+B z` o doble clic para pantalla completa
+- **Redimensionar por teclado** — `Ctrl+B R` → flechas/hjkl para ajustar
+- **Intercambiar paneles** — `Ctrl+B {` / `}` para cambiar posicion
+- **Salto rapido** — `Ctrl+B q` → numeros de panel, 1-9 para saltar
 - **Teclas tmux** — `Ctrl+B` seguido de teclas tmux estandar
+- **Archivo de configuracion** — `~/.config/ezpn/config.toml`
 - **Control IPC** — `ezpn-ctl` para automatizacion
 - **Snapshots de espacio de trabajo** — `ezpn-ctl save/load`
 

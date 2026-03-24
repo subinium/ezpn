@@ -14,6 +14,7 @@ mod config;
 mod ipc;
 mod layout;
 mod pane;
+mod project;
 mod render;
 mod settings;
 mod tab;
@@ -34,9 +35,20 @@ enum InputMode {
     Prefix { entered_at: Instant },
     ScrollMode,
     QuitConfirm,
+    ResizeMode,
+    PaneSelect,
+    HelpOverlay,
 }
 
 fn main() -> anyhow::Result<()> {
+    // Handle subcommands before anything else
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(|s| s.as_str()) {
+        Some("init") => return cmd_init(),
+        Some("from") => return cmd_from(args.get(2).map(|s| s.as_str())),
+        _ => {}
+    }
+
     if std::env::var("EZPN").is_ok() {
         eprintln!("ezpn: cannot run inside an existing ezpn session");
         std::process::exit(1);
@@ -66,6 +78,117 @@ fn main() -> anyhow::Result<()> {
     result
 }
 
+fn cmd_init() -> anyhow::Result<()> {
+    let path = std::path::Path::new(".ezpn.toml");
+    if path.exists() {
+        eprintln!("ezpn: .ezpn.toml already exists");
+        std::process::exit(1);
+    }
+
+    let template = r#"# ezpn project workspace
+# Run `ezpn` in this directory to auto-load this config.
+
+[workspace]
+# Layout spec: ratios separated by : (cols) and / (rows)
+# Examples: "7:3", "1:1:1", "7:3/5:5", "1/1:1"
+layout = "1:1"
+# Or use grid: rows = 2, cols = 3
+
+[[pane]]
+name = "editor"
+# command = "nvim ."
+# cwd = "."
+# shell = "/bin/zsh"
+# restart = "never"  # never | on_failure | always
+# [pane.env]
+# NODE_ENV = "development"
+
+[[pane]]
+name = "shell"
+# command = "npm run dev"
+# cwd = "./frontend"
+"#;
+
+    std::fs::write(path, template)?;
+    println!("Created .ezpn.toml — edit it and run `ezpn` to launch.");
+    Ok(())
+}
+
+/// Generate .ezpn.toml from Procfile or docker-compose.yml
+fn cmd_from(source: Option<&str>) -> anyhow::Result<()> {
+    let source = source.unwrap_or("Procfile");
+    let path = std::path::Path::new(source);
+    if !path.exists() {
+        eprintln!("ezpn: {} not found", source);
+        std::process::exit(1);
+    }
+
+    let out_path = std::path::Path::new(".ezpn.toml");
+    if out_path.exists() {
+        eprintln!("ezpn: .ezpn.toml already exists (delete it first or edit manually)");
+        std::process::exit(1);
+    }
+
+    let contents = std::fs::read_to_string(path)?;
+    let entries = parse_procfile(&contents);
+
+    if entries.is_empty() {
+        eprintln!("ezpn: no processes found in {}", source);
+        std::process::exit(1);
+    }
+
+    let mut toml = String::new();
+    toml.push_str(&format!("# Generated from {}\n\n", source));
+
+    // Auto-select layout based on count
+    let layout = match entries.len() {
+        1 => "1",
+        2 => "1:1",
+        3 => "1:1:1",
+        4 => "1:1/1:1",
+        n if n <= 6 => "1:1:1/1:1:1",
+        _ => "1:1:1/1:1:1",
+    };
+    toml.push_str(&format!("[workspace]\nlayout = \"{}\"\n\n", layout));
+
+    for (name, command) in &entries {
+        toml.push_str("[[pane]]\n");
+        toml.push_str(&format!("name = \"{}\"\n", name));
+        toml.push_str(&format!(
+            "command = \"{}\"\n\n",
+            command.replace('"', "\\\"")
+        ));
+    }
+
+    std::fs::write(out_path, &toml)?;
+    println!(
+        "Created .ezpn.toml from {} ({} processes). Run `ezpn` to launch.",
+        source,
+        entries.len()
+    );
+    Ok(())
+}
+
+/// Parse Procfile format: `name: command`
+fn parse_procfile(contents: &str) -> Vec<(String, String)> {
+    contents
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let (name, cmd) = line.split_once(':')?;
+            let name = name.trim();
+            let cmd = cmd.trim();
+            if name.is_empty() || cmd.is_empty() {
+                return None;
+            }
+            Some((name.to_string(), cmd.to_string()))
+        })
+        .collect()
+}
+
 enum LayoutSpec {
     Grid { rows: usize, cols: usize },
     Spec(String),
@@ -74,7 +197,9 @@ enum LayoutSpec {
 struct Config {
     layout: LayoutSpec,
     border: BorderStyle,
+    has_border_override: bool,
     shell: String,
+    has_shell_override: bool,
     commands: Vec<String>,
     restore: Option<String>,
 }
@@ -159,6 +284,10 @@ fn parse_args() -> anyhow::Result<Config> {
                 print_help();
                 std::process::exit(0);
             }
+            "-V" | "--version" => {
+                println!("ezpn {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             other if other.starts_with('-') => anyhow::bail!("Unknown option: {}", other),
             _ => positional.push(args[i].clone()),
         }
@@ -213,7 +342,9 @@ fn parse_args() -> anyhow::Result<Config> {
     Ok(Config {
         layout,
         border,
+        has_border_override: border_set,
         shell,
+        has_shell_override: shell_set,
         commands,
         restore,
     })
@@ -229,24 +360,42 @@ USAGE:
   ezpn [OPTIONS] [ROWS] [COLS]
   ezpn [OPTIONS] --layout <SPEC>
   ezpn --restore <FILE>
+  ezpn init                         Generate .ezpn.toml template
 
 EXAMPLES:
-  ezpn                              Two panes side by side
+  ezpn                              Two panes side by side (or load .ezpn.toml)
   ezpn 2 3                          2x3 grid (6 panes)
-  ezpn --layout '7:3'               70/30 horizontal split
-  ezpn --layout '1:1:1'             3 equal columns
-  ezpn --layout '7:3/5:5'           2 rows with different ratios
+  ezpn -l dev                       70/30 split (preset)
+  ezpn -l ide                       IDE layout (editor + sidebar + 2 bottom)
+  ezpn -l monitor                   3 equal columns
+  ezpn -l '7:3/5:5'                 Custom: 2 rows with different ratios
   ezpn -e 'make watch' -e 'npm dev' Per-pane commands via shell -lc
   ezpn --restore .ezpn-session.json Restore a saved workspace
+  ezpn init                         Create .ezpn.toml in current directory
 
 OPTIONS:
-  -l, --layout <SPEC>   Layout spec (rows with /, cols with :, weights 1-9)
+  -l, --layout <SPEC>   Layout spec or preset name (see PRESETS below)
   -e, --exec <CMD>      Command for each pane (repeatable, default: interactive $SHELL)
   -r, --restore <FILE>  Restore a saved workspace snapshot
   -b, --border <STYLE>  single, rounded, heavy, double (default: rounded)
   -d, --direction <DIR> h (horizontal, default) or v (vertical)
   -s, --shell <SHELL>   Default shell path (default: $SHELL)
   -h, --help            Show this help
+  -V, --version         Show version
+
+LAYOUT PRESETS:
+  dev       7:3         Main editor + side terminal
+  ide       7:3/1:1     Editor + sidebar + 2 bottom panes
+  monitor   1:1:1       3 equal columns
+  quad      2x2         4 panes in a grid
+  stack     1/1/1       3 stacked rows
+  main      6:4/1       Wide top pair + full-width bottom
+  trio      1/1:1       Full top + 2 bottom panes
+
+PROJECT CONFIG (.ezpn.toml):
+  Place .ezpn.toml in your project root. Run `ezpn init` to generate a template.
+  Supports: layout, per-pane commands, cwd, env vars, custom names,
+  auto-restart (never/on_failure/always), per-pane shell override.
 
 CONTROLS:
   Mouse click       Select pane
@@ -256,17 +405,43 @@ CONTROLS:
   Ctrl+E            Split top/bottom (auto-equalizes)
   Ctrl+N            Next pane
   F2                Equalize all pane sizes
-  Ctrl+B <key>      Prefix mode (tmux keys: % \" o x E [ d s)
+  Ctrl+B <key>      Prefix mode (tmux keys: % \" o x z R q ? {{ }} E B [ d s)
   Ctrl+G / F1       Settings panel (j/k/Enter/1-4/q)
   Alt+Arrow         Navigate (needs Meta key on macOS)
-  Ctrl+W            Quit"
+  Double-click      Zoom toggle
+  Ctrl+W            Quit
+
+PREFIX KEYS (Ctrl+B then):
+  z                 Zoom toggle
+  B                 Broadcast mode (type in all panes)
+  R                 Resize mode (arrow/hjkl, q to exit)
+  q                 Show pane numbers + quick jump (0-9)
+  ?                 Help overlay
+  {{ }}               Swap pane with prev/next"
     );
 }
 
 fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
     let (mut tw, mut th) = terminal::size()?;
-    let mut default_shell = config.shell.clone();
-    let mut settings = Settings::new(config.border);
+
+    // Load config file defaults, then overlay CLI args
+    let file_config = config::load_config();
+    let effective_scrollback = file_config.scrollback;
+    let mut default_shell = if config.has_shell_override {
+        config.shell.clone()
+    } else {
+        file_config.shell
+    };
+    let effective_border = if config.has_border_override {
+        config.border
+    } else {
+        file_config.border
+    };
+    let mut settings = Settings::new(effective_border);
+    settings.show_status_bar = file_config.show_status_bar;
+
+    // Auto-restart state (populated from .ezpn.toml if present)
+    let mut restart_policies: HashMap<usize, project::RestartPolicy> = HashMap::new();
 
     let (mut layout, mut panes, mut active) = if let Some(path) = &config.restore {
         let snapshot = workspace::load_snapshot(path)?;
@@ -274,9 +449,63 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
         default_shell = snapshot.shell.clone();
         settings.border_style = snapshot.border_style;
         settings.show_status_bar = snapshot.show_status_bar;
-        let panes = spawn_snapshot_panes(&layout, &snapshot, &default_shell, tw, th, &settings)?;
+        let panes = spawn_snapshot_panes(
+            &layout,
+            &snapshot,
+            &default_shell,
+            tw,
+            th,
+            &settings,
+            effective_scrollback,
+        )?;
         let active = snapshot.active_pane;
         (layout, panes, active)
+    } else if config.commands.is_empty()
+        && matches!(config.layout, LayoutSpec::Grid { rows: 1, cols: 2 })
+    {
+        // No explicit args — try loading .ezpn.toml from current directory
+        if let Some(result) = project::load_project() {
+            let proj = result.map_err(|e| anyhow::anyhow!("{e}"))?;
+            let panes = spawn_project_panes(
+                &proj,
+                &default_shell,
+                tw,
+                th,
+                &settings,
+                effective_scrollback,
+            )?;
+            // Store restart policies and pane launch info for auto-restart
+            restart_policies = proj.restarts.clone();
+            let active = *proj.layout.pane_ids().first().unwrap_or(&0);
+            (proj.layout, panes, active)
+        } else if let Some((layout, launches)) = try_load_procfile() {
+            // Auto-detected Procfile
+            let panes = spawn_layout_panes(
+                &layout,
+                launches,
+                &default_shell,
+                tw,
+                th,
+                &settings,
+                effective_scrollback,
+            )?;
+            let active = *layout.pane_ids().first().unwrap_or(&0);
+            (layout, panes, active)
+        } else {
+            // No .ezpn.toml or Procfile, use default 1x2 grid
+            let layout = Layout::from_grid(1, 2);
+            let panes = spawn_layout_panes(
+                &layout,
+                build_command_launches(&layout, &config.commands),
+                &default_shell,
+                tw,
+                th,
+                &settings,
+                effective_scrollback,
+            )?;
+            let active = *layout.pane_ids().first().unwrap_or(&0);
+            (layout, panes, active)
+        }
     } else {
         let layout = match &config.layout {
             LayoutSpec::Grid { rows, cols } => Layout::from_grid(*rows, *cols),
@@ -291,12 +520,25 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
             tw,
             th,
             &settings,
+            effective_scrollback,
         )?;
         let active = *layout.pane_ids().first().unwrap_or(&0);
         (layout, panes, active)
     };
 
     let mut drag: Option<DragState> = None;
+    let mut zoomed_pane: Option<usize> = None;
+    let mut last_click: Option<(Instant, u16, u16)> = None;
+    let mut broadcast = false;
+
+    let mut restart_state: HashMap<usize, (Instant, u32)> = HashMap::new(); // (last_death, retries)
+    const MAX_RESTART_RETRIES: u32 = 10;
+    const RESTART_DELAY: Duration = Duration::from_secs(2);
+    const RESTART_BACKOFF_THRESHOLD: u32 = 3; // after this many rapid restarts, increase delay
+
+    // Set window title
+    let _ = write!(stdout, "\x1b]0;ezpn\x07");
+    let _ = stdout.flush();
     let mut mode = InputMode::Normal;
     let ipc_rx = ipc::start_listener()
         .map_err(|e| eprintln!("ezpn: IPC unavailable ({e}), ezpn-ctl disabled"))
@@ -327,8 +569,96 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
             }
         }
 
-        if panes.is_empty() || panes.values().all(|pane| !pane.is_alive()) {
+        // Auto-restart dead panes with restart policy
+        {
+            let dead_restartable: Vec<usize> = panes
+                .iter()
+                .filter(|(pid, pane)| {
+                    !pane.is_alive()
+                        && restart_policies.get(pid).is_some_and(|p| {
+                            *p == project::RestartPolicy::Always
+                                || *p == project::RestartPolicy::OnFailure
+                        })
+                })
+                .map(|(&pid, _)| pid)
+                .collect();
+
+            for pid in dead_restartable {
+                let (last_death, retries) = restart_state
+                    .entry(pid)
+                    .or_insert((Instant::now() - RESTART_DELAY, 0));
+
+                if *retries >= MAX_RESTART_RETRIES {
+                    continue; // give up after too many retries
+                }
+
+                let delay = if *retries >= RESTART_BACKOFF_THRESHOLD {
+                    RESTART_DELAY * (*retries - RESTART_BACKOFF_THRESHOLD + 1)
+                } else {
+                    RESTART_DELAY
+                };
+
+                if last_death.elapsed() < delay {
+                    continue; // wait before restarting
+                }
+
+                let (launch, old_name) = panes
+                    .get(&pid)
+                    .map(|p| (p.launch().clone(), p.name().map(String::from)))
+                    .unwrap_or((PaneLaunch::Shell, None));
+                if replace_pane(
+                    &mut panes,
+                    &layout,
+                    pid,
+                    launch,
+                    &default_shell,
+                    tw,
+                    th,
+                    &settings,
+                    effective_scrollback,
+                )
+                .is_ok()
+                {
+                    // Preserve the pane name from config
+                    if let Some(pane) = panes.get_mut(&pid) {
+                        pane.set_name(old_name);
+                    }
+                    *retries += 1;
+                    *last_death = Instant::now();
+                    update.dirty_panes.insert(pid);
+                }
+            }
+        }
+
+        let all_dead = panes.is_empty()
+            || panes.iter().all(|(pid, pane)| {
+                if pane.is_alive() {
+                    return false; // alive pane → not all dead
+                }
+                // Dead pane — check if it can be restarted
+                let has_restart = restart_policies.get(pid).is_some_and(|p| {
+                    *p == project::RestartPolicy::Always || *p == project::RestartPolicy::OnFailure
+                });
+                if !has_restart {
+                    return true; // dead with no restart policy
+                }
+                // Has restart policy — check if retries exhausted
+                restart_state
+                    .get(pid)
+                    .is_some_and(|(_, retries)| *retries >= MAX_RESTART_RETRIES)
+            });
+        if all_dead {
             break;
+        }
+
+        // Unzoom if zoomed pane no longer exists
+        if let Some(zpid) = zoomed_pane {
+            if !panes.contains_key(&zpid) {
+                zoomed_pane = None;
+                resize_all(&mut panes, &layout, tw, th, &settings);
+                update.mark_all(&layout);
+                update.border_dirty = true;
+            }
         }
 
         // Prefix mode timeout
@@ -357,6 +687,67 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                                 mode = InputMode::Normal;
                                 update.full_redraw = true;
                             }
+                        }
+                    }
+                    // ── Help overlay: any key dismisses ──
+                    else if matches!(mode, InputMode::HelpOverlay) {
+                        mode = InputMode::Normal;
+                        update.full_redraw = true;
+                    }
+                    // ── Pane select: digit jumps, any other key cancels ──
+                    else if matches!(mode, InputMode::PaneSelect) {
+                        let ids = layout.pane_ids();
+                        if let KeyCode::Char(c @ '0'..='9') = key.code {
+                            let idx = match c {
+                                '1'..='9' => c as usize - '1' as usize,
+                                '0' => 9,
+                                _ => unreachable!(),
+                            };
+                            if let Some(&target) = ids.get(idx) {
+                                if panes.contains_key(&target) {
+                                    active = target;
+                                }
+                            }
+                        }
+                        mode = InputMode::Normal;
+                        update.full_redraw = true;
+                    }
+                    // ── Resize mode: arrows resize, q/Esc exits ──
+                    else if matches!(mode, InputMode::ResizeMode) {
+                        match key.code {
+                            KeyCode::Left | KeyCode::Char('h') => {
+                                if layout.resize_pane(active, NavDir::Left, 0.05) {
+                                    resize_all(&mut panes, &layout, tw, th, &settings);
+                                    update.mark_all(&layout);
+                                    update.border_dirty = true;
+                                }
+                            }
+                            KeyCode::Right | KeyCode::Char('l') => {
+                                if layout.resize_pane(active, NavDir::Right, 0.05) {
+                                    resize_all(&mut panes, &layout, tw, th, &settings);
+                                    update.mark_all(&layout);
+                                    update.border_dirty = true;
+                                }
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                if layout.resize_pane(active, NavDir::Up, 0.05) {
+                                    resize_all(&mut panes, &layout, tw, th, &settings);
+                                    update.mark_all(&layout);
+                                    update.border_dirty = true;
+                                }
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if layout.resize_pane(active, NavDir::Down, 0.05) {
+                                    resize_all(&mut panes, &layout, tw, th, &settings);
+                                    update.mark_all(&layout);
+                                    update.border_dirty = true;
+                                }
+                            }
+                            KeyCode::Char('q') | KeyCode::Esc => {
+                                mode = InputMode::Normal;
+                                update.full_redraw = true;
+                            }
+                            _ => {}
                         }
                     }
                     // ── Scroll mode: arrow/pgup/pgdn navigate, q/Esc exits ──
@@ -423,8 +814,9 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                     }
                     // ── Prefix mode: Ctrl+B was pressed, interpret next key ──
                     else if matches!(mode, InputMode::Prefix { .. }) {
-                        mode = InputMode::Normal;
                         update.full_redraw = true; // clear [PREFIX] indicator
+                                                   // Default: return to Normal. Some keys transition to other modes.
+                        let mut next_mode = InputMode::Normal;
                         match key.code {
                             // Split
                             KeyCode::Char('%') => {
@@ -437,6 +829,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                                     tw,
                                     th,
                                     &settings,
+                                    effective_scrollback,
                                 )?;
                                 update.mark_all(&layout);
                                 update.border_dirty = true;
@@ -451,6 +844,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                                     tw,
                                     th,
                                     &settings,
+                                    effective_scrollback,
                                 )?;
                                 update.mark_all(&layout);
                                 update.border_dirty = true;
@@ -487,6 +881,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                             KeyCode::Char('x') => {
                                 let target = active;
                                 close_pane(&mut layout, &mut panes, &mut active, target);
+                                resize_all(&mut panes, &layout, tw, th, &settings);
                                 update.mark_all(&layout);
                                 update.border_dirty = true;
                             }
@@ -499,7 +894,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                             }
                             // Scroll mode
                             KeyCode::Char('[') => {
-                                mode = InputMode::ScrollMode;
+                                next_mode = InputMode::ScrollMode;
                             }
                             // Quit with confirmation
                             KeyCode::Char('d') => {
@@ -507,8 +902,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                                 if live == 0 {
                                     break;
                                 }
-                                mode = InputMode::QuitConfirm;
-                                update.full_redraw = true;
+                                next_mode = InputMode::QuitConfirm;
                             }
                             // Toggle status bar
                             KeyCode::Char('s') => {
@@ -517,8 +911,59 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                                 update.mark_all(&layout);
                                 update.border_dirty = true;
                             }
+                            // Zoom toggle
+                            KeyCode::Char('z') => {
+                                if zoomed_pane.is_some() {
+                                    // Unzoom: restore normal layout sizes
+                                    zoomed_pane = None;
+                                    resize_all(&mut panes, &layout, tw, th, &settings);
+                                    update.mark_all(&layout);
+                                    update.border_dirty = true;
+                                } else {
+                                    // Zoom active pane
+                                    zoomed_pane = Some(active);
+                                    resize_zoomed_pane(&mut panes, active, tw, th, &settings);
+                                }
+                            }
+                            // Resize mode
+                            KeyCode::Char('R') => {
+                                next_mode = InputMode::ResizeMode;
+                            }
+                            // Pane select (show numbers)
+                            KeyCode::Char('q') => {
+                                next_mode = InputMode::PaneSelect;
+                            }
+                            // Help overlay
+                            KeyCode::Char('?') => {
+                                next_mode = InputMode::HelpOverlay;
+                            }
+                            // Swap with previous pane
+                            KeyCode::Char('{') => {
+                                let prev = layout.prev_pane(active);
+                                if prev != active {
+                                    layout.swap_panes(active, prev);
+                                    // active ID stays the same (it moved in the tree)
+                                    update.mark_all(&layout);
+                                    update.border_dirty = true;
+                                }
+                            }
+                            // Swap with next pane
+                            KeyCode::Char('}') => {
+                                let next = layout.next_pane(active);
+                                if next != active {
+                                    layout.swap_panes(active, next);
+                                    update.mark_all(&layout);
+                                    update.border_dirty = true;
+                                }
+                            }
+                            // Broadcast toggle
+                            KeyCode::Char('B') => {
+                                broadcast = !broadcast;
+                                update.full_redraw = true;
+                            }
                             _ => {} // unknown prefix command, ignore
                         }
+                        mode = next_mode;
                     }
                     // ── Normal mode ──
                     else {
@@ -560,6 +1005,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                                         tw,
                                         th,
                                         &settings,
+                                        effective_scrollback,
                                     )?;
                                     update.mark_all(&layout);
                                     update.border_dirty = true;
@@ -574,6 +1020,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                                         tw,
                                         th,
                                         &settings,
+                                        effective_scrollback,
                                     )?;
                                     update.mark_all(&layout);
                                     update.border_dirty = true;
@@ -604,6 +1051,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                                 tw,
                                 th,
                                 &settings,
+                                effective_scrollback,
                             )?;
                             update.mark_all(&layout);
                             update.border_dirty = true;
@@ -617,6 +1065,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                                 tw,
                                 th,
                                 &settings,
+                                effective_scrollback,
                             )?;
                             update.mark_all(&layout);
                             update.border_dirty = true;
@@ -644,6 +1093,12 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                                     active = next;
                                     update.full_redraw = true;
                                 }
+                            } else if broadcast {
+                                for pane in panes.values_mut() {
+                                    if pane.is_alive() {
+                                        pane.write_key(key);
+                                    }
+                                }
                             } else if let Some(pane) = panes.get_mut(&active) {
                                 if pane.is_alive() {
                                     pane.write_key(key);
@@ -665,8 +1120,16 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                                 tw,
                                 th,
                                 &settings,
+                                effective_scrollback,
                             )?;
                             update.dirty_panes.insert(active);
+                        } else if broadcast {
+                            // Broadcast: send key to all live panes
+                            for pane in panes.values_mut() {
+                                if pane.is_alive() {
+                                    pane.write_key(key);
+                                }
+                            }
                         } else if let Some(pane) = panes.get_mut(&active) {
                             if pane.is_alive() {
                                 pane.write_key(key);
@@ -701,6 +1164,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                                             tw,
                                             th,
                                             &settings,
+                                            effective_scrollback,
                                         )?;
                                         update.mark_all(&layout);
                                         update.border_dirty = true;
@@ -715,6 +1179,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                                             tw,
                                             th,
                                             &settings,
+                                            effective_scrollback,
                                         )?;
                                         update.mark_all(&layout);
                                         update.border_dirty = true;
@@ -742,6 +1207,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                                 match action {
                                     render::TitleAction::Close(pid) => {
                                         close_pane(&mut layout, &mut panes, &mut active, pid);
+                                        resize_all(&mut panes, &layout, tw, th, &settings);
                                     }
                                     render::TitleAction::SplitH(pid) => {
                                         // ━ button = horizontal line = top/bottom split
@@ -754,6 +1220,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                                             tw,
                                             th,
                                             &settings,
+                                            effective_scrollback,
                                         );
                                     }
                                     render::TitleAction::SplitV(pid) => {
@@ -767,6 +1234,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                                             tw,
                                             th,
                                             &settings,
+                                            effective_scrollback,
                                         );
                                     }
                                 }
@@ -780,9 +1248,45 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                             } else if let Some(pid) =
                                 layout.find_at(mouse.column, mouse.row, &inner)
                             {
-                                if pid != active && panes.contains_key(&pid) {
+                                // Double-click detection → zoom toggle
+                                let now = Instant::now();
+                                let is_double = last_click
+                                    .map(|(t, lx, ly)| {
+                                        now.duration_since(t) < Duration::from_millis(400)
+                                            && lx == mouse.column
+                                            && ly == mouse.row
+                                    })
+                                    .unwrap_or(false);
+                                last_click = Some((now, mouse.column, mouse.row));
+
+                                if is_double && panes.contains_key(&pid) {
+                                    // Toggle zoom
+                                    if zoomed_pane.is_some() {
+                                        zoomed_pane = None;
+                                        resize_all(&mut panes, &layout, tw, th, &settings);
+                                    } else {
+                                        zoomed_pane = Some(pid);
+                                        resize_zoomed_pane(&mut panes, pid, tw, th, &settings);
+                                    }
+                                    active = pid;
+                                    update.mark_all(&layout);
+                                    update.border_dirty = true;
+                                } else if pid != active && panes.contains_key(&pid) {
                                     active = pid;
                                     update.full_redraw = true;
+                                }
+                                // Forward click to child if it wants mouse
+                                if !is_double {
+                                    if let Some(pane) = panes.get_mut(&pid) {
+                                        if pane.wants_mouse() {
+                                            if let Some(rect) = border_cache.pane_rects().get(&pid)
+                                            {
+                                                let rel_col = mouse.column.saturating_sub(rect.x);
+                                                let rel_row = mouse.row.saturating_sub(rect.y);
+                                                pane.send_mouse_event(0, rel_col, rel_row, false);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -800,23 +1304,61 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                                 resize_all(&mut panes, &layout, tw, th, &settings);
                                 update.mark_all(&layout);
                                 update.border_dirty = true;
+                            } else {
+                                // Forward release to child if it wants mouse
+                                if let Some(pane) = panes.get_mut(&active) {
+                                    if pane.wants_mouse() {
+                                        if let Some(rect) = border_cache.pane_rects().get(&active) {
+                                            let rel_col = mouse.column.saturating_sub(rect.x);
+                                            let rel_row = mouse.row.saturating_sub(rect.y);
+                                            pane.send_mouse_event(0, rel_col, rel_row, true);
+                                        }
+                                    }
+                                }
                             }
                         }
                         MouseEventKind::ScrollUp => {
-                            if let Some(pane) = panes.get_mut(&active) {
+                            // Target pane under cursor, not just active
+                            let target = layout
+                                .find_at(mouse.column, mouse.row, &inner)
+                                .unwrap_or(active);
+                            if let Some(pane) = panes.get_mut(&target) {
                                 if pane.is_alive() {
-                                    // Send 3 arrow-ups (works in less, man, shell history, etc.)
-                                    for _ in 0..3 {
-                                        pane.write_bytes(b"\x1b[A");
+                                    if pane.wants_mouse() {
+                                        // Forward scroll to child in its encoding
+                                        if let Some(rect) = border_cache.pane_rects().get(&target) {
+                                            let rel_col = mouse.column.saturating_sub(rect.x);
+                                            let rel_row = mouse.row.saturating_sub(rect.y);
+                                            for _ in 0..3 {
+                                                pane.send_mouse_scroll(true, rel_col, rel_row);
+                                            }
+                                        }
+                                    } else {
+                                        // No mouse reporting — scroll through ezpn scrollback
+                                        pane.scroll_up(3);
+                                        update.dirty_panes.insert(target);
                                     }
                                 }
                             }
                         }
                         MouseEventKind::ScrollDown => {
-                            if let Some(pane) = panes.get_mut(&active) {
+                            let target = layout
+                                .find_at(mouse.column, mouse.row, &inner)
+                                .unwrap_or(active);
+                            if let Some(pane) = panes.get_mut(&target) {
                                 if pane.is_alive() {
-                                    for _ in 0..3 {
-                                        pane.write_bytes(b"\x1b[B");
+                                    if pane.wants_mouse() {
+                                        if let Some(rect) = border_cache.pane_rects().get(&target) {
+                                            let rel_col = mouse.column.saturating_sub(rect.x);
+                                            let rel_row = mouse.row.saturating_sub(rect.y);
+                                            for _ in 0..3 {
+                                                pane.send_mouse_scroll(false, rel_col, rel_row);
+                                            }
+                                        }
+                                    } else {
+                                        // No mouse reporting — scroll through ezpn scrollback
+                                        pane.scroll_down(3);
+                                        update.dirty_panes.insert(target);
                                     }
                                 }
                             }
@@ -847,6 +1389,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                     tw,
                     th,
                     &mut settings,
+                    effective_scrollback,
                 );
                 update.merge(&mut ipc_update);
                 let _ = resp_tx.send(response);
@@ -863,30 +1406,117 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
             border_cache = render::build_border_cache(&layout, settings.show_status_bar, tw, th);
         }
 
+        if zoomed_pane.is_some() {
+            zoomed_pane = Some(active);
+            resize_zoomed_pane(&mut panes, active, tw, th, &settings);
+        }
+
         if update.needs_render() {
+            // Sync scrollback offsets to vt100 parser before rendering
+            for pane in panes.values_mut() {
+                pane.sync_scrollback();
+            }
+
             let mode_label = match &mode {
                 InputMode::Prefix { .. } => "PREFIX",
                 InputMode::ScrollMode => "SCROLL",
                 InputMode::QuitConfirm => "QUIT? y/n",
+                InputMode::ResizeMode => "RESIZE",
+                InputMode::PaneSelect => "SELECT",
+                InputMode::HelpOverlay => "",
+                InputMode::Normal if broadcast => "BROADCAST",
                 InputMode::Normal => "",
             };
-            render_frame(
-                stdout,
-                &panes,
-                &layout,
-                active,
-                &settings,
-                tw,
-                th,
-                drag.is_some(),
-                &border_cache,
-                &update.dirty_panes,
-                update.full_redraw,
-                mode_label,
-            )?;
+
+            if let Some(zpid) = zoomed_pane {
+                // Zoomed mode: render only the zoomed pane at full size
+                queue!(stdout, terminal::BeginSynchronizedUpdate)?;
+                let ids = layout.pane_ids();
+                let pane_idx = ids.iter().position(|&id| id == zpid).unwrap_or(0);
+                let label = panes
+                    .get(&zpid)
+                    .map(|p| p.launch_label(&default_shell))
+                    .unwrap_or_default();
+                if let Some(pane) = panes.get(&zpid) {
+                    render::render_zoomed_pane(
+                        stdout,
+                        pane,
+                        pane_idx,
+                        &label,
+                        settings.border_style,
+                        tw,
+                        th,
+                        settings.show_status_bar,
+                    )?;
+                }
+                // Status bar
+                if settings.show_status_bar {
+                    let zoom_label = if mode_label.is_empty() {
+                        "ZOOM"
+                    } else {
+                        mode_label
+                    };
+                    let pane_name = panes.get(&zpid).and_then(|p| p.name()).unwrap_or("");
+                    render::draw_status_bar_full(
+                        stdout,
+                        tw,
+                        th,
+                        pane_idx,
+                        ids.len(),
+                        zoom_label,
+                        pane_name,
+                    )?;
+                }
+                queue!(stdout, terminal::EndSynchronizedUpdate)?;
+                stdout.flush()?;
+            } else {
+                render_frame(
+                    stdout,
+                    &panes,
+                    &layout,
+                    active,
+                    &settings,
+                    tw,
+                    th,
+                    drag.is_some(),
+                    &border_cache,
+                    &update.dirty_panes,
+                    update.full_redraw,
+                    mode_label,
+                )?;
+            }
+
+            // Overlays on top of the main render
+            if matches!(mode, InputMode::HelpOverlay) {
+                queue!(stdout, terminal::BeginSynchronizedUpdate)?;
+                render::draw_help_overlay(stdout, tw, th)?;
+                queue!(stdout, terminal::EndSynchronizedUpdate)?;
+                stdout.flush()?;
+            }
+            if matches!(mode, InputMode::PaneSelect) {
+                let inner = make_inner(tw, th, settings.show_status_bar);
+                queue!(stdout, terminal::BeginSynchronizedUpdate)?;
+                render::draw_pane_numbers(stdout, &layout, &inner)?;
+                queue!(stdout, terminal::EndSynchronizedUpdate)?;
+                stdout.flush()?;
+            }
+
+            // Reset scrollback view so process() isn't affected
+            for pane in panes.values_mut() {
+                pane.reset_scrollback_view();
+            }
+        }
+
+        // Update window title with pane count
+        {
+            let ids = layout.pane_ids();
+            let idx = ids.iter().position(|&id| id == active).unwrap_or(0);
+            let _ = write!(stdout, "\x1b]0;ezpn [{}/{}]\x07", idx + 1, ids.len());
         }
     }
 
+    // Restore window title
+    let _ = write!(stdout, "\x1b]0;\x07");
     ipc::cleanup();
     Ok(())
 }
@@ -898,6 +1528,24 @@ fn make_inner(tw: u16, th: u16, show_status_bar: bool) -> Rect {
         y: 1,
         w: tw.saturating_sub(2),
         h: th.saturating_sub(sh + 2),
+    }
+}
+
+fn zoomed_content_size(tw: u16, th: u16, show_status_bar: bool) -> (u16, u16) {
+    let sh = if show_status_bar { 1u16 } else { 0 };
+    (tw.saturating_sub(2), th.saturating_sub(sh + 2))
+}
+
+fn resize_zoomed_pane(
+    panes: &mut HashMap<usize, Pane>,
+    pane_id: usize,
+    tw: u16,
+    th: u16,
+    settings: &Settings,
+) {
+    let (cols, rows) = zoomed_content_size(tw, th, settings.show_status_bar);
+    if let Some(pane) = panes.get_mut(&pane_id) {
+        pane.resize(cols, rows);
     }
 }
 
@@ -935,7 +1583,8 @@ fn render_frame(
     if settings.show_status_bar && !mode_label.is_empty() {
         let ids = layout.pane_ids();
         let active_idx = ids.iter().position(|&id| id == active).unwrap_or(0);
-        render::draw_status_bar(stdout, tw, th, active_idx, ids.len(), mode_label)?;
+        let pane_name = panes.get(&active).and_then(|p| p.name()).unwrap_or("");
+        render::draw_status_bar_full(stdout, tw, th, active_idx, ids.len(), mode_label, pane_name)?;
     }
     if settings.visible {
         settings.render_overlay(stdout, tw, th)?;
@@ -944,6 +1593,39 @@ fn render_frame(
     queue!(stdout, terminal::EndSynchronizedUpdate)?;
     stdout.flush()?;
     Ok(())
+}
+
+/// Try to load a Procfile from the current directory. Returns layout + launches.
+fn try_load_procfile() -> Option<(Layout, HashMap<usize, PaneLaunch>)> {
+    let path = std::path::Path::new("Procfile");
+    if !path.exists() {
+        return None;
+    }
+    let contents = std::fs::read_to_string(path).ok()?;
+    let entries = parse_procfile(&contents);
+    if entries.is_empty() {
+        return None;
+    }
+    let count = entries.len();
+    let layout = match count {
+        1 => Layout::from_grid(1, 1),
+        2 => Layout::from_spec("1:1").unwrap_or_else(|_| Layout::from_grid(1, 2)),
+        3 => Layout::from_spec("1:1:1").unwrap_or_else(|_| Layout::from_grid(1, 3)),
+        _ => Layout::from_grid(((count + 2) / 3).max(1), 3.min(count)),
+    };
+    let ids = layout.pane_ids();
+    let launches: HashMap<usize, PaneLaunch> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| {
+            let launch = entries
+                .get(i)
+                .map(|(_, cmd)| PaneLaunch::Command(cmd.clone()))
+                .unwrap_or(PaneLaunch::Shell);
+            (id, launch)
+        })
+        .collect();
+    Some((layout, launches))
 }
 
 fn build_command_launches(layout: &Layout, commands: &[String]) -> HashMap<usize, PaneLaunch> {
@@ -976,6 +1658,7 @@ fn spawn_layout_panes(
     tw: u16,
     th: u16,
     settings: &Settings,
+    scrollback: usize,
 ) -> anyhow::Result<HashMap<usize, Pane>> {
     let inner = make_inner(tw, th, settings.show_status_bar);
     let rects = layout.pane_rects(&inner);
@@ -998,7 +1681,7 @@ fn spawn_layout_panes(
                 let pid = *pid;
                 let cols = *cols;
                 let rows = *rows;
-                s.spawn(move || (pid, spawn_pane(shell, launch, cols, rows)))
+                s.spawn(move || (pid, spawn_pane(shell, launch, cols, rows, scrollback)))
             })
             .collect();
         for handle in handles {
@@ -1020,6 +1703,7 @@ fn spawn_snapshot_panes(
     tw: u16,
     th: u16,
     settings: &Settings,
+    scrollback: usize,
 ) -> anyhow::Result<HashMap<usize, Pane>> {
     spawn_layout_panes(
         layout,
@@ -1028,14 +1712,51 @@ fn spawn_snapshot_panes(
         tw,
         th,
         settings,
+        scrollback,
     )
 }
 
-fn spawn_pane(shell: &str, launch: &PaneLaunch, cols: u16, rows: u16) -> anyhow::Result<Pane> {
-    match launch {
-        PaneLaunch::Shell => Pane::new(shell, cols, rows),
-        PaneLaunch::Command(command) => Pane::with_command(shell, command, cols, rows),
+fn spawn_pane(
+    shell: &str,
+    launch: &PaneLaunch,
+    cols: u16,
+    rows: u16,
+    scrollback: usize,
+) -> anyhow::Result<Pane> {
+    Pane::with_scrollback(shell, launch.clone(), cols, rows, scrollback)
+}
+
+fn spawn_project_panes(
+    proj: &project::ResolvedProject,
+    shell: &str,
+    tw: u16,
+    th: u16,
+    settings: &Settings,
+    scrollback: usize,
+) -> anyhow::Result<HashMap<usize, Pane>> {
+    let inner = make_inner(tw, th, settings.show_status_bar);
+    let rects = proj.layout.pane_rects(&inner);
+    let mut panes = HashMap::new();
+
+    for (&pid, rect) in &rects {
+        let launch = proj
+            .launches
+            .get(&pid)
+            .cloned()
+            .unwrap_or(PaneLaunch::Shell);
+        let cols = rect.w.max(1);
+        let rows = rect.h.max(1);
+        let pane_shell = proj.shells.get(&pid).map(|s| s.as_str()).unwrap_or(shell);
+        let cwd = proj.cwds.get(&pid).map(|p| p.as_path());
+        let env = proj.envs.get(&pid).cloned().unwrap_or_default();
+        let mut pane =
+            Pane::with_full_config(pane_shell, launch, cols, rows, scrollback, cwd, &env)?;
+        if let Some(name) = proj.names.get(&pid) {
+            pane.set_name(Some(name.clone()));
+        }
+        panes.insert(pid, pane);
     }
+    Ok(panes)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1048,13 +1769,14 @@ fn replace_pane(
     tw: u16,
     th: u16,
     settings: &Settings,
+    scrollback: usize,
 ) -> anyhow::Result<()> {
     let inner = make_inner(tw, th, settings.show_status_bar);
     let rect = layout
         .pane_rects(&inner)
         .remove(&pane_id)
         .ok_or_else(|| anyhow::anyhow!("pane rect not found"))?;
-    let new_pane = spawn_pane(shell, &launch, rect.w.max(1), rect.h.max(1))?;
+    let new_pane = spawn_pane(shell, &launch, rect.w.max(1), rect.h.max(1), scrollback)?;
     if let Some(mut old_pane) = panes.insert(pane_id, new_pane) {
         old_pane.kill();
     }
@@ -1077,6 +1799,7 @@ fn apply_snapshot(
     settings: &mut Settings,
     tw: u16,
     th: u16,
+    scrollback: usize,
 ) -> anyhow::Result<()> {
     let mut next_settings = Settings::new(snapshot.border_style);
     next_settings.show_status_bar = snapshot.show_status_bar;
@@ -1088,6 +1811,7 @@ fn apply_snapshot(
         tw,
         th,
         &next_settings,
+        scrollback,
     )?;
 
     kill_all_panes(panes);
@@ -1110,6 +1834,7 @@ fn do_split(
     tw: u16,
     th: u16,
     settings: &Settings,
+    scrollback: usize,
 ) -> anyhow::Result<()> {
     let inner = make_inner(tw, th, settings.show_status_bar);
     if let Some(rect) = layout.pane_rects(&inner).get(&active) {
@@ -1127,7 +1852,16 @@ fn do_split(
     let new_id = layout.split(active, dir);
     let rects = layout.pane_rects(&inner);
     if let Some(rect) = rects.get(&new_id) {
-        panes.insert(new_id, Pane::new(shell, rect.w.max(1), rect.h.max(1))?);
+        panes.insert(
+            new_id,
+            spawn_pane(
+                shell,
+                &PaneLaunch::Shell,
+                rect.w.max(1),
+                rect.h.max(1),
+                scrollback,
+            )?,
+        );
     }
     resize_all(panes, layout, tw, th, settings);
     Ok(())
@@ -1233,6 +1967,7 @@ fn handle_ipc_command(
     tw: u16,
     th: u16,
     settings: &mut Settings,
+    scrollback: usize,
 ) -> (ipc::IpcResponse, RenderUpdate) {
     let mut update = RenderUpdate::default();
 
@@ -1246,7 +1981,9 @@ fn handle_ipc_command(
                     ipc::SplitDirection::Horizontal => Direction::Horizontal,
                     ipc::SplitDirection::Vertical => Direction::Vertical,
                 };
-                match do_split(layout, panes, target, dir, shell, tw, th, settings) {
+                match do_split(
+                    layout, panes, target, dir, shell, tw, th, settings, scrollback,
+                ) {
                     Ok(()) => {
                         update.mark_all(layout);
                         update.border_dirty = true;
@@ -1261,6 +1998,7 @@ fn handle_ipc_command(
                 ipc::IpcResponse::error("pane not found")
             } else {
                 close_pane(layout, panes, active, pane);
+                resize_all(panes, layout, tw, th, settings);
                 update.mark_all(layout);
                 update.border_dirty = true;
                 ipc::IpcResponse::success("closed")
@@ -1312,7 +2050,15 @@ fn handle_ipc_command(
         }
         ipc::IpcRequest::Layout { spec } => match Layout::from_spec(&spec) {
             Ok(new_layout) => {
-                match spawn_layout_panes(&new_layout, HashMap::new(), shell, tw, th, settings) {
+                match spawn_layout_panes(
+                    &new_layout,
+                    HashMap::new(),
+                    shell,
+                    tw,
+                    th,
+                    settings,
+                    scrollback,
+                ) {
                     Ok(new_panes) => {
                         kill_all_panes(panes);
                         *layout = new_layout;
@@ -1340,6 +2086,7 @@ fn handle_ipc_command(
                     tw,
                     th,
                     settings,
+                    scrollback,
                 ) {
                     Ok(()) => {
                         update.dirty_panes.insert(pane);
@@ -1365,7 +2112,9 @@ fn handle_ipc_command(
         }
         ipc::IpcRequest::Load { path } => match workspace::load_snapshot(&path) {
             Ok(snapshot) => {
-                match apply_snapshot(snapshot, layout, panes, active, shell, settings, tw, th) {
+                match apply_snapshot(
+                    snapshot, layout, panes, active, shell, settings, tw, th, scrollback,
+                ) {
                     Ok(()) => {
                         update.mark_all(layout);
                         update.border_dirty = true;
