@@ -1737,7 +1737,7 @@ fn try_load_procfile() -> Option<(Layout, HashMap<usize, PaneLaunch>)> {
         1 => Layout::from_grid(1, 1),
         2 => Layout::from_spec("1:1").unwrap_or_else(|_| Layout::from_grid(1, 2)),
         3 => Layout::from_spec("1:1:1").unwrap_or_else(|_| Layout::from_grid(1, 3)),
-        _ => Layout::from_grid(((count + 2) / 3).max(1), 3.min(count)),
+        _ => Layout::from_grid(count.div_ceil(3).max(1), 3.min(count)),
     };
     let ids = layout.pane_ids();
     let launches: HashMap<usize, PaneLaunch> = ids
@@ -2145,7 +2145,7 @@ fn extract_selected_text(screen: &vt100::Screen, sel: &TextSelection) -> String 
 /// Minimal base64 encoder for OSC 52 clipboard.
 fn base64_encode(data: &[u8]) -> String {
     const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
