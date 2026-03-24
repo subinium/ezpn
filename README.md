@@ -13,6 +13,14 @@ A terminal pane splitter. Click to select. Drag to resize. No config needed.
 ## Install
 
 ```bash
+cargo install ezpn
+```
+
+Or build from source:
+
+```bash
+git clone https://github.com/subinium/ezpn
+cd ezpn
 cargo install --path .
 ```
 
