@@ -333,8 +333,20 @@ pub fn render_panes(
                 clear_title(stdout, rect)?;
             }
             let is_active = pid == active_id;
-            let is_alive = panes.get(&pid).is_some_and(|p| p.is_alive());
-            draw_pane_title(stdout, rect, display_idx, is_active, is_alive, &chars)?;
+            let pane_ref = panes.get(&pid);
+            let is_alive = pane_ref.is_some_and(|p| p.is_alive());
+            let label = pane_ref.map(|p| p.launch_label("")).unwrap_or_default();
+            let is_scrolled = pane_ref.is_some_and(|p| p.is_scrolled());
+            draw_pane_title(
+                stdout,
+                rect,
+                display_idx,
+                is_active,
+                is_alive,
+                &label,
+                is_scrolled,
+                &chars,
+            )?;
             if let Some(pane) = panes.get(&pid) {
                 draw_content(stdout, pane, rect, is_alive)?;
             }
@@ -409,12 +421,15 @@ fn is_pane_border(x: u16, y: u16, r: &Rect) -> bool {
         || (x == left || x == right) && y >= top && y <= bot
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_pane_title(
     stdout: &mut io::Stdout,
     rect: &Rect,
     idx: usize,
     is_active: bool,
     is_alive: bool,
+    label: &str,
+    is_scrolled: bool,
     chars: &BorderChars,
 ) -> anyhow::Result<()> {
     let title_y = rect.y.saturating_sub(1);
@@ -424,15 +439,21 @@ fn draw_pane_title(
         return Ok(());
     }
 
-    let title = if is_alive {
-        format!(" {} ", idx + 1)
-    } else {
+    let scroll_ind = if is_scrolled { " [SCROLL]" } else { "" };
+    let title = if !is_alive {
         format!(" {} [exited] ", idx + 1)
+    } else if label.is_empty() || avail < 12 {
+        format!(" {}{} ", idx + 1, scroll_ind)
+    } else {
+        // Truncate label to fit
+        let max_label = avail.saturating_sub(8 + scroll_ind.len()); // room for " N: ... "
+        let short = truncate_label(label, max_label);
+        format!(" {}:{}{} ", idx + 1, short, scroll_ind)
     };
     let tlen = title.len();
-    // Buttons: [━] [┃] [×] — 12 chars total
-    let show_buttons = avail >= tlen + 14;
-    let btn_len = if show_buttons { 12 } else { 0 };
+    // Buttons: [━] [┃] [×] — 11 display columns total
+    let show_buttons = avail >= tlen + 13;
+    let btn_len = if show_buttons { 11 } else { 0 };
     // Fallback: just close button
     let show_close = !show_buttons && avail >= tlen + 4;
     let close_len = if show_close { 2 } else { 0 };
@@ -491,17 +512,68 @@ fn draw_pane_title(
     Ok(())
 }
 
+fn truncate_label(label: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    for ch in label.chars().take(max_chars) {
+        out.push(ch);
+    }
+    out
+}
+
 /// Draw dimmed overlay on dead panes with centered message.
 fn draw_dead_overlay(stdout: &mut io::Stdout, rect: &Rect) -> anyhow::Result<()> {
     if rect.w < 5 || rect.h < 1 {
         return Ok(());
     }
-    let msg = "[press Enter to respawn]";
+
+    // Dim background for dead pane
+    let dim_bg = Color::Rgb {
+        r: 10,
+        g: 10,
+        b: 14,
+    };
+    for row in 0..rect.h {
+        queue!(
+            stdout,
+            cursor::MoveTo(rect.x, rect.y + row),
+            SetBackgroundColor(dim_bg),
+        )?;
+        for _ in 0..rect.w {
+            queue!(stdout, Print(" "))?;
+        }
+    }
+
     let my = rect.y + rect.h / 2;
+
+    // "Process exited" label
+    if rect.h >= 3 {
+        let label = "Process exited";
+        let lx = rect.x + rect.w.saturating_sub(label.len() as u16) / 2;
+        queue!(
+            stdout,
+            cursor::MoveTo(lx, my.saturating_sub(1)),
+            SetBackgroundColor(dim_bg),
+            SetForegroundColor(Color::Rgb {
+                r: 120,
+                g: 60,
+                b: 60
+            }),
+            SetAttribute(Attribute::Bold),
+            Print(label),
+            SetAttribute(Attribute::Reset),
+        )?;
+    }
+
+    // "Press Enter to respawn" hint
+    let msg = "Press Enter to respawn";
     let mx = rect.x + rect.w.saturating_sub(msg.len() as u16) / 2;
     queue!(
         stdout,
         cursor::MoveTo(mx, my),
+        SetBackgroundColor(dim_bg),
         SetForegroundColor(Color::DarkGrey),
         SetAttribute(Attribute::Italic),
         Print(msg),
@@ -533,6 +605,19 @@ fn draw_content(
 
         for c in 0..rect.w {
             if let Some(cell) = screen.cell(r, c) {
+                // Skip wide character continuation cells — the wide char itself
+                // already occupies 2 display columns when printed.
+                if cell.is_wide_continuation() {
+                    continue;
+                }
+
+                // If this is a wide char at the last column, it would overflow.
+                // Print a space instead to stay within bounds.
+                if cell.is_wide() && c + 1 >= rect.w {
+                    buf.push(' ');
+                    continue;
+                }
+
                 let mut fg = vt100_to_crossterm(cell.fgcolor());
                 let bg = vt100_to_crossterm(cell.bgcolor());
                 if !is_alive {
@@ -620,6 +705,19 @@ pub fn draw_status_bar(
     total: usize,
     mode_label: &str,
 ) -> anyhow::Result<()> {
+    draw_status_bar_full(stdout, term_w, term_h, active_idx, total, mode_label, "")
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn draw_status_bar_full(
+    stdout: &mut io::Stdout,
+    term_w: u16,
+    term_h: u16,
+    active_idx: usize,
+    total: usize,
+    mode_label: &str,
+    pane_name: &str,
+) -> anyhow::Result<()> {
     let y = term_h - 1;
     let w = term_w as usize;
 
@@ -633,14 +731,18 @@ pub fn draw_status_bar(
         queue!(stdout, Print(" "))?;
     }
 
-    // Left: pane info
+    // Left: pane info + name
     queue!(
         stdout,
         cursor::MoveTo(1, y),
         SetForegroundColor(ACTIVE_COLOR),
         SetAttribute(Attribute::Bold)
     )?;
-    let left = format!("Pane {}/{}", active_idx + 1, total);
+    let left = if pane_name.is_empty() {
+        format!("Pane {}/{}", active_idx + 1, total)
+    } else {
+        format!("Pane {}/{} {}", active_idx + 1, total, pane_name)
+    };
     queue!(stdout, Print(&left))?;
     let mut left_end = 1 + left.len();
 
@@ -667,19 +769,35 @@ pub fn draw_status_bar(
         left_end += mode_label.len() + 2;
     }
 
-    // Right: hints (truncate if too narrow)
+    // Right: context-aware hints based on mode
     queue!(
         stdout,
         SetAttribute(Attribute::Reset),
         SetBackgroundColor(STATUS_BG)
     )?;
-    let hints = [
-        "Ctrl+D/E split",
-        "Ctrl+N next",
-        "Ctrl+B prefix",
-        "Ctrl+G settings",
-        "Ctrl+W quit",
-    ];
+    let hints: &[&str] = match mode_label {
+        "PREFIX" => &[
+            "% \" split",
+            "o next",
+            "z zoom",
+            "B broadcast",
+            "x close",
+            "? help",
+        ],
+        "RESIZE" => &["←→↑↓ resize", "hjkl resize", "q exit"],
+        "SCROLL" => &["j/k scroll", "g/G top/bottom", "PgUp/Dn", "q exit"],
+        "SELECT" => &["1-9 jump", "0 for 10th", "any key cancel"],
+        "QUIT? y/n" => &["y confirm", "any key cancel"],
+        "ZOOM" => &["Ctrl+B z unzoom", "type normally"],
+        "BROADCAST" => &["typing in ALL panes", "Ctrl+B B to stop"],
+        _ => &[
+            "Ctrl+D/E split",
+            "Ctrl+N next",
+            "Ctrl+B prefix",
+            "Ctrl+G settings",
+            "Ctrl+W quit",
+        ],
+    };
     let mut right_str = String::new();
     for hint in hints.iter() {
         let candidate = if right_str.is_empty() {
@@ -724,19 +842,21 @@ pub fn title_button_hit(x: u16, y: u16, layout: &Layout, inner: &Rect) -> Option
             continue;
         }
         let avail = rect.w as usize;
-        if avail >= 14 {
-            // Full button set: [━] [┃] [×] — 12 chars from right edge
-            let base = rect.x + rect.w;
-            // [×] at base-3..base-1
-            if x >= base.saturating_sub(3) && x <= base.saturating_sub(1) {
+        if avail >= 13 {
+            // Full button set: [━] [┃] [×] — 11 display cols from right edge
+            // Rendered as: "[━] [┃] [×]"
+            //              -11        -1
+            let end = rect.x + rect.w; // 1 past the last content col
+                                       // [×] at end-3..end-1 (3 chars)
+            if x >= end.saturating_sub(3) && x < end {
                 return Some(TitleAction::Close(pid));
             }
-            // [┃] at base-7..base-5
-            if x >= base.saturating_sub(7) && x <= base.saturating_sub(5) {
+            // [┃] at end-7..end-5 (3 chars)
+            if x >= end.saturating_sub(7) && x < end.saturating_sub(4) {
                 return Some(TitleAction::SplitV(pid));
             }
-            // [━] at base-11..base-9
-            if x >= base.saturating_sub(11) && x <= base.saturating_sub(9) {
+            // [━] at end-11..end-9 (3 chars)
+            if x >= end.saturating_sub(11) && x < end.saturating_sub(8) {
                 return Some(TitleAction::SplitH(pid));
             }
         } else if avail >= 4 {
@@ -748,6 +868,336 @@ pub fn title_button_hit(x: u16, y: u16, layout: &Layout, inner: &Rect) -> Option
         }
     }
     None
+}
+
+// ─── Zoomed Pane Rendering ─────────────────────────────────
+
+/// Render a single pane at full terminal size (zoom mode).
+#[allow(clippy::too_many_arguments)]
+pub fn render_zoomed_pane(
+    stdout: &mut io::Stdout,
+    pane: &Pane,
+    pane_idx: usize,
+    label: &str,
+    border_style: BorderStyle,
+    term_w: u16,
+    term_h: u16,
+    show_status_bar: bool,
+) -> anyhow::Result<()> {
+    queue!(stdout, cursor::Hide, terminal::Clear(ClearType::All))?;
+
+    let chars = border_style.chars();
+    let status_h = if show_status_bar { 1u16 } else { 0 };
+    let border_h = term_h.saturating_sub(status_h);
+
+    if term_w == 0 || border_h == 0 {
+        return Ok(());
+    }
+
+    // Draw outer border
+    let mut bmap = BorderMap::new();
+    if term_w > 0 && border_h > 0 {
+        bmap.add_h_line(0, term_w - 1, 0);
+        bmap.add_h_line(0, term_w - 1, border_h - 1);
+        bmap.add_v_line(0, 0, border_h - 1);
+        bmap.add_v_line(term_w - 1, 0, border_h - 1);
+    }
+    for ((x, y), flags) in &bmap.cells {
+        queue!(
+            stdout,
+            cursor::MoveTo(*x, *y),
+            SetForegroundColor(ACTIVE_COLOR),
+            Print(border_char(flags, &chars))
+        )?;
+    }
+
+    // Title bar
+    let title = format!(" {}:{} [ZOOM] ", pane_idx + 1, label);
+    let avail = term_w.saturating_sub(2) as usize;
+    if avail > title.len() + 1 {
+        queue!(
+            stdout,
+            cursor::MoveTo(1, 0),
+            SetForegroundColor(ACTIVE_COLOR),
+            Print(chars.h),
+            SetForegroundColor(Color::White),
+            SetAttribute(Attribute::Bold),
+            Print(&title),
+            SetAttribute(Attribute::Reset),
+            SetForegroundColor(ACTIVE_COLOR),
+        )?;
+        for _ in 0..avail - title.len() - 1 {
+            queue!(stdout, Print(chars.h))?;
+        }
+    }
+
+    // Content area
+    let rect = Rect {
+        x: 1,
+        y: 1,
+        w: term_w.saturating_sub(2),
+        h: border_h.saturating_sub(2),
+    };
+    draw_content(stdout, pane, &rect, pane.is_alive())?;
+
+    // Cursor
+    if pane.is_alive() {
+        let screen = pane.screen();
+        let (cr, cc) = screen.cursor_position();
+        if cc < rect.w && cr < rect.h {
+            queue!(
+                stdout,
+                cursor::MoveTo(rect.x + cc, rect.y + cr),
+                cursor::Show
+            )?;
+        }
+    }
+
+    queue!(stdout, ResetColor, SetAttribute(Attribute::Reset))?;
+    Ok(())
+}
+
+// ─── Help Overlay ──────────────────────────────────────────
+
+pub fn draw_help_overlay(stdout: &mut io::Stdout, term_w: u16, term_h: u16) -> anyhow::Result<()> {
+    let help_lines = [
+        "",
+        "  DIRECT SHORTCUTS",
+        "  Ctrl+D        Split left|right",
+        "  Ctrl+E        Split top/bottom",
+        "  Ctrl+N        Next pane",
+        "  Ctrl+G        Settings panel",
+        "  Ctrl+W        Quit",
+        "",
+        "  PREFIX MODE (Ctrl+B then)",
+        "  %             Split left|right",
+        "  \"             Split top/bottom",
+        "  o             Next pane",
+        "  Arrow         Navigate directional",
+        "  x             Close pane",
+        "  z             Zoom toggle",
+        "  R             Resize mode (arrows, q exit)",
+        "  { }           Swap pane prev/next",
+        "  [             Scroll mode (j/k/g/G, q exit)",
+        "  q             Show pane numbers + jump",
+        "  E             Equalize sizes",
+        "  s             Toggle status bar",
+        "  d             Quit (with confirmation)",
+        "  ?             This help",
+        "",
+        "  MOUSE",
+        "  Click         Select pane",
+        "  Double-click  Zoom toggle",
+        "  Drag border   Resize",
+        "  Scroll        Scroll active pane",
+        "  [━][┃][×]     Split/close buttons",
+        "",
+        "          Press any key to close",
+    ];
+
+    let w: usize = 50;
+    let h = help_lines.len() + 2; // +2 for top/bottom border
+    let ox = term_w.saturating_sub(w as u16) / 2;
+    let oy = term_h.saturating_sub(h as u16) / 2;
+
+    let bg = Color::Rgb {
+        r: 16,
+        g: 18,
+        b: 24,
+    };
+    let border_fg = Color::Rgb {
+        r: 80,
+        g: 90,
+        b: 110,
+    };
+
+    // Backdrop
+    queue!(
+        stdout,
+        SetBackgroundColor(Color::Rgb { r: 4, g: 5, b: 8 }),
+        terminal::Clear(ClearType::All)
+    )?;
+
+    // Panel background
+    let blank = " ".repeat(w);
+    for dy in 0..h as u16 {
+        queue!(
+            stdout,
+            cursor::MoveTo(ox, oy + dy),
+            SetBackgroundColor(bg),
+            Print(&blank)
+        )?;
+    }
+
+    // Top border
+    queue!(
+        stdout,
+        cursor::MoveTo(ox, oy),
+        SetBackgroundColor(bg),
+        SetForegroundColor(border_fg),
+    )?;
+    let title = " Help (Ctrl+B ?) ";
+    let pad = w.saturating_sub(title.len() + 2);
+    let lp = pad / 2;
+    let rp = pad - lp;
+    queue!(
+        stdout,
+        Print("─".repeat(lp)),
+        SetForegroundColor(Color::White),
+        SetAttribute(Attribute::Bold),
+        Print(title),
+        SetAttribute(Attribute::Reset),
+        SetForegroundColor(border_fg),
+        SetBackgroundColor(bg),
+        Print("─".repeat(rp)),
+    )?;
+
+    // Content
+    for (i, line) in help_lines.iter().enumerate() {
+        let y = oy + 1 + i as u16;
+        queue!(stdout, cursor::MoveTo(ox, y), SetBackgroundColor(bg))?;
+
+        if line.contains("SHORTCUTS") || line.contains("PREFIX MODE") || line.contains("MOUSE") {
+            queue!(
+                stdout,
+                SetForegroundColor(Color::Rgb {
+                    r: 102,
+                    g: 217,
+                    b: 239
+                }),
+                SetAttribute(Attribute::Bold),
+                Print(format!("{:<width$}", line, width = w)),
+                SetAttribute(Attribute::Reset),
+            )?;
+        } else if line.contains("Press any key") {
+            queue!(
+                stdout,
+                SetForegroundColor(Color::Rgb {
+                    r: 90,
+                    g: 98,
+                    b: 110
+                }),
+                Print(format!("{:<width$}", line, width = w)),
+            )?;
+        } else {
+            // Split at first run of spaces >= 8 for key/description alignment
+            queue!(
+                stdout,
+                SetForegroundColor(Color::Rgb {
+                    r: 190,
+                    g: 200,
+                    b: 212,
+                }),
+                Print(format!("{:<width$}", line, width = w)),
+            )?;
+        }
+    }
+
+    // Bottom border
+    queue!(
+        stdout,
+        cursor::MoveTo(ox, oy + h as u16 - 1),
+        SetBackgroundColor(bg),
+        SetForegroundColor(border_fg),
+        Print("─".repeat(w)),
+    )?;
+
+    queue!(
+        stdout,
+        ResetColor,
+        SetAttribute(Attribute::Reset),
+        cursor::Hide
+    )?;
+    Ok(())
+}
+
+// ─── Pane Number Overlay ───────────────────────────────────
+
+/// Draw large pane numbers overlaid on each pane for quick-jump (Ctrl+B q).
+pub fn draw_pane_numbers(
+    stdout: &mut io::Stdout,
+    layout: &Layout,
+    inner: &Rect,
+) -> anyhow::Result<()> {
+    let rects = layout.pane_rects(inner);
+    let ids = layout.pane_ids();
+
+    for (display_idx, &pid) in ids.iter().enumerate() {
+        let Some(num) = quick_jump_label(display_idx) else {
+            continue;
+        };
+        if let Some(rect) = rects.get(&pid) {
+            let num = num.to_string();
+            let num_w = num.len() as u16;
+
+            if rect.w < num_w + 2 || rect.h < 3 {
+                continue;
+            }
+
+            let cx = rect.x + (rect.w - num_w - 2) / 2;
+            let cy = rect.y + rect.h / 2 - 1;
+
+            let bg = Color::Rgb {
+                r: 20,
+                g: 24,
+                b: 32,
+            };
+            let fg = Color::Rgb {
+                r: 102,
+                g: 217,
+                b: 239,
+            };
+            let box_w = (num_w + 4) as usize;
+
+            // Box background (3 rows)
+            for dy in 0..3u16 {
+                queue!(
+                    stdout,
+                    cursor::MoveTo(cx, cy + dy),
+                    SetBackgroundColor(bg),
+                    Print(" ".repeat(box_w)),
+                )?;
+            }
+
+            // Number centered in middle row
+            queue!(
+                stdout,
+                cursor::MoveTo(cx + 2, cy + 1),
+                SetBackgroundColor(bg),
+                SetForegroundColor(fg),
+                SetAttribute(Attribute::Bold),
+                Print(&num),
+                SetAttribute(Attribute::Reset),
+            )?;
+        }
+    }
+
+    // Hint at bottom
+    let hint = "Press 1-9 or 0 to jump, any other key to cancel";
+    let hx = inner.x + inner.w.saturating_sub(hint.len() as u16) / 2;
+    let hy = inner.y + inner.h;
+    queue!(
+        stdout,
+        cursor::MoveTo(hx, hy),
+        SetForegroundColor(Color::Rgb {
+            r: 90,
+            g: 98,
+            b: 110,
+        }),
+        Print(hint),
+        ResetColor,
+        cursor::Hide,
+    )?;
+
+    Ok(())
+}
+
+fn quick_jump_label(index: usize) -> Option<char> {
+    match index {
+        0..=8 => char::from_u32('1' as u32 + index as u32),
+        9 => Some('0'),
+        _ => None,
+    }
 }
 
 fn vt100_to_crossterm(color: vt100::Color) -> Color {

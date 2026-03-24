@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use crate::render::BorderStyle;
 use std::path::PathBuf;
 
@@ -41,7 +40,7 @@ pub fn load_config() -> EzpnConfig {
                 }
                 if let Some((key, value)) = line.split_once('=') {
                     let key = key.trim();
-                    let value = value.trim();
+                    let value = normalize_value(value);
                     match key {
                         "border" => {
                             if let Some(style) = BorderStyle::from_str(value) {
@@ -65,6 +64,18 @@ pub fn load_config() -> EzpnConfig {
     config
 }
 
+fn normalize_value(value: &str) -> &str {
+    let value = value.trim();
+    if value.len() >= 2 {
+        let first = value.as_bytes()[0];
+        let last = value.as_bytes()[value.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return &value[1..value.len() - 1];
+        }
+    }
+    value
+}
+
 fn config_path() -> Option<PathBuf> {
     // Try XDG_CONFIG_HOME, then ~/.config
     let dir = std::env::var("XDG_CONFIG_HOME")
@@ -86,4 +97,16 @@ fn dirs_fallback() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/tmp"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_value;
+
+    #[test]
+    fn normalize_value_trims_quotes() {
+        assert_eq!(normalize_value("rounded"), "rounded");
+        assert_eq!(normalize_value(" \"rounded\" "), "rounded");
+        assert_eq!(normalize_value(" '/bin/zsh' "), "/bin/zsh");
+    }
 }

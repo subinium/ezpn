@@ -31,7 +31,7 @@ ezpn -e 'make watch' -e 'npm dev'   # commande par panneau
 
 ## Controles
 
-**Souris :** Cliquez pour selectionner / `x` pour fermer / Glissez le bord pour redimensionner / Molette
+**Souris :** Cliquez pour selectionner / `x` pour fermer / Glissez le bord pour redimensionner / Double-clic pour basculer le zoom / Molette
 
 **Clavier :**
 
@@ -52,6 +52,11 @@ ezpn -e 'make watch' -e 'npm dev'   # commande par panneau
 | `o` | Panneau suivant |
 | `Arrow` | Navigation directionnelle |
 | `x` | Fermer le panneau |
+| `z` | Basculer le zoom |
+| `R` | Mode redimensionnement |
+| `q` | Numeros de panneau + 1-9 pour sauter (0 pour le 10e) |
+| `{ }` | Echanger le panneau |
+| `?` | Aide |
 | `[` | Mode defilement (j/k/g/G, q pour quitter) |
 | `d` | Quitter (avec confirmation) |
 
@@ -59,8 +64,13 @@ ezpn -e 'make watch' -e 'npm dev'   # commande par panneau
 
 - **Dispositions flexibles** — Grille, ratios, division libre, redimensionnement par glissement
 - **Commande par panneau** — `-e` pour lancer des commandes differentes
-- **Boutons de barre de titre** — `[━] [┃] [×]` cliquez pour diviser/fermer
+- **Barre de titre** — `[━] [┃] [×]` boutons + affichage de la commande en cours
+- **Mode zoom** — `Ctrl+B z` ou double-clic pour plein ecran
+- **Redimensionnement clavier** — `Ctrl+B R` → fleches/hjkl pour ajuster
+- **Echange de panneaux** — `Ctrl+B {` / `}` pour echanger les positions
+- **Saut rapide** — `Ctrl+B q` → numeros de panneau, 1-9 pour sauter
 - **Touches tmux** — `Ctrl+B` suivi des touches tmux standard
+- **Fichier de configuration** — `~/.config/ezpn/config.toml`
 - **Controle IPC** — `ezpn-ctl` pour l'automatisation
 - **Instantanes d'espace de travail** — `ezpn-ctl save/load`
 
