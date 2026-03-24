@@ -22,6 +22,7 @@ pub struct Pane {
     launch: PaneLaunch,
     scroll_offset: usize, // 0 = live (bottom), >0 = scrolled up N lines
     name: Option<String>,
+    exit_code: Option<u32>,
 }
 
 impl Pane {
@@ -143,6 +144,7 @@ impl Pane {
             launch,
             scroll_offset: 0,
             name: None,
+            exit_code: None,
         })
     }
 
@@ -168,7 +170,8 @@ impl Pane {
             }
         }
         if self.alive {
-            if let Ok(Some(_)) = self.child.try_wait() {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                self.exit_code = Some(status.exit_code());
                 self.alive = false;
             }
         }
@@ -312,10 +315,19 @@ impl Pane {
         if let Some(name) = &self.name {
             return name.clone();
         }
+        // OSC title set by child process (priority over command/shell)
+        let osc_title = self.parser.screen().title();
+        if !osc_title.is_empty() {
+            return osc_title.to_string();
+        }
         match &self.launch {
             PaneLaunch::Shell => shell.to_string(),
             PaneLaunch::Command(command) => command.clone(),
         }
+    }
+
+    pub fn exit_code(&self) -> Option<u32> {
+        self.exit_code
     }
 
     pub fn name(&self) -> Option<&str> {

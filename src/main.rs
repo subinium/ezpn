@@ -412,6 +412,9 @@ CONTROLS:
   Ctrl+W            Quit
 
 PREFIX KEYS (Ctrl+B then):
+  c                 New pane (split + focus)
+  ;                 Last active pane (toggle back)
+  Space             Equalize layout
   z                 Zoom toggle
   B                 Broadcast mode (type in all panes)
   R                 Resize mode (arrow/hjkl, q to exit)
@@ -530,6 +533,9 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
     let mut zoomed_pane: Option<usize> = None;
     let mut last_click: Option<(Instant, u16, u16)> = None;
     let mut broadcast = false;
+    let mut last_active: usize = active; // for Ctrl+B ; (last pane)
+    let mut selection_anchor: Option<(usize, u16, u16)> = None; // (pane_id, rel_col, rel_row)
+    let mut text_selection: Option<TextSelection> = None;
 
     let mut restart_state: HashMap<usize, (Instant, u32)> = HashMap::new(); // (last_death, retries)
     const MAX_RESTART_RETRIES: u32 = 10;
@@ -558,9 +564,18 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
         &initial_dirty,
         true,
         "",
+        None,
+        0,
     )?;
 
+    let mut prev_active = active;
     loop {
+        // Track last-active pane for Ctrl+B ;
+        if active != prev_active {
+            last_active = prev_active;
+            prev_active = active;
+        }
+
         let mut update = RenderUpdate::default();
 
         for (&pid, pane) in &mut panes {
@@ -663,7 +678,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
 
         // Prefix mode timeout
         if let InputMode::Prefix { entered_at } = &mode {
-            if entered_at.elapsed() > Duration::from_secs(1) {
+            if entered_at.elapsed() > Duration::from_secs(3) {
                 mode = InputMode::Normal;
                 update.full_redraw = true;
             }
@@ -961,6 +976,38 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                                 broadcast = !broadcast;
                                 update.full_redraw = true;
                             }
+                            // Last pane (tmux ;)
+                            KeyCode::Char(';') => {
+                                if panes.contains_key(&last_active) {
+                                    active = last_active;
+                                    update.full_redraw = true;
+                                }
+                            }
+                            // Cycle layout (tmux Space)
+                            KeyCode::Char(' ') => {
+                                layout.equalize();
+                                resize_all(&mut panes, &layout, tw, th, &settings);
+                                update.mark_all(&layout);
+                                update.border_dirty = true;
+                            }
+                            // New pane (tmux c) — split active pane horizontally
+                            KeyCode::Char('c') => {
+                                do_split(
+                                    &mut layout,
+                                    &mut panes,
+                                    active,
+                                    Direction::Horizontal,
+                                    &default_shell,
+                                    tw,
+                                    th,
+                                    &settings,
+                                    effective_scrollback,
+                                )?;
+                                // Focus the new pane
+                                active = layout.next_pane(active);
+                                update.mark_all(&layout);
+                                update.border_dirty = true;
+                            }
                             _ => {} // unknown prefix command, ignore
                         }
                         mode = next_mode;
@@ -1139,7 +1186,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
 
                     // Prefix mode timeout (1 second)
                     if let InputMode::Prefix { entered_at } = &mode {
-                        if entered_at.elapsed() > Duration::from_secs(1) {
+                        if entered_at.elapsed() > Duration::from_secs(3) {
                             mode = InputMode::Normal;
                             update.full_redraw = true;
                         }
@@ -1275,7 +1322,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                                     active = pid;
                                     update.full_redraw = true;
                                 }
-                                // Forward click to child if it wants mouse
+                                // Forward click to child if it wants mouse, or start selection
                                 if !is_double {
                                     if let Some(pane) = panes.get_mut(&pid) {
                                         if pane.wants_mouse() {
@@ -1284,6 +1331,19 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                                                 let rel_col = mouse.column.saturating_sub(rect.x);
                                                 let rel_row = mouse.row.saturating_sub(rect.y);
                                                 pane.send_mouse_event(0, rel_col, rel_row, false);
+                                            }
+                                        } else if pid == active {
+                                            // Start potential text selection in active non-mouse pane
+                                            if let Some(rect) = border_cache.pane_rects().get(&pid)
+                                            {
+                                                let rel_col = mouse.column.saturating_sub(rect.x);
+                                                let rel_row = mouse.row.saturating_sub(rect.y);
+                                                selection_anchor = Some((pid, rel_col, rel_row));
+                                                // Clear any existing selection
+                                                if text_selection.is_some() {
+                                                    text_selection = None;
+                                                    update.dirty_panes.insert(pid);
+                                                }
                                             }
                                         }
                                     }
@@ -1297,6 +1357,26 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                                 resize_all(&mut panes, &layout, tw, th, &settings);
                                 update.mark_all(&layout);
                                 update.border_dirty = true;
+                            } else if let Some((pid, anchor_col, anchor_row)) = selection_anchor {
+                                // Update text selection during drag
+                                if let Some(rect) = border_cache.pane_rects().get(&pid) {
+                                    let rel_col = mouse
+                                        .column
+                                        .saturating_sub(rect.x)
+                                        .min(rect.w.saturating_sub(1));
+                                    let rel_row = mouse
+                                        .row
+                                        .saturating_sub(rect.y)
+                                        .min(rect.h.saturating_sub(1));
+                                    text_selection = Some(TextSelection {
+                                        pane_id: pid,
+                                        start_row: anchor_row,
+                                        start_col: anchor_col,
+                                        end_row: rel_row,
+                                        end_col: rel_col,
+                                    });
+                                    update.dirty_panes.insert(pid);
+                                }
                             }
                         }
                         MouseEventKind::Up(MouseButton::Left) => {
@@ -1304,7 +1384,24 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                                 resize_all(&mut panes, &layout, tw, th, &settings);
                                 update.mark_all(&layout);
                                 update.border_dirty = true;
+                            } else if let Some(ref sel) = text_selection {
+                                // Copy selected text to clipboard via OSC 52
+                                if let Some(pane) = panes.get_mut(&sel.pane_id) {
+                                    pane.sync_scrollback();
+                                    let text = extract_selected_text(pane.screen(), sel);
+                                    pane.reset_scrollback_view();
+                                    if !text.is_empty() {
+                                        let encoded = base64_encode(text.as_bytes());
+                                        let _ = write!(stdout, "\x1b]52;c;{}\x07", encoded);
+                                        let _ = stdout.flush();
+                                    }
+                                }
+                                let pid = sel.pane_id;
+                                text_selection = None;
+                                selection_anchor = None;
+                                update.dirty_panes.insert(pid);
                             } else {
+                                selection_anchor = None;
                                 // Forward release to child if it wants mouse
                                 if let Some(pane) = panes.get_mut(&active) {
                                     if pane.wants_mouse() {
@@ -1465,11 +1562,26 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                         ids.len(),
                         zoom_label,
                         pane_name,
+                        0,
                     )?;
                 }
                 queue!(stdout, terminal::EndSynchronizedUpdate)?;
                 stdout.flush()?;
             } else {
+                let sel_for_render = text_selection.as_ref().map(|s| {
+                    let (sr, sc, er, ec) = s.normalized();
+                    (s.pane_id, sr, sc, er, ec)
+                });
+                // Compute selection char count for status bar
+                let sel_chars = text_selection
+                    .as_ref()
+                    .and_then(|sel| {
+                        panes.get(&sel.pane_id).map(|pane| {
+                            let text = extract_selected_text(pane.screen(), sel);
+                            text.chars().count()
+                        })
+                    })
+                    .unwrap_or(0);
                 render_frame(
                     stdout,
                     &panes,
@@ -1483,6 +1595,8 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                     &update.dirty_panes,
                     update.full_redraw,
                     mode_label,
+                    sel_for_render,
+                    sel_chars,
                 )?;
             }
 
@@ -1563,6 +1677,8 @@ fn render_frame(
     dirty_panes: &HashSet<usize>,
     full_redraw: bool,
     mode_label: &str,
+    selection: render::PaneSelection,
+    selection_chars: usize,
 ) -> anyhow::Result<()> {
     queue!(stdout, terminal::BeginSynchronizedUpdate)?;
     render::render_panes(
@@ -1578,13 +1694,23 @@ fn render_frame(
         border_cache,
         dirty_panes,
         full_redraw,
+        selection,
     )?;
     // Mode-aware status bar (render over the default one if we have a mode)
-    if settings.show_status_bar && !mode_label.is_empty() {
+    if settings.show_status_bar && (!mode_label.is_empty() || selection_chars > 0) {
         let ids = layout.pane_ids();
         let active_idx = ids.iter().position(|&id| id == active).unwrap_or(0);
         let pane_name = panes.get(&active).and_then(|p| p.name()).unwrap_or("");
-        render::draw_status_bar_full(stdout, tw, th, active_idx, ids.len(), mode_label, pane_name)?;
+        render::draw_status_bar_full(
+            stdout,
+            tw,
+            th,
+            active_idx,
+            ids.len(),
+            mode_label,
+            pane_name,
+            selection_chars,
+        )?;
     }
     if settings.visible {
         settings.render_overlay(stdout, tw, th)?;
@@ -1898,6 +2024,29 @@ fn resize_all(
     }
 }
 
+/// Text selection state for copy-on-drag.
+#[derive(Clone)]
+struct TextSelection {
+    pane_id: usize,
+    start_row: u16,
+    start_col: u16,
+    end_row: u16,
+    end_col: u16,
+}
+
+impl TextSelection {
+    /// Normalized range: (min_row, min_col, max_row, max_col)
+    fn normalized(&self) -> (u16, u16, u16, u16) {
+        if self.start_row < self.end_row
+            || (self.start_row == self.end_row && self.start_col <= self.end_col)
+        {
+            (self.start_row, self.start_col, self.end_row, self.end_col)
+        } else {
+            (self.end_row, self.end_col, self.start_row, self.start_col)
+        }
+    }
+}
+
 struct DragState {
     path: Vec<bool>,
     direction: Direction,
@@ -1955,6 +2104,67 @@ impl RenderUpdate {
     fn needs_render(&self) -> bool {
         self.full_redraw || !self.dirty_panes.is_empty()
     }
+}
+
+/// Extract text from vt100 screen within a selection range.
+fn extract_selected_text(screen: &vt100::Screen, sel: &TextSelection) -> String {
+    let (sr, sc, er, ec) = sel.normalized();
+    let mut text = String::new();
+
+    for r in sr..=er {
+        let col_start = if r == sr { sc } else { 0 };
+        let col_end = if r == er { ec } else { u16::MAX };
+        let mut row_text = String::new();
+        let mut c = col_start;
+        loop {
+            if c > col_end {
+                break;
+            }
+            if let Some(cell) = screen.cell(r, c) {
+                let contents = cell.contents();
+                if contents.is_empty() {
+                    row_text.push(' ');
+                } else {
+                    row_text.push_str(&contents);
+                }
+            } else {
+                break;
+            }
+            c += 1;
+        }
+        // Trim trailing spaces per line
+        let trimmed = row_text.trim_end();
+        text.push_str(trimmed);
+        if r < er {
+            text.push('\n');
+        }
+    }
+    text
+}
+
+/// Minimal base64 encoder for OSC 52 clipboard.
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHA[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHA[((triple >> 12) & 0x3F) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHA[((triple >> 6) & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHA[(triple & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
