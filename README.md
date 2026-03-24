@@ -57,9 +57,9 @@ Commands passed with `-e/--exec` run via `$SHELL -l -c`, so pipes, redirects, an
 | `Ctrl+D` | Split left \| right |
 | `Ctrl+E` | Split top / bottom |
 | `F2` | Equalize all sizes |
-| `Ctrl+]` | Next pane |
+| `Ctrl+N` | Next pane |
 | `Ctrl+G` | Settings (j/k/Enter to navigate) |
-| `Ctrl+Q` | Quit |
+| `Ctrl+W` | Quit |
 
 **tmux-compatible prefix keys (`Ctrl+B` then...):**
 

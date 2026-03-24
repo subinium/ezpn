@@ -675,9 +675,10 @@ pub fn draw_status_bar(
     )?;
     let hints = [
         "Ctrl+D/E:split",
+        "Ctrl+N:next",
         "F2:equalize",
         "Ctrl+G:settings",
-        "Ctrl+\\:quit",
+        "Ctrl+W:quit",
     ];
     let mut right_str = String::new();
     for hint in hints.iter() {

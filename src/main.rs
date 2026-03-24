@@ -251,14 +251,15 @@ OPTIONS:
 CONTROLS:
   Mouse click       Select pane
   Drag border       Resize panes
-  Click x           Close pane (auto-collapses)
+  Click [━][┃][×]   Split/close buttons on title bar
   Ctrl+D            Split left|right (auto-equalizes)
   Ctrl+E            Split top/bottom (auto-equalizes)
+  Ctrl+N            Next pane
   F2                Equalize all pane sizes
-  Ctrl+]            Next pane
-  Ctrl+G / F1       Settings panel
+  Ctrl+B <key>      Prefix mode (tmux keys: % \" o x E [ d s)
+  Ctrl+G / F1       Settings panel (j/k/Enter/1-4/q)
   Alt+Arrow         Navigate (needs Meta key on macOS)
-  Ctrl+\\            Force quit all"
+  Ctrl+W            Quit"
     );
 }
 
@@ -535,9 +536,11 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                             settings.toggle();
                             update.full_redraw = true;
                         }
-                        // Force quit: Ctrl+\ or Ctrl+Q
+                        // Force quit: Ctrl+\ or Ctrl+Q or Ctrl+W
                         else if ctrl
-                            && (key.code == KeyCode::Char('\\') || key.code == KeyCode::Char('q'))
+                            && (key.code == KeyCode::Char('\\')
+                                || key.code == KeyCode::Char('q')
+                                || key.code == KeyCode::Char('w'))
                         {
                             break;
                         }
@@ -617,7 +620,9 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                             )?;
                             update.mark_all(&layout);
                             update.border_dirty = true;
-                        } else if key.code == KeyCode::Char(']') && ctrl {
+                        } else if ctrl
+                            && (key.code == KeyCode::Char(']') || key.code == KeyCode::Char('n'))
+                        {
                             active = layout.next_pane(active);
                             update.full_redraw = true;
                         } else if key.code == KeyCode::F(2) {
