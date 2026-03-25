@@ -33,6 +33,7 @@ enum InputMode {
     },
     CopyMode(crate::copy_mode::CopyModeState),
     QuitConfirm,
+    CloseConfirm,
     ResizeMode,
     PaneSelect,
     HelpOverlay,
@@ -897,6 +898,7 @@ fn render_frame_to_buf(
         InputMode::Prefix { .. } => "PREFIX",
         InputMode::CopyMode(ref cm) => cm.mode_label(),
         InputMode::QuitConfirm => "KILL SESSION? y/n",
+        InputMode::CloseConfirm => "CLOSE PANE? y/n",
         InputMode::ResizeMode => "RESIZE",
         InputMode::PaneSelect => "SELECT",
         InputMode::HelpOverlay => "",
@@ -1194,6 +1196,25 @@ fn process_key(
         return;
     }
 
+    // ── Close pane confirmation ──
+    if matches!(mode, InputMode::CloseConfirm) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                let target = *active;
+                super::close_pane(layout, panes, active, target);
+                super::resize_all(panes, layout, tw, th, settings);
+                update.mark_all(layout);
+                update.border_dirty = true;
+                *mode = InputMode::Normal;
+            }
+            _ => {
+                *mode = InputMode::Normal;
+                update.full_redraw = true;
+            }
+        }
+        return;
+    }
+
     // ── Help overlay ──
     if matches!(mode, InputMode::HelpOverlay) {
         *mode = InputMode::Normal;
@@ -1457,13 +1478,9 @@ fn process_key(
                     *active = n;
                 }
             }
-            // Close pane
+            // Close pane (with confirmation, tmux-style)
             KeyCode::Char('x') => {
-                let target = *active;
-                super::close_pane(layout, panes, active, target);
-                super::resize_all(panes, layout, tw, th, settings);
-                update.mark_all(layout);
-                update.border_dirty = true;
+                next_mode = InputMode::CloseConfirm;
             }
             // Equalize
             KeyCode::Char('E') => {

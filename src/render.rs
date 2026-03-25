@@ -1028,7 +1028,8 @@ pub fn draw_status_bar_full(
         "VISUAL" | "V-LINE" => &["hjkl extend", "y copy+exit", "v/V toggle", "Esc cancel"],
         "SEARCH" => &["type query", "Enter find", "n/N next/prev", "Esc cancel"],
         "SELECT" => &["1-9 jump to pane", "0 for 10th", "any key cancel"],
-        "QUIT? y/n" => &["y quit", "any key cancel"],
+        "KILL SESSION? y/n" => &["y kill session", "any key cancel"],
+        "CLOSE PANE? y/n" => &["y close pane", "any key cancel"],
         "ZOOM" => &["Ctrl+B z unzoom", "Ctrl+D/E split", "type normally"],
         "BROADCAST" => &["typing in ALL panes", "Ctrl+B B stop broadcast"],
         _ => &[
