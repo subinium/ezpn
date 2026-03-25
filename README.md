@@ -7,7 +7,7 @@
 Dead simple terminal pane splitting with session persistence. Think tmux, but instant.
 
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
-[![Crate](https://img.shields.io/badge/crates.io-v0.4.0-orange)](https://crates.io/crates/ezpn)
+[![Crate](https://img.shields.io/badge/crates.io-v0.4.1-orange)](https://crates.io/crates/ezpn)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)]()
 
 **English** | [한국어](docs/README.ko.md) | [日本語](docs/README.ja.md) | [中文](docs/README.zh.md) | [Español](docs/README.es.md) | [Français](docs/README.fr.md)
