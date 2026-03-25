@@ -197,6 +197,9 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
     let mut tw: u16 = 80;
     let mut th: u16 = 24;
 
+    // Init wake channel — PTY reader threads will wake us via this channel
+    let wake_rx = crate::pane::init_wake_channel();
+
     // Start IPC listener (existing ezpn-ctl support)
     let ipc_rx = ipc::start_listener()
         .map_err(|e| eprintln!("ezpn-server: IPC unavailable ({e})"))
@@ -815,9 +818,13 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
             }
         }
 
-        // Sleep: 8ms when client connected (frame budget), 50ms when headless (save CPU)
-        let sleep_ms = if client.is_some() { 8 } else { 50 };
-        std::thread::sleep(Duration::from_millis(sleep_ms));
+        // Block until any event source wakes us, or timeout.
+        // With client: 8ms max (frame budget for smooth rendering).
+        // Headless: 20ms (responsive to PING probes for session discovery).
+        let timeout_ms = if client.is_some() { 8 } else { 20 };
+        let _ = wake_rx.recv_timeout(Duration::from_millis(timeout_ms));
+        // Drain accumulated wake signals
+        while wake_rx.try_recv().is_ok() {}
     }
 
     session::cleanup(session_name);
@@ -846,6 +853,7 @@ fn client_reader(stream: UnixStream, tx: mpsc::Sender<ClientMsg>) {
                     if tx.send(msg).is_err() {
                         break;
                     }
+                    crate::pane::wake_main_loop(); // Wake server loop
                 }
             }
             Err(_) => {

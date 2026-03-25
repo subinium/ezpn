@@ -1,7 +1,27 @@
 use std::io::{Read, Write};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::OnceLock;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+/// Global wake channel: PTY reader threads send () to wake the server main loop.
+/// Set once by the server with `set_wake_channel()`.
+static WAKE_TX: OnceLock<mpsc::Sender<()>> = OnceLock::new();
+
+/// Initialize the global wake channel. Call once from server startup.
+/// Returns the Receiver that the main loop should use.
+pub fn init_wake_channel() -> mpsc::Receiver<()> {
+    let (tx, rx) = mpsc::channel();
+    let _ = WAKE_TX.set(tx);
+    rx
+}
+
+/// Send a wake signal to the main loop (used by reader threads and client reader).
+pub fn wake_main_loop() {
+    if let Some(tx) = WAKE_TX.get() {
+        let _ = tx.send(());
+    }
+}
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 
@@ -133,6 +153,7 @@ impl Pane {
                         if tx.send(buf[..n].to_vec()).is_err() {
                             break;
                         }
+                        wake_main_loop();
                     }
                     Err(_) => break,
                 }
