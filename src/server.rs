@@ -31,7 +31,7 @@ enum InputMode {
     Prefix {
         entered_at: Instant,
     },
-    ScrollMode,
+    CopyMode(crate::copy_mode::CopyModeState),
     QuitConfirm,
     ResizeMode,
     PaneSelect,
@@ -887,7 +887,7 @@ fn render_frame_to_buf(
 ) -> anyhow::Result<()> {
     let mode_label = match mode {
         InputMode::Prefix { .. } => "PREFIX",
-        InputMode::ScrollMode => "SCROLL",
+        InputMode::CopyMode(ref cm) => cm.mode_label(),
         InputMode::QuitConfirm => "KILL SESSION? y/n",
         InputMode::ResizeMode => "RESIZE",
         InputMode::PaneSelect => "SELECT",
@@ -1314,65 +1314,67 @@ fn process_key(
         return;
     }
 
-    // ── Scroll mode ──
-    if matches!(mode, InputMode::ScrollMode) {
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                if let Some(p) = panes.get_mut(active) {
-                    p.scroll_up(1);
+    // ── Copy mode (vi keys, selection, search) ──
+    if let InputMode::CopyMode(ref mut cm_state) = mode {
+        if let Some(pane) = panes.get_mut(active) {
+            // Handle scrolling first (before screen access)
+            match key.code {
+                KeyCode::Char('k') | KeyCode::Up if cm_state.cursor_row == 0 => {
+                    pane.scroll_up(1);
                 }
-                update.dirty_panes.insert(*active);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if let Some(p) = panes.get_mut(active) {
-                    p.scroll_down(1);
+                KeyCode::Char('j') | KeyCode::Down
+                    if cm_state.cursor_row >= cm_state.pane_rows.saturating_sub(1) =>
+                {
+                    pane.scroll_down(1);
                 }
-                update.dirty_panes.insert(*active);
-            }
-            KeyCode::PageUp => {
-                if let Some(p) = panes.get_mut(active) {
-                    p.scroll_up(20);
+                KeyCode::Char('g') if !ctrl => {
+                    pane.scroll_up(usize::MAX);
                 }
-                update.dirty_panes.insert(*active);
-            }
-            KeyCode::PageDown => {
-                if let Some(p) = panes.get_mut(active) {
-                    p.scroll_down(20);
+                KeyCode::Char('G') => {
+                    pane.snap_to_bottom();
                 }
-                update.dirty_panes.insert(*active);
-            }
-            KeyCode::Char('u') if ctrl => {
-                if let Some(p) = panes.get_mut(active) {
-                    p.scroll_up(20);
+                KeyCode::Char('u') if ctrl => {
+                    pane.scroll_up((cm_state.pane_rows / 2) as usize);
                 }
-                update.dirty_panes.insert(*active);
-            }
-            KeyCode::Char('d') if ctrl => {
-                if let Some(p) = panes.get_mut(active) {
-                    p.scroll_down(20);
+                KeyCode::Char('d') if ctrl => {
+                    pane.scroll_down((cm_state.pane_rows / 2) as usize);
                 }
-                update.dirty_panes.insert(*active);
-            }
-            KeyCode::Char('g') => {
-                if let Some(p) = panes.get_mut(active) {
-                    p.scroll_up(usize::MAX);
+                KeyCode::PageUp => {
+                    pane.scroll_up(cm_state.pane_rows as usize);
                 }
-                update.dirty_panes.insert(*active);
-            }
-            KeyCode::Char('G') => {
-                if let Some(p) = panes.get_mut(active) {
-                    p.snap_to_bottom();
+                KeyCode::PageDown => {
+                    pane.scroll_down(cm_state.pane_rows as usize);
                 }
-                update.dirty_panes.insert(*active);
+                _ => {}
             }
-            KeyCode::Char('q') | KeyCode::Esc => {
-                if let Some(p) = panes.get_mut(active) {
-                    p.snap_to_bottom();
+
+            // Process key through copy mode state machine
+            pane.sync_scrollback();
+            let action = crate::copy_mode::handle_key(
+                key,
+                cm_state,
+                pane.screen(),
+                &mut |_| {}, // scrolling handled above
+                &mut |_| {},
+            );
+            pane.reset_scrollback_view();
+
+            match action {
+                crate::copy_mode::CopyAction::CopyAndExit(text) => {
+                    // OSC 52 clipboard copy
+                    let encoded = super::base64_encode(text.as_bytes());
+                    let osc = format!("\x1b]52;c;{}\x07", encoded);
+                    pane.osc52_pending.push(osc.into_bytes());
+                    pane.snap_to_bottom();
+                    *mode = InputMode::Normal;
                 }
-                *mode = InputMode::Normal;
-                update.dirty_panes.insert(*active);
+                crate::copy_mode::CopyAction::Exit => {
+                    pane.snap_to_bottom();
+                    *mode = InputMode::Normal;
+                }
+                _ => {}
             }
-            _ => {}
+            update.dirty_panes.insert(*active);
         }
         return;
     }
@@ -1458,7 +1460,13 @@ fn process_key(
             }
             // Scroll mode
             KeyCode::Char('[') => {
-                next_mode = InputMode::ScrollMode;
+                // Enter copy mode — need pane dimensions
+                if let Some(pane) = panes.get(active) {
+                    let screen = pane.screen();
+                    let (rows, cols) = screen.size();
+                    next_mode =
+                        InputMode::CopyMode(crate::copy_mode::CopyModeState::new(rows, cols));
+                }
             }
             // Detach (tmux d)
             KeyCode::Char('d') => {

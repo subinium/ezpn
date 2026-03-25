@@ -12,6 +12,7 @@ use crossterm::{
 
 mod client;
 mod config;
+mod copy_mode;
 mod ipc;
 mod layout;
 mod pane;

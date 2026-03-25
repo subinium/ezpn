@@ -44,7 +44,7 @@ pub struct Pane {
     name: Option<String>,
     exit_code: Option<u32>,
     /// Pending OSC 52 clipboard sequences from child to forward to the terminal.
-    osc52_pending: Vec<Vec<u8>>,
+    pub osc52_pending: Vec<Vec<u8>>,
     /// Whether the child has enabled bracketed paste mode (\x1b[?2004h).
     bracketed_paste: bool,
     /// Whether the child has requested focus events (\x1b[?1004h).
