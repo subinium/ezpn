@@ -137,7 +137,7 @@ All tmux command aliases (`split-window`, `kill-pane`, `new-window`, etc.) are s
 | **Panes** | |
 | `%` / `"` | Split H / V |
 | `o` / Arrow | Next / navigate pane |
-| `x` | Close pane |
+| `x` | Close pane (with y/n confirmation) |
 | `z` | Zoom toggle |
 | `{` / `}` | Swap pane prev / next |
 | `E` / Space | Equalize |
