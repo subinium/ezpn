@@ -62,18 +62,26 @@ pub fn run(socket_path: &std::path::Path, session_name: &str) -> anyhow::Result<
         cursor::Hide
     )?;
 
+    // Set terminal title to show session name
+    let _ = write!(stdout, "\x1b]0;ezpn: {}\x07", session_name);
+    let _ = stdout.flush();
+
     let reason = client_loop(&mut stdout, write_stream, &server_rx);
 
     // Cleanup terminal FIRST — before printing any messages
-    let _ = execute!(
-        io::stdout(),
-        PopKeyboardEnhancementFlags,
-        event::DisableBracketedPaste,
-        event::DisableFocusChange,
-        cursor::Show,
-        event::DisableMouseCapture,
-        LeaveAlternateScreen
-    );
+    {
+        let mut out = io::stdout();
+        let _ = write!(out, "\x1b]0;\x07"); // Restore terminal title
+        let _ = execute!(
+            out,
+            PopKeyboardEnhancementFlags,
+            event::DisableBracketedPaste,
+            event::DisableFocusChange,
+            cursor::Show,
+            event::DisableMouseCapture,
+            LeaveAlternateScreen
+        );
+    }
     let _ = terminal::disable_raw_mode();
 
     // Now print status message (after terminal is restored)

@@ -880,7 +880,7 @@ fn render_frame_to_buf(
     let mode_label = match mode {
         InputMode::Prefix { .. } => "PREFIX",
         InputMode::ScrollMode => "SCROLL",
-        InputMode::QuitConfirm => "QUIT? y/n",
+        InputMode::QuitConfirm => "KILL SESSION? y/n",
         InputMode::ResizeMode => "RESIZE",
         InputMode::PaneSelect => "SELECT",
         InputMode::HelpOverlay => "",
@@ -1161,10 +1161,8 @@ fn process_key(
     if matches!(mode, InputMode::QuitConfirm) {
         match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {
-                // Kill all panes → server will exit
-                for pane in panes.values_mut() {
-                    pane.kill();
-                }
+                // Kill entire session (all tabs)
+                *tab_action = TabAction::KillSession;
             }
             _ => {
                 *mode = InputMode::Normal;
@@ -1582,8 +1580,9 @@ fn process_key(
             || key.code == KeyCode::Char('q')
             || key.code == KeyCode::Char('w'))
     {
-        // Kill entire session (all tabs)
-        *tab_action = TabAction::KillSession;
+        // Confirm before killing session
+        *mode = InputMode::QuitConfirm;
+        update.full_redraw = true;
     } else if settings.visible {
         let prev_border = settings.border_style;
         let prev_status = settings.show_status_bar;

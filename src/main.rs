@@ -158,9 +158,26 @@ fn cmd_ls() -> anyhow::Result<()> {
     if sessions.is_empty() {
         println!("No active sessions.");
     } else {
-        println!("{:<20} SOCKET", "SESSION");
         for (name, path) in &sessions {
-            println!("{:<20} {}", name, path.display());
+            // Show creation time from socket mtime
+            let age = std::fs::metadata(path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .map(|d| {
+                    let secs = d.as_secs();
+                    if secs < 60 {
+                        format!("{}s", secs)
+                    } else if secs < 3600 {
+                        format!("{}m", secs / 60)
+                    } else if secs < 86400 {
+                        format!("{}h", secs / 3600)
+                    } else {
+                        format!("{}d", secs / 86400)
+                    }
+                })
+                .unwrap_or_else(|| "?".to_string());
+            println!("{}: (created {})", name, age);
         }
     }
     Ok(())
