@@ -57,16 +57,29 @@ pub fn auto_name() -> String {
         })
         .collect();
 
-    let path = socket_path(&base);
-    if !path.exists() {
+    // First choice: bare directory name (e.g. "myproject")
+    if !socket_path(&base).exists() {
         return base;
     }
-    for i in 1..100 {
-        let name = format!("{}-{}", base, i);
-        if !socket_path(&name).exists() {
-            return name;
-        }
+
+    // Collision: use short timestamp suffix (e.g. "myproject-1422" from HH:MM)
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let hhmm = format!("{:02}{:02}", (now / 3600) % 24, (now / 60) % 60);
+    let name = format!("{}-{}", base, hhmm);
+    if !socket_path(&name).exists() {
+        return name;
     }
+
+    // Rare: same minute, add seconds
+    let name = format!("{}-{}{:02}", base, hhmm, now % 60);
+    if !socket_path(&name).exists() {
+        return name;
+    }
+
+    // Fallback: PID
     format!("{}-{}", base, std::process::id())
 }
 
