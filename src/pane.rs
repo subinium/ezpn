@@ -435,16 +435,32 @@ fn encode_key(key: KeyEvent) -> Vec<u8> {
     let has_mods = shift || alt || ctrl;
 
     match key.code {
-        KeyCode::Char(c) if ctrl && !shift && !alt => {
-            let byte = (c.to_ascii_lowercase() as u8)
+        // Ctrl+char: special cases for non-letter characters, then a-z
+        KeyCode::Char(c) if ctrl && !shift && !alt => match c {
+            ' ' => vec![0x00],  // Ctrl+Space = NUL
+            '[' => vec![0x1b],  // Ctrl+[ = ESC
+            '\\' => vec![0x1c], // Ctrl+\ = FS
+            ']' => vec![0x1d],  // Ctrl+] = GS (vim tag jump)
+            '^' => vec![0x1e],  // Ctrl+^ = RS (vim alternate file)
+            '_' => vec![0x1f],  // Ctrl+_ = US
+            'a'..='z' => vec![c as u8 - b'a' + 1],
+            _ => vec![(c.to_ascii_lowercase() as u8)
                 .wrapping_sub(b'a')
-                .wrapping_add(1);
-            vec![byte]
-        }
+                .wrapping_add(1)],
+        },
         KeyCode::Char(c) if ctrl && alt => {
-            let byte = (c.to_ascii_lowercase() as u8)
-                .wrapping_sub(b'a')
-                .wrapping_add(1);
+            let byte = match c {
+                ' ' => 0x00,
+                '[' => 0x1b,
+                '\\' => 0x1c,
+                ']' => 0x1d,
+                '^' => 0x1e,
+                '_' => 0x1f,
+                'a'..='z' => c as u8 - b'a' + 1,
+                _ => (c.to_ascii_lowercase() as u8)
+                    .wrapping_sub(b'a')
+                    .wrapping_add(1),
+            };
             vec![0x1b, byte]
         }
         KeyCode::Char(c) => {
@@ -455,22 +471,30 @@ fn encode_key(key: KeyEvent) -> Vec<u8> {
                 v.extend_from_slice(s.as_bytes());
                 v
             } else if shift && (alt || ctrl) {
-                // CSI u for modified chars: ESC [ <codepoint> ; <mods> u
                 format!("\x1b[{};{}u", c as u32, mods_param).into_bytes()
             } else {
                 s.as_bytes().to_vec()
             }
         }
-        // Enter: plain \r, or CSI u when modified (Shift+Enter, Ctrl+Enter)
+        // Enter: Shift+Enter → CSI u, Alt+Enter → ESC CR, plain → CR
         KeyCode::Enter => {
-            if has_mods {
+            if shift {
+                format!("\x1b[13;{}u", mods_param).into_bytes()
+            } else if alt {
+                vec![0x1b, b'\r'] // Alt+Enter = ESC CR (legacy)
+            } else if ctrl {
                 format!("\x1b[13;{}u", mods_param).into_bytes()
             } else {
                 vec![b'\r']
             }
         }
+        // Backspace: Alt+BS → ESC DEL (word delete), Shift+BS → CSI u, plain → DEL
         KeyCode::Backspace => {
-            if has_mods {
+            if alt && !ctrl && !shift {
+                vec![0x1b, 0x7f] // Alt+Backspace = ESC DEL (shell word delete)
+            } else if ctrl && !alt && !shift {
+                vec![0x08] // Ctrl+Backspace = BS
+            } else if has_mods {
                 format!("\x1b[127;{}u", mods_param).into_bytes()
             } else {
                 vec![0x7f]
@@ -515,7 +539,7 @@ fn encode_key(key: KeyEvent) -> Vec<u8> {
         KeyCode::PageUp => tilde_with_mods(5, has_mods, mods_param),
         KeyCode::PageDown => tilde_with_mods(6, has_mods, mods_param),
         KeyCode::Insert => tilde_with_mods(2, has_mods, mods_param),
-        KeyCode::F(n) => encode_f_key(n),
+        KeyCode::F(n) => encode_f_key_with_mods(n, has_mods, mods_param),
         _ => vec![],
     }
 }
@@ -538,20 +562,41 @@ fn tilde_with_mods(n: u8, has_mods: bool, mods_param: u8) -> Vec<u8> {
     }
 }
 
-fn encode_f_key(n: u8) -> Vec<u8> {
-    match n {
-        1 => b"\x1bOP".to_vec(),
-        2 => b"\x1bOQ".to_vec(),
-        3 => b"\x1bOR".to_vec(),
-        4 => b"\x1bOS".to_vec(),
-        5 => b"\x1b[15~".to_vec(),
-        6 => b"\x1b[17~".to_vec(),
-        7 => b"\x1b[18~".to_vec(),
-        8 => b"\x1b[19~".to_vec(),
-        9 => b"\x1b[20~".to_vec(),
-        10 => b"\x1b[21~".to_vec(),
-        11 => b"\x1b[23~".to_vec(),
-        12 => b"\x1b[24~".to_vec(),
-        _ => vec![],
+fn encode_f_key_with_mods(n: u8, has_mods: bool, mods_param: u8) -> Vec<u8> {
+    // F1-F4 use SS3 format without mods, CSI format with mods
+    // F5-F12 use CSI tilde format
+    if has_mods {
+        let code = match n {
+            1 => 11,
+            2 => 12,
+            3 => 13,
+            4 => 14,
+            5 => 15,
+            6 => 17,
+            7 => 18,
+            8 => 19,
+            9 => 20,
+            10 => 21,
+            11 => 23,
+            12 => 24,
+            _ => return vec![],
+        };
+        format!("\x1b[{};{}~", code, mods_param).into_bytes()
+    } else {
+        match n {
+            1 => b"\x1bOP".to_vec(),
+            2 => b"\x1bOQ".to_vec(),
+            3 => b"\x1bOR".to_vec(),
+            4 => b"\x1bOS".to_vec(),
+            5 => b"\x1b[15~".to_vec(),
+            6 => b"\x1b[17~".to_vec(),
+            7 => b"\x1b[18~".to_vec(),
+            8 => b"\x1b[19~".to_vec(),
+            9 => b"\x1b[20~".to_vec(),
+            10 => b"\x1b[21~".to_vec(),
+            11 => b"\x1b[23~".to_vec(),
+            12 => b"\x1b[24~".to_vec(),
+            _ => vec![],
+        }
     }
 }
