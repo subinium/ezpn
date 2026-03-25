@@ -1495,7 +1495,7 @@ pub fn draw_help_overlay(stdout: &mut impl Write, term_w: u16, term_h: u16) -> a
         "  B             Broadcast mode (type in all)",
         "  R             Resize mode (arrows/hjkl, q)",
         "  { }           Swap pane prev/next",
-        "  [             Scroll mode (j/k/g/G, q)",
+        "  [             Copy mode (hjkl/v/y/search, q)",
         "  d             Detach session",
         "  s             Toggle status bar",
         "  ?             This help",

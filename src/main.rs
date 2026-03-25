@@ -739,7 +739,7 @@ PREFIX KEYS (Ctrl+B then):
   R                 Resize mode (arrow/hjkl, q to exit)
   q                 Show pane numbers + quick jump
   {{ }}               Swap pane with prev/next
-  [                 Scroll mode (j/k/g/G, q to exit)
+  [                 Copy mode (vi keys, v select, y copy, / search)
   ,                 Rename current tab
   :                 Command palette
   d                 Detach (session continues in background)

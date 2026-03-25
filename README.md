@@ -143,7 +143,7 @@ All tmux command aliases (`split-window`, `kill-pane`, `new-window`, etc.) are s
 | `E` / Space | Equalize |
 | **Modes** | |
 | `R` | Resize mode (hjkl/arrows, q to exit) |
-| `[` | Scroll mode (j/k/g/G, q to exit) |
+| `[` | Copy mode (vi keys, v select, y copy, / search) |
 | `B` | Broadcast (type in all panes) |
 | `:` | Command palette |
 | `?` | Help overlay |
@@ -161,6 +161,38 @@ All tmux command aliases (`split-window`, `kill-pane`, `new-window`, etc.) are s
 - **Terminal.app**: Settings > Profiles > Keyboard > Use Option as Meta Key
 - **Ghostty**: Works by default
 </details>
+
+## Copy Mode (vi keys)
+
+`Ctrl+B [` enters copy mode — navigate scrollback, select text, search, and copy to clipboard.
+
+**Navigation:**
+
+| Key | Action |
+|-----|--------|
+| `h` `j` `k` `l` | Move cursor |
+| `w` / `b` | Next / previous word |
+| `0` / `$` / `^` | Line start / end / first non-blank |
+| `g` / `G` | Top / bottom of scrollback |
+| `Ctrl+U` / `Ctrl+D` | Half page up / down |
+| `H` / `M` / `L` | Viewport top / middle / bottom |
+
+**Selection & Copy:**
+
+| Key | Action |
+|-----|--------|
+| `v` | Start character selection |
+| `V` | Start line selection |
+| `y` / `Enter` | Copy selection to clipboard (OSC 52) and exit |
+
+**Search:**
+
+| Key | Action |
+|-----|--------|
+| `/` | Forward search (incremental, case-insensitive) |
+| `?` | Backward search |
+| `n` / `N` | Next / previous match |
+| `q` / `Esc` | Exit copy mode |
 
 ## Layout Presets
 
@@ -342,6 +374,7 @@ src/
 ├── protocol.rs    Binary wire protocol (TLV framing)
 ├── session.rs     Session naming, discovery, daemon spawning
 ├── tab.rs         Tab (window) manager with save/restore
+├── copy_mode.rs   Vi-style copy mode (selection, search, clipboard)
 ├── layout.rs      Binary split tree + named presets
 ├── pane.rs        PTY + VT100 emulation + scrollback + input encoding
 ├── render.rs      Incremental render + border cache + tab bar + status bar
