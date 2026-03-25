@@ -252,7 +252,7 @@ ezpn from Procfile   # Generate .ezpn.toml from Procfile
 `~/.config/ezpn/config.toml`:
 
 ```toml
-border = rounded        # single | rounded | heavy | double
+border = rounded        # single | rounded | heavy | double | none
 shell = /bin/zsh
 scrollback = 10000
 status_bar = true
@@ -315,6 +315,13 @@ Multiple sessions are supported. `ezpn a` without a name attaches to the most re
 
 **CJK/Unicode** — Proper width calculation for Korean, Chinese, Japanese characters and emoji.
 
+**Borderless mode** — `ezpn -b none` removes the outer frame for maximum screen space. Panes are separated by thin vertical lines with a colored title strip. 10% more usable area than bordered mode.
+
+**Configurable prefix key** — Change the prefix from `Ctrl+B` to any key in `~/.config/ezpn/config.toml`:
+```toml
+prefix = a   # Ctrl+A becomes the prefix key
+```
+
 **Dead pane recovery** — Process exits show dimmed overlay. Press `Enter` to respawn.
 
 **Settings panel** — `Ctrl+G` opens a modal for border style, status bar toggle, split actions.
@@ -322,7 +329,7 @@ Multiple sessions are supported. `ezpn a` without a name attaches to the most re
 **Border styles** — `--border` or change in settings:
 
 ```
-single           rounded (default) heavy            double
+single           rounded (default) heavy            double           none (borderless)
 ┌──────┬──────┐  ╭──────┬──────╮  ┏━━━━━━┳━━━━━━┓  ╔══════╦══════╗
 │      │      │  │      │      │  ┃      ┃      ┃  ║      ║      ║
 └──────┴──────┘  ╰──────┴──────╯  ┗━━━━━━┻━━━━━━┛  ╚══════╩══════╝
