@@ -1030,6 +1030,7 @@ pub fn draw_status_bar_full(
         "SELECT" => &["1-9 jump to pane", "0 for 10th", "any key cancel"],
         "KILL SESSION? y/n" => &["y kill session", "any key cancel"],
         "CLOSE PANE? y/n" => &["y close pane", "any key cancel"],
+        "CLOSE TAB? y/n" => &["y close tab", "any key cancel"],
         "ZOOM" => &["Ctrl+B z unzoom", "Ctrl+D/E split", "type normally"],
         "BROADCAST" => &["typing in ALL panes", "Ctrl+B B stop broadcast"],
         _ => &[

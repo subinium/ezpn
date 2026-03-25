@@ -34,6 +34,7 @@ enum InputMode {
     CopyMode(crate::copy_mode::CopyModeState),
     QuitConfirm,
     CloseConfirm,
+    CloseTabConfirm,
     ResizeMode,
     PaneSelect,
     HelpOverlay,
@@ -899,6 +900,7 @@ fn render_frame_to_buf(
         InputMode::CopyMode(ref cm) => cm.mode_label(),
         InputMode::QuitConfirm => "KILL SESSION? y/n",
         InputMode::CloseConfirm => "CLOSE PANE? y/n",
+        InputMode::CloseTabConfirm => "CLOSE TAB? y/n",
         InputMode::ResizeMode => "RESIZE",
         InputMode::PaneSelect => "SELECT",
         InputMode::HelpOverlay => "",
@@ -1187,6 +1189,21 @@ fn process_key(
             KeyCode::Char('y') | KeyCode::Enter => {
                 // Kill entire session (all tabs)
                 *tab_action = TabAction::KillSession;
+            }
+            _ => {
+                *mode = InputMode::Normal;
+                update.full_redraw = true;
+            }
+        }
+        return;
+    }
+
+    // ── Close tab (window) confirmation ──
+    if matches!(mode, InputMode::CloseTabConfirm) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                *tab_action = TabAction::CloseTab;
+                *mode = InputMode::Normal;
             }
             _ => {
                 *mode = InputMode::Normal;
@@ -1582,9 +1599,9 @@ fn process_key(
             KeyCode::Char('p') => {
                 *tab_action = TabAction::PrevTab;
             }
-            // Close tab (tmux &)
+            // Close tab (with confirmation)
             KeyCode::Char('&') => {
-                *tab_action = TabAction::CloseTab;
+                next_mode = InputMode::CloseTabConfirm;
             }
             // Rename tab (tmux ,) — pre-fill with current tab name
             KeyCode::Char(',') => {
