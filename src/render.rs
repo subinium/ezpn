@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
-use std::io;
+use std::io::Write;
+
+use unicode_width::UnicodeWidthStr;
 
 use crossterm::{
     cursor, queue,
@@ -28,6 +30,11 @@ const HINT_FG: Color = Color::Rgb {
 };
 const CLOSE_COLOR: Color = Color::DarkRed;
 const DEAD_FG: Color = Color::DarkGrey;
+const BROADCAST_COLOR: Color = Color::Rgb {
+    r: 255,
+    g: 140,
+    b: 50,
+};
 const DRAG_COLOR: Color = Color::Yellow;
 const MUTED_FG: Color = Color::Rgb {
     r: 100,
@@ -269,7 +276,7 @@ pub type PaneSelection = Option<(usize, u16, u16, u16, u16)>;
 
 #[allow(clippy::too_many_arguments)]
 pub fn render_panes(
-    stdout: &mut io::Stdout,
+    stdout: &mut impl Write,
     panes: &HashMap<usize, Pane>,
     layout: &Layout,
     active_id: usize,
@@ -282,6 +289,7 @@ pub fn render_panes(
     dirty_panes: &HashSet<usize>,
     full_redraw: bool,
     selection: PaneSelection,
+    broadcast: bool,
 ) -> anyhow::Result<()> {
     queue!(stdout, cursor::Hide)?;
 
@@ -317,6 +325,8 @@ pub fn render_panes(
                 .unwrap_or(false);
             let color = if dragging_sep {
                 DRAG_COLOR
+            } else if broadcast {
+                BROADCAST_COLOR
             } else if is_active {
                 ACTIVE_COLOR
             } else {
@@ -397,7 +407,7 @@ pub fn render_panes(
     Ok(())
 }
 
-fn clear_rect(stdout: &mut io::Stdout, rect: &Rect) -> anyhow::Result<()> {
+fn clear_rect(stdout: &mut impl Write, rect: &Rect) -> anyhow::Result<()> {
     if rect.w == 0 || rect.h == 0 {
         return Ok(());
     }
@@ -412,7 +422,7 @@ fn clear_rect(stdout: &mut io::Stdout, rect: &Rect) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn clear_title(stdout: &mut io::Stdout, rect: &Rect) -> anyhow::Result<()> {
+fn clear_title(stdout: &mut impl Write, rect: &Rect) -> anyhow::Result<()> {
     if rect.w == 0 {
         return Ok(());
     }
@@ -438,7 +448,7 @@ fn is_pane_border(x: u16, y: u16, r: &Rect) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 fn draw_pane_title(
-    stdout: &mut io::Stdout,
+    stdout: &mut impl Write,
     rect: &Rect,
     idx: usize,
     is_active: bool,
@@ -531,19 +541,25 @@ fn draw_pane_title(
     Ok(())
 }
 
-fn truncate_label(label: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
+fn truncate_label(label: &str, max_cols: usize) -> String {
+    if max_cols == 0 {
         return String::new();
     }
     let mut out = String::new();
-    for ch in label.chars().take(max_chars) {
+    let mut width = 0usize;
+    for ch in label.chars() {
+        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + cw > max_cols {
+            break;
+        }
         out.push(ch);
+        width += cw;
     }
     out
 }
 
 /// Draw dimmed overlay on dead panes with centered message.
-fn draw_dead_overlay(stdout: &mut io::Stdout, rect: &Rect) -> anyhow::Result<()> {
+fn draw_dead_overlay(stdout: &mut impl Write, rect: &Rect) -> anyhow::Result<()> {
     if rect.w < 5 || rect.h < 1 {
         return Ok(());
     }
@@ -602,7 +618,7 @@ fn draw_dead_overlay(stdout: &mut io::Stdout, rect: &Rect) -> anyhow::Result<()>
 }
 
 fn draw_content(
-    stdout: &mut io::Stdout,
+    stdout: &mut impl Write,
     pane: &Pane,
     rect: &Rect,
     is_alive: bool,
@@ -745,7 +761,7 @@ fn draw_content(
 }
 
 pub fn draw_status_bar(
-    stdout: &mut io::Stdout,
+    stdout: &mut impl Write,
     term_w: u16,
     term_h: u16,
     active_idx: usize,
@@ -757,7 +773,7 @@ pub fn draw_status_bar(
 
 #[allow(clippy::too_many_arguments)]
 pub fn draw_status_bar_full(
-    stdout: &mut io::Stdout,
+    stdout: &mut impl Write,
     term_w: u16,
     term_h: u16,
     active_idx: usize,
@@ -853,19 +869,18 @@ pub fn draw_status_bar_full(
     )?;
     let hints: &[&str] = match mode_label {
         "PREFIX" => &[
+            "c new-tab",
+            "n/p next/prev-tab",
             "%/\" split H/V",
-            "c new-pane",
-            "o next",
-            "; last-pane",
+            "o next-pane",
             "←↑↓→ navigate",
             "z zoom",
             "B broadcast",
             "R resize",
             "[ scroll",
-            "Space equalize",
-            "q pane-jump",
-            "{/} swap",
-            "x close",
+            "d detach",
+            "x close-pane",
+            "& close-tab",
             "? help",
         ],
         "RESIZE" => &["←→↑↓/hjkl resize pane", "q/Esc exit resize"],
@@ -968,17 +983,214 @@ pub fn draw_status_bar_full(
     Ok(())
 }
 
+/// Draw a text input bar at the bottom of the screen (replaces status bar temporarily).
+pub fn draw_text_input(
+    stdout: &mut impl Write,
+    term_w: u16,
+    term_h: u16,
+    prompt: &str,
+    buffer: &str,
+) -> anyhow::Result<()> {
+    let y = term_h - 1;
+    let w = term_w as usize;
+
+    let input_bg = Color::Rgb {
+        r: 30,
+        g: 35,
+        b: 50,
+    };
+    let prompt_fg = Color::Rgb {
+        r: 102,
+        g: 217,
+        b: 239,
+    };
+    let text_fg = Color::White;
+    let cursor_bg = Color::Rgb {
+        r: 80,
+        g: 90,
+        b: 120,
+    };
+
+    // Clear row
+    queue!(stdout, cursor::MoveTo(0, y), SetBackgroundColor(input_bg),)?;
+    for _ in 0..w {
+        queue!(stdout, Print(" "))?;
+    }
+
+    // Prompt
+    queue!(
+        stdout,
+        cursor::MoveTo(1, y),
+        SetBackgroundColor(input_bg),
+        SetForegroundColor(prompt_fg),
+        SetAttribute(Attribute::Bold),
+        Print(prompt),
+        SetAttribute(Attribute::Reset),
+        SetBackgroundColor(input_bg),
+        SetForegroundColor(text_fg),
+        Print(buffer),
+    )?;
+
+    // Cursor block
+    let cursor_x = 1 + prompt.len() as u16 + buffer.len() as u16;
+    if (cursor_x as usize) < w {
+        queue!(
+            stdout,
+            cursor::MoveTo(cursor_x, y),
+            SetBackgroundColor(cursor_bg),
+            Print(" "),
+        )?;
+    }
+
+    queue!(stdout, ResetColor, SetAttribute(Attribute::Reset))?;
+    Ok(())
+}
+
+/// Y position of the tab bar given terminal dimensions.
+pub fn tab_bar_y(term_h: u16, show_status_bar: bool) -> u16 {
+    if show_status_bar {
+        term_h.saturating_sub(2)
+    } else {
+        term_h.saturating_sub(1)
+    }
+}
+
+/// Hit-test: which tab index was clicked at column `x` on the tab bar row?
+/// `tabs` must be the same list passed to `draw_tab_bar`.
+pub fn tab_bar_hit(x: u16, tabs: &[(usize, String, bool)], term_w: u16) -> Option<usize> {
+    if tabs.len() <= 1 {
+        return None;
+    }
+    let w = term_w as usize;
+    let mut col = 2usize;
+    for (idx, name, _) in tabs {
+        let name_w = UnicodeWidthStr::width(name.as_str());
+        let tab_width = 4 + name_w + 2; // "  N:" + name + "  "
+        if col + tab_width >= w {
+            break;
+        }
+        if (x as usize) >= col && (x as usize) < col + tab_width {
+            return Some(*idx);
+        }
+        col += tab_width + 2; // tab + " │"
+    }
+    None
+}
+
+/// Draw tab indicators in the status bar area.
+/// Renders a tab bar above the main status bar (uses 1 extra row).
+/// `tabs` is `(index, name, is_active)` for each tab.
+pub fn draw_tab_bar(
+    stdout: &mut impl Write,
+    term_w: u16,
+    term_h: u16,
+    tabs: &[(usize, String, bool)],
+    show_status_bar: bool,
+) -> anyhow::Result<()> {
+    if tabs.len() <= 1 {
+        return Ok(());
+    }
+
+    let y = tab_bar_y(term_h, show_status_bar);
+    let w = term_w as usize;
+
+    let tab_bg = Color::Rgb {
+        r: 24,
+        g: 26,
+        b: 34,
+    };
+    let active_tab_bg = Color::Rgb {
+        r: 50,
+        g: 55,
+        b: 70,
+    };
+    let active_tab_fg = Color::Rgb {
+        r: 220,
+        g: 225,
+        b: 240,
+    };
+    let inactive_fg = Color::Rgb {
+        r: 100,
+        g: 110,
+        b: 130,
+    };
+    let index_fg = Color::Rgb {
+        r: 80,
+        g: 180,
+        b: 220,
+    };
+    let sep_fg = Color::Rgb {
+        r: 50,
+        g: 55,
+        b: 65,
+    };
+
+    // Clear the row
+    queue!(stdout, cursor::MoveTo(0, y), SetBackgroundColor(tab_bg),)?;
+    for _ in 0..w {
+        queue!(stdout, Print(" "))?;
+    }
+
+    // Render tabs with generous spacing: "  N : name  │"
+    queue!(stdout, cursor::MoveTo(1, y))?;
+    let mut col = 2usize;
+
+    for (idx, name, is_active) in tabs {
+        let name_w = UnicodeWidthStr::width(name.as_str());
+        let tab_width = 4 + name_w + 2; // "  N:" + name + "  "
+        if col + tab_width + 1 >= w {
+            break;
+        }
+
+        let bg = if *is_active { active_tab_bg } else { tab_bg };
+
+        queue!(stdout, SetBackgroundColor(bg), SetForegroundColor(index_fg),)?;
+        if *is_active {
+            queue!(stdout, SetAttribute(Attribute::Bold))?;
+        }
+        queue!(stdout, Print(format!("  {}: ", idx + 1)))?;
+
+        queue!(
+            stdout,
+            SetForegroundColor(if *is_active {
+                active_tab_fg
+            } else {
+                inactive_fg
+            })
+        )?;
+        queue!(stdout, Print(name))?;
+        queue!(stdout, Print("  "))?;
+
+        if *is_active {
+            queue!(stdout, SetAttribute(Attribute::Reset))?;
+        }
+
+        // Separator
+        queue!(
+            stdout,
+            SetBackgroundColor(tab_bg),
+            SetForegroundColor(sep_fg),
+            Print(" │"),
+        )?;
+        col += tab_width + 2; // tab + " │"
+    }
+
+    queue!(stdout, ResetColor, SetAttribute(Attribute::Reset))?;
+    Ok(())
+}
+
 /// Get current time as HH:MM using libc (no chrono dependency).
+/// Uses `localtime_r` for thread safety.
 fn now_hhmm() -> String {
     #[cfg(unix)]
     {
         let mut t: libc::time_t = 0;
         unsafe { libc::time(&mut t) };
-        let tm = unsafe { libc::localtime(&t) };
-        if tm.is_null() {
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        let result = unsafe { libc::localtime_r(&t, &mut tm) };
+        if result.is_null() {
             return "--:--".to_string();
         }
-        let tm = unsafe { &*tm };
         format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
     }
     #[cfg(not(unix))]
@@ -1037,7 +1249,7 @@ pub fn title_button_hit(x: u16, y: u16, layout: &Layout, inner: &Rect) -> Option
 /// Render a single pane at full terminal size (zoom mode).
 #[allow(clippy::too_many_arguments)]
 pub fn render_zoomed_pane(
-    stdout: &mut io::Stdout,
+    stdout: &mut impl Write,
     pane: &Pane,
     pane_idx: usize,
     label: &str,
@@ -1121,7 +1333,7 @@ pub fn render_zoomed_pane(
 
 // ─── Help Overlay ──────────────────────────────────────────
 
-pub fn draw_help_overlay(stdout: &mut io::Stdout, term_w: u16, term_h: u16) -> anyhow::Result<()> {
+pub fn draw_help_overlay(stdout: &mut impl Write, term_w: u16, term_h: u16) -> anyhow::Result<()> {
     let help_lines = [
         "",
         "  DIRECT SHORTCUTS",
@@ -1134,20 +1346,22 @@ pub fn draw_help_overlay(stdout: &mut io::Stdout, term_w: u16, term_h: u16) -> a
         "  Ctrl+W        Quit",
         "",
         "  PREFIX MODE (Ctrl+B then)",
-        "  %             Split left|right",
-        "  \"             Split top/bottom",
-        "  o             Next pane",
-        "  Arrow         Navigate directional",
+        "  TABS:",
+        "  c             New tab",
+        "  n / p         Next / previous tab",
+        "  0-9           Jump to tab by number",
+        "  &             Close current tab",
+        "  PANES:",
+        "  % / \"         Split H / V",
+        "  o / Arrow     Next / navigate pane",
         "  x             Close pane",
         "  z             Zoom toggle",
         "  B             Broadcast mode (type in all)",
         "  R             Resize mode (arrows/hjkl, q)",
         "  { }           Swap pane prev/next",
         "  [             Scroll mode (j/k/g/G, q)",
-        "  q             Show pane numbers + jump",
-        "  E             Equalize sizes",
+        "  d             Detach session",
         "  s             Toggle status bar",
-        "  d             Quit (with confirmation)",
         "  ?             This help",
         "",
         "  MOUSE",
@@ -1292,7 +1506,7 @@ pub fn draw_help_overlay(stdout: &mut io::Stdout, term_w: u16, term_h: u16) -> a
 
 /// Draw large pane numbers overlaid on each pane for quick-jump (Ctrl+B q).
 pub fn draw_pane_numbers(
-    stdout: &mut io::Stdout,
+    stdout: &mut impl Write,
     layout: &Layout,
     inner: &Rect,
 ) -> anyhow::Result<()> {

@@ -8,6 +8,8 @@ pub struct EzpnConfig {
     pub scrollback: usize,
     pub show_status_bar: bool,
     pub show_tab_bar: bool,
+    /// Prefix key character (default: 'b' for Ctrl+B).
+    pub prefix_key: char,
 }
 
 impl Default for EzpnConfig {
@@ -18,6 +20,7 @@ impl Default for EzpnConfig {
             scrollback: 10_000,
             show_status_bar: true,
             show_tab_bar: true,
+            prefix_key: 'b',
         }
     }
 }
@@ -55,6 +58,15 @@ pub fn load_config() -> EzpnConfig {
                         }
                         "status_bar" => config.show_status_bar = value == "true",
                         "tab_bar" => config.show_tab_bar = value == "true",
+                        "prefix" => {
+                            // Accept single char like "a" or "b"
+                            let ch = value.to_lowercase();
+                            if let Some(c) = ch.chars().next() {
+                                if c.is_ascii_lowercase() {
+                                    config.prefix_key = c;
+                                }
+                            }
+                        }
                         _ => {} // ignore unknown keys
                     }
                 }

@@ -1,4 +1,4 @@
-use std::io;
+use std::io::Write;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use crossterm::{cursor, queue, style::*};
@@ -168,7 +168,7 @@ impl Settings {
 
     // ─── Render ────────────────────────────────────────
 
-    pub fn render_overlay(&self, stdout: &mut io::Stdout, tw: u16, th: u16) -> anyhow::Result<()> {
+    pub fn render_overlay(&self, stdout: &mut impl Write, tw: u16, th: u16) -> anyhow::Result<()> {
         if tw < W + 4 || th < H + 2 {
             return Ok(());
         }
@@ -247,7 +247,7 @@ impl Settings {
     #[allow(clippy::too_many_arguments)]
     fn item_border(
         &self,
-        stdout: &mut io::Stdout,
+        stdout: &mut impl Write,
         x: u16,
         xr: u16,
         oy: u16,
@@ -295,7 +295,7 @@ impl Settings {
     #[allow(clippy::too_many_arguments)]
     fn item_action(
         &self,
-        stdout: &mut io::Stdout,
+        stdout: &mut impl Write,
         x: u16,
         xr: u16,
         oy: u16,
@@ -331,7 +331,7 @@ impl Settings {
         Ok(())
     }
 
-    fn item_toggle(&self, stdout: &mut io::Stdout, x: u16, xr: u16, oy: u16) -> anyhow::Result<()> {
+    fn item_toggle(&self, stdout: &mut impl Write, x: u16, xr: u16, oy: u16) -> anyhow::Result<()> {
         let y = oy + ITEM_Y[I_STATUS];
         let f = self.focused == I_STATUS;
         let bg = if f { FOCUS_BG } else { BG };
@@ -365,7 +365,7 @@ impl Settings {
         Ok(())
     }
 
-    fn item_close(&self, stdout: &mut io::Stdout, x: u16, xr: u16, oy: u16) -> anyhow::Result<()> {
+    fn item_close(&self, stdout: &mut impl Write, x: u16, xr: u16, oy: u16) -> anyhow::Result<()> {
         let y = oy + ITEM_Y[I_CLOSE];
         let f = self.focused == I_CLOSE;
         let bg = if f { FOCUS_BG } else { BG };
@@ -459,7 +459,7 @@ fn origin(tw: u16, th: u16) -> (u16, u16) {
 }
 
 fn text(
-    out: &mut io::Stdout,
+    out: &mut impl Write,
     x: u16,
     y: u16,
     bg: Color,
@@ -483,7 +483,7 @@ fn text(
     Ok(())
 }
 
-fn div(out: &mut io::Stdout, x: u16, y: u16, w: usize) -> anyhow::Result<()> {
+fn div(out: &mut impl Write, x: u16, y: u16, w: usize) -> anyhow::Result<()> {
     queue!(
         out,
         cursor::MoveTo(x, y),
@@ -494,7 +494,7 @@ fn div(out: &mut io::Stdout, x: u16, y: u16, w: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn row_bg(out: &mut io::Stdout, x: u16, y: u16, w: usize, bg: Color) -> anyhow::Result<()> {
+fn row_bg(out: &mut impl Write, x: u16, y: u16, w: usize, bg: Color) -> anyhow::Result<()> {
     queue!(out, cursor::MoveTo(x, y), SetBackgroundColor(bg))?;
     for _ in 0..w {
         queue!(out, Print(" "))?;
@@ -502,7 +502,7 @@ fn row_bg(out: &mut io::Stdout, x: u16, y: u16, w: usize, bg: Color) -> anyhow::
     Ok(())
 }
 
-fn focus_marker(out: &mut io::Stdout, x: u16, y: u16) -> anyhow::Result<()> {
+fn focus_marker(out: &mut impl Write, x: u16, y: u16) -> anyhow::Result<()> {
     queue!(
         out,
         cursor::MoveTo(x, y),
@@ -514,7 +514,7 @@ fn focus_marker(out: &mut io::Stdout, x: u16, y: u16) -> anyhow::Result<()> {
 }
 
 fn right_tag(
-    out: &mut io::Stdout,
+    out: &mut impl Write,
     xr: u16,
     y: u16,
     bg: Color,

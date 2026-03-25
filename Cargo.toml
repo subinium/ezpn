@@ -1,6 +1,6 @@
 [package]
 name = "ezpn"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.82"
 autobins = false
@@ -23,11 +23,12 @@ path = "src/bin/ezpn-ctl.rs"
 [dependencies]
 portable-pty = "0.8"
 vt100 = "0.15"
-crossterm = "0.28"
+crossterm = { version = "0.28", features = ["serde"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+unicode-width = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
