@@ -25,14 +25,14 @@
 ## 为什么选择 ezpn？
 
 ```bash
-$ ezpn -e 'npm run dev' -e 'npm test --watch' -e 'tail -f logs/app.log'
+$ ezpn                # 终端即刻分屏
+$ ezpn 2 3            # 2x3 Shell 网格
+$ ezpn -l dev         # 预设布局
 ```
 
-三个面板。三条命令。一行搞定。无需配置文件，无需设置，无需学习成本。
+无需配置文件，无需设置，无需学习成本。会话在后台持久运行 — `Ctrl+B d` 分离，`ezpn a` 回来。
 
-会话在后台持久运行 — `Ctrl+B d` 分离，`ezpn a` 回来。进程继续运行。
-
-**团队协作**，将 `.ezpn.toml` 放入仓库，所有人共享相同的工作空间：
+**在项目中**，将 `.ezpn.toml` 放入仓库并运行 `ezpn` — 所有人共享相同的工作空间：
 
 ```toml
 [workspace]

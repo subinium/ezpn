@@ -25,14 +25,14 @@
 ## ¿Por qué ezpn?
 
 ```bash
-$ ezpn -e 'npm run dev' -e 'npm test --watch' -e 'tail -f logs/app.log'
+$ ezpn                # divide tu terminal, al instante
+$ ezpn 2 3            # cuadrícula 2x3 de shells
+$ ezpn -l dev         # preset de diseño
 ```
 
-Tres paneles. Tres comandos. Una línea. Sin archivos de configuración, sin setup, sin curva de aprendizaje.
+Sin archivos de configuración, sin setup, sin curva de aprendizaje. Las sesiones persisten en segundo plano — `Ctrl+B d` para separar, `ezpn a` para volver.
 
-Las sesiones persisten en segundo plano — `Ctrl+B d` para separar, `ezpn a` para volver. Tus procesos siguen ejecutándose.
-
-**Para equipos**, coloca `.ezpn.toml` en tu repo y todos obtienen el mismo espacio de trabajo:
+**En un proyecto**, coloca `.ezpn.toml` en tu repo y ejecuta `ezpn` — todos obtienen el mismo espacio de trabajo:
 
 ```toml
 [workspace]
