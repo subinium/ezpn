@@ -1878,12 +1878,35 @@ fn process_mouse(
 ) {
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            // Tab bar click detection
+            // Tab bar: single click = switch tab, double click = rename tab
             if tab_names.len() > 1 {
                 let tab_y = render::tab_bar_y(th, settings.show_status_bar);
                 if mouse.row == tab_y {
                     if let Some(idx) = render::tab_bar_hit(mouse.column, tab_names, tw) {
-                        *tab_action = TabAction::GoToTab(idx);
+                        let now = Instant::now();
+                        let is_double = last_click
+                            .map(|(t, lx, ly)| {
+                                now.duration_since(t) < Duration::from_millis(400)
+                                    && lx == mouse.column
+                                    && ly == mouse.row
+                            })
+                            .unwrap_or(false);
+                        *last_click = Some((now, mouse.column, mouse.row));
+
+                        if is_double {
+                            // Double-click on tab → rename mode
+                            // First switch to that tab if not active
+                            if idx != tab_names.iter().position(|(_, _, a)| *a).unwrap_or(0) {
+                                *tab_action = TabAction::GoToTab(idx);
+                            }
+                            // Enter rename mode with current tab name as initial buffer
+                            *_mode = InputMode::RenameTab {
+                                buffer: String::new(),
+                            };
+                            update.full_redraw = true;
+                        } else {
+                            *tab_action = TabAction::GoToTab(idx);
+                        }
                         return;
                     }
                 }
