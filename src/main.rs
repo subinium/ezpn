@@ -10,12 +10,16 @@ use crossterm::{
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
 
+mod client;
 mod config;
 mod ipc;
 mod layout;
 mod pane;
 mod project;
+mod protocol;
 mod render;
+mod server;
+mod session;
 mod settings;
 mod tab;
 mod workspace;
@@ -46,6 +50,31 @@ fn main() -> anyhow::Result<()> {
     match args.get(1).map(|s| s.as_str()) {
         Some("init") => return cmd_init(),
         Some("from") => return cmd_from(args.get(2).map(|s| s.as_str())),
+        Some("ls") => return cmd_ls(),
+        Some("kill") => return cmd_kill(args.get(2).map(|s| s.as_str())),
+        Some("a") | Some("attach") => return cmd_attach(args.get(2).map(|s| s.as_str())),
+        Some("rename") => {
+            return cmd_rename(
+                args.get(2).map(|s| s.as_str()),
+                args.get(3).map(|s| s.as_str()),
+            )
+        }
+        Some("-h") | Some("--help") => {
+            print_help();
+            return Ok(());
+        }
+        Some("-V") | Some("--version") => {
+            println!("ezpn {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some("--server") => {
+            // Internal: run as server daemon
+            let session_name = args
+                .get(2)
+                .ok_or_else(|| anyhow::anyhow!("--server requires session name"))?;
+            let remaining: Vec<String> = args[3..].to_vec();
+            return server::run(session_name, &remaining);
+        }
         _ => {}
     }
 
@@ -54,21 +83,67 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
 
+    // Validate args BEFORE spawning daemon — catch errors like invalid flags,
+    // conflicting options, etc. early so the user sees them immediately.
     let config = parse_args()?;
 
+    // Check for --no-daemon flag for legacy single-process mode
+    let original_args: Vec<String> = args[1..].to_vec();
+    if original_args.iter().any(|a| a == "--no-daemon") {
+        return run_direct(&config);
+    }
+
+    // Create a new session and attach
+    // Check for -S/--session flag to set custom session name
+    let session_name = {
+        let mut custom = None;
+        let mut i = 1;
+        while i < args.len() {
+            if (args[i] == "-S" || args[i] == "--session") && i + 1 < args.len() {
+                custom = Some(args[i + 1].clone());
+                break;
+            }
+            i += 1;
+        }
+        custom.unwrap_or_else(session::auto_name)
+    };
+
+    // Auto-attach: if a session with this name already exists, attach to it
+    // instead of creating a new one. (Like `cd` into a tmux project.)
+    if let Some((existing_name, existing_path)) = session::find(Some(&session_name)) {
+        match client::run(&existing_path, &existing_name) {
+            Ok(()) => return Ok(()),
+            Err(_) => {
+                // Session was stale — clean up and fall through to create new
+                session::cleanup(&existing_name);
+            }
+        }
+    }
+
+    let sock_path = session::spawn_server(&session_name, &original_args)?;
+    client::run(&sock_path, &session_name)
+}
+
+fn run_direct(config: &Config) -> anyhow::Result<()> {
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(
         stdout,
         EnterAlternateScreen,
         event::EnableMouseCapture,
+        event::EnableFocusChange,
+        event::PushKeyboardEnhancementFlags(
+            event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+        ),
         cursor::Hide
     )?;
 
-    let result = run(&mut stdout, &config);
+    let result = run(&mut stdout, config);
 
     let _ = execute!(
         io::stdout(),
+        event::PopKeyboardEnhancementFlags,
+        event::DisableFocusChange,
         cursor::Show,
         event::DisableMouseCapture,
         LeaveAlternateScreen
@@ -76,6 +151,73 @@ fn main() -> anyhow::Result<()> {
     let _ = terminal::disable_raw_mode();
 
     result
+}
+
+fn cmd_ls() -> anyhow::Result<()> {
+    let sessions = session::list();
+    if sessions.is_empty() {
+        println!("No active sessions.");
+    } else {
+        println!("{:<20} SOCKET", "SESSION");
+        for (name, path) in &sessions {
+            println!("{:<20} {}", name, path.display());
+        }
+    }
+    Ok(())
+}
+
+fn cmd_kill(name: Option<&str>) -> anyhow::Result<()> {
+    let (session_name, path) = session::find(name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no session found{}",
+            name.map(|n| format!(": {}", n)).unwrap_or_default()
+        )
+    })?;
+
+    // Connect to the server and send kill command
+    if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&path) {
+        let _ = protocol::write_msg(&mut stream, protocol::C_KILL, &[]);
+        // Give the server a moment to shut down gracefully
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    // Clean up socket file in case server didn't
+    session::cleanup(&session_name);
+    println!("Killed session: {}", session_name);
+    Ok(())
+}
+
+fn cmd_rename(old: Option<&str>, new: Option<&str>) -> anyhow::Result<()> {
+    let new_name = new.ok_or_else(|| anyhow::anyhow!("usage: ezpn rename <old> <new>"))?;
+    let (old_name, old_path) = session::find(old).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no session found{}",
+            old.map(|n| format!(": {}", n)).unwrap_or_default()
+        )
+    })?;
+    let new_path = session::socket_path(new_name);
+    if new_path.exists() {
+        anyhow::bail!("session '{}' already exists", new_name);
+    }
+    std::fs::rename(&old_path, &new_path)?;
+    println!("Renamed session: {} → {}", old_name, new_name);
+    Ok(())
+}
+
+fn cmd_attach(name: Option<&str>) -> anyhow::Result<()> {
+    let (session_name, path) = session::find(name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no session found{}",
+            name.map(|n| format!(": {}", n)).unwrap_or_default()
+        )
+    })?;
+
+    if std::env::var("EZPN").is_ok() {
+        eprintln!("ezpn: cannot attach from inside an existing ezpn session");
+        std::process::exit(1);
+    }
+
+    client::run(&path, &session_name)
 }
 
 fn cmd_init() -> anyhow::Result<()> {
@@ -189,19 +331,19 @@ fn parse_procfile(contents: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-enum LayoutSpec {
+pub(crate) enum LayoutSpec {
     Grid { rows: usize, cols: usize },
     Spec(String),
 }
 
-struct Config {
-    layout: LayoutSpec,
-    border: BorderStyle,
-    has_border_override: bool,
-    shell: String,
-    has_shell_override: bool,
-    commands: Vec<String>,
-    restore: Option<String>,
+pub(crate) struct Config {
+    pub layout: LayoutSpec,
+    pub border: BorderStyle,
+    pub has_border_override: bool,
+    pub shell: String,
+    pub has_shell_override: bool,
+    pub commands: Vec<String>,
+    pub restore: Option<String>,
 }
 
 fn parse_args() -> anyhow::Result<Config> {
@@ -280,6 +422,9 @@ fn parse_args() -> anyhow::Result<Config> {
                         .ok_or_else(|| anyhow::anyhow!("--restore requires a file path"))?,
                 );
             }
+            "-S" | "--session" => {
+                i += 1; // Skip value — handled in main()
+            }
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -288,6 +433,7 @@ fn parse_args() -> anyhow::Result<Config> {
                 println!("ezpn {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
+            "--no-daemon" => {} // Handled by main() before parse_args
             other if other.starts_with('-') => anyhow::bail!("Unknown option: {}", other),
             _ => positional.push(args[i].clone()),
         }
@@ -350,17 +496,158 @@ fn parse_args() -> anyhow::Result<Config> {
     })
 }
 
+/// Parse args from a given slice (used by server process).
+pub(crate) fn parse_args_from(args: &[String]) -> anyhow::Result<Config> {
+    // Build a fake argv with program name
+    let mut full_args = vec!["ezpn".to_string()];
+    full_args.extend_from_slice(args);
+    // Temporarily override std::env::args by reparsing
+    let mut rows = 1usize;
+    let mut cols = 2usize;
+    let mut border = BorderStyle::Rounded;
+    let mut shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let mut vertical = false;
+    let mut layout_spec: Option<String> = None;
+    let mut commands = Vec::new();
+    let mut restore = None;
+    let mut positional = Vec::new();
+    let mut border_set = false;
+    let mut shell_set = false;
+    let mut direction_set = false;
+
+    let mut i = 1;
+    while i < full_args.len() {
+        match full_args[i].as_str() {
+            "-b" | "--border" => {
+                i += 1;
+                let value = full_args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--border requires a style"))?;
+                border = BorderStyle::from_str(value)
+                    .ok_or_else(|| anyhow::anyhow!("Unknown border style: '{}'", value))?;
+                border_set = true;
+            }
+            "-s" | "--shell" => {
+                i += 1;
+                shell = full_args
+                    .get(i)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("--shell requires a path"))?;
+                shell_set = true;
+            }
+            "-d" | "--direction" => {
+                i += 1;
+                let value = full_args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--direction requires h|v"))?;
+                match value.as_str() {
+                    "v" | "vertical" => vertical = true,
+                    "h" | "horizontal" => vertical = false,
+                    other => anyhow::bail!("Unknown direction: '{}'", other),
+                }
+                direction_set = true;
+            }
+            "-l" | "--layout" => {
+                i += 1;
+                layout_spec = Some(
+                    full_args
+                        .get(i)
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("--layout requires a spec"))?,
+                );
+            }
+            "-e" | "--exec" => {
+                i += 1;
+                commands.push(
+                    full_args
+                        .get(i)
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("--exec requires a command"))?,
+                );
+            }
+            "-r" | "--restore" => {
+                i += 1;
+                restore = Some(
+                    full_args
+                        .get(i)
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("--restore requires a file path"))?,
+                );
+            }
+            "--no-daemon" | "-h" | "--help" | "-V" | "--version" => {
+                // Skip flags not relevant to server
+            }
+            "-S" | "--session" => {
+                i += 1; // Skip value — handled by main()
+            }
+            other if other.starts_with('-') => {
+                // Skip unknown flags silently in server mode
+            }
+            _ => positional.push(full_args[i].clone()),
+        }
+        i += 1;
+    }
+
+    let layout = if let Some(spec) = layout_spec {
+        LayoutSpec::Spec(spec)
+    } else {
+        match positional.len() {
+            0 => {}
+            1 => {
+                let n: usize = positional[0].parse()?;
+                if vertical {
+                    rows = n;
+                    cols = 1;
+                } else {
+                    rows = 1;
+                    cols = n;
+                }
+            }
+            2 => {
+                rows = positional[0].parse()?;
+                cols = positional[1].parse()?;
+            }
+            _ => anyhow::bail!("Too many arguments"),
+        }
+        if rows == 0 || cols == 0 {
+            anyhow::bail!("Rows and cols must be >= 1");
+        }
+        if rows * cols > 100 {
+            anyhow::bail!("Maximum 100 panes");
+        }
+        LayoutSpec::Grid { rows, cols }
+    };
+
+    let _ = (direction_set, restore.as_ref());
+
+    Ok(Config {
+        layout,
+        border,
+        has_border_override: border_set,
+        shell,
+        has_shell_override: shell_set,
+        commands,
+        restore,
+    })
+}
+
 fn print_help() {
     println!(
         "\
 ezpn — Dead simple terminal pane splitting
 
 USAGE:
-  ezpn [OPTIONS] [COLS]
-  ezpn [OPTIONS] [ROWS] [COLS]
-  ezpn [OPTIONS] --layout <SPEC>
-  ezpn --restore <FILE>
-  ezpn init                         Generate .ezpn.toml template
+  ezpn [OPTIONS] [COLS]              Create session + attach (daemon mode)
+  ezpn [OPTIONS] [ROWS] [COLS]       Create session + attach
+  ezpn [OPTIONS] --layout <SPEC>     Create session with layout
+  ezpn a|attach [SESSION]            Attach to existing session
+  ezpn ls                            List active sessions
+  ezpn kill [SESSION]                Kill a session
+  ezpn rename <OLD> <NEW>            Rename a session
+  ezpn --restore <FILE>              Restore workspace snapshot
+  ezpn init                          Generate .ezpn.toml template
+  ezpn from [FILE]                   Generate .ezpn.toml from Procfile
+  ezpn --no-daemon [OPTIONS]         Run in single-process mode (no detach)
 
 EXAMPLES:
   ezpn                              Two panes side by side (or load .ezpn.toml)
@@ -371,7 +658,8 @@ EXAMPLES:
   ezpn -l '7:3/5:5'                 Custom: 2 rows with different ratios
   ezpn -e 'make watch' -e 'npm dev' Per-pane commands via shell -lc
   ezpn --restore .ezpn-session.json Restore a saved workspace
-  ezpn init                         Create .ezpn.toml in current directory
+  ezpn a                            Reattach to last session
+  Ctrl+B d                          Detach from current session
 
 OPTIONS:
   -l, --layout <SPEC>   Layout spec or preset name (see PRESETS below)
@@ -380,6 +668,7 @@ OPTIONS:
   -b, --border <STYLE>  single, rounded, heavy, double (default: rounded)
   -d, --direction <DIR> h (horizontal, default) or v (vertical)
   -s, --shell <SHELL>   Default shell path (default: $SHELL)
+  -S, --session <NAME>  Custom session name (default: auto from directory)
   -h, --help            Show this help
   -V, --version         Show version
 
@@ -412,15 +701,32 @@ CONTROLS:
   Ctrl+W            Quit
 
 PREFIX KEYS (Ctrl+B then):
-  c                 New pane (split + focus)
+  TABS (tmux windows):
+  c                 New tab
+  n                 Next tab
+  p                 Previous tab
+  0-9               Go to tab by number
+  &                 Close current tab
+
+  PANES:
+  %                 Split left|right
+  \"                 Split top/bottom
+  o                 Next pane
+  Arrow             Navigate directional
+  x                 Close pane
   ;                 Last active pane (toggle back)
   Space             Equalize layout
   z                 Zoom toggle
   B                 Broadcast mode (type in all panes)
   R                 Resize mode (arrow/hjkl, q to exit)
-  q                 Show pane numbers + quick jump (0-9)
-  ?                 Help overlay
-  {{ }}               Swap pane with prev/next"
+  q                 Show pane numbers + quick jump
+  {{ }}               Swap pane with prev/next
+  [                 Scroll mode (j/k/g/G, q to exit)
+  ,                 Rename current tab
+  :                 Command palette
+  d                 Detach (session continues in background)
+  s                 Toggle status bar
+  ?                 Help overlay"
     );
 }
 
@@ -566,6 +872,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
         "",
         None,
         0,
+        false,
     )?;
 
     let mut prev_active = active;
@@ -990,7 +1297,8 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                                 update.mark_all(&layout);
                                 update.border_dirty = true;
                             }
-                            // New pane (tmux c) — split active pane horizontally
+                            // New pane (split + focus) — in --no-daemon mode only.
+                            // Daemon mode (default) maps 'c' to new tab.
                             KeyCode::Char('c') => {
                                 do_split(
                                     &mut layout,
@@ -1388,7 +1696,14 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                                 // Copy selected text to clipboard via OSC 52
                                 if let Some(pane) = panes.get_mut(&sel.pane_id) {
                                     pane.sync_scrollback();
-                                    let text = extract_selected_text(pane.screen(), sel);
+                                    let text = extract_selected_text(
+                                        pane.screen(),
+                                        sel.pane_id,
+                                        sel.start_row,
+                                        sel.start_col,
+                                        sel.end_row,
+                                        sel.end_col,
+                                    );
                                     pane.reset_scrollback_view();
                                     if !text.is_empty() {
                                         let encoded = base64_encode(text.as_bytes());
@@ -1577,7 +1892,14 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                     .as_ref()
                     .and_then(|sel| {
                         panes.get(&sel.pane_id).map(|pane| {
-                            let text = extract_selected_text(pane.screen(), sel);
+                            let text = extract_selected_text(
+                                pane.screen(),
+                                sel.pane_id,
+                                sel.start_row,
+                                sel.start_col,
+                                sel.end_row,
+                                sel.end_col,
+                            );
                             text.chars().count()
                         })
                     })
@@ -1597,6 +1919,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                     mode_label,
                     sel_for_render,
                     sel_chars,
+                    broadcast,
                 )?;
             }
 
@@ -1635,7 +1958,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn make_inner(tw: u16, th: u16, show_status_bar: bool) -> Rect {
+pub(crate) fn make_inner(tw: u16, th: u16, show_status_bar: bool) -> Rect {
     let sh = if show_status_bar { 1u16 } else { 0 };
     Rect {
         x: 1,
@@ -1650,7 +1973,7 @@ fn zoomed_content_size(tw: u16, th: u16, show_status_bar: bool) -> (u16, u16) {
     (tw.saturating_sub(2), th.saturating_sub(sh + 2))
 }
 
-fn resize_zoomed_pane(
+pub(crate) fn resize_zoomed_pane(
     panes: &mut HashMap<usize, Pane>,
     pane_id: usize,
     tw: u16,
@@ -1679,6 +2002,7 @@ fn render_frame(
     mode_label: &str,
     selection: render::PaneSelection,
     selection_chars: usize,
+    broadcast: bool,
 ) -> anyhow::Result<()> {
     queue!(stdout, terminal::BeginSynchronizedUpdate)?;
     render::render_panes(
@@ -1695,6 +2019,7 @@ fn render_frame(
         dirty_panes,
         full_redraw,
         selection,
+        broadcast,
     )?;
     // Mode-aware status bar (render over the default one if we have a mode)
     if settings.show_status_bar && (!mode_label.is_empty() || selection_chars > 0) {
@@ -1719,6 +2044,143 @@ fn render_frame(
     queue!(stdout, terminal::EndSynchronizedUpdate)?;
     stdout.flush()?;
     Ok(())
+}
+
+/// Build initial layout, panes, and active pane ID from config.
+/// Used by both direct mode and server mode.
+#[allow(clippy::type_complexity)]
+pub(crate) fn build_initial_state(
+    config: &Config,
+    default_shell: &mut String,
+    settings: &mut Settings,
+    restart_policies: &mut HashMap<usize, project::RestartPolicy>,
+    scrollback: usize,
+) -> anyhow::Result<(Layout, HashMap<usize, Pane>, usize)> {
+    // Use a default terminal size for initial spawn (server doesn't have a terminal yet).
+    // Panes will be resized when a client connects.
+    let tw: u16 = 80;
+    let th: u16 = 24;
+
+    if let Some(path) = &config.restore {
+        let snapshot = workspace::load_snapshot(path)?;
+        let layout = snapshot.layout.clone();
+        *default_shell = snapshot.shell.clone();
+        settings.border_style = snapshot.border_style;
+        settings.show_status_bar = snapshot.show_status_bar;
+        let panes = spawn_snapshot_panes(
+            &layout,
+            &snapshot,
+            default_shell,
+            tw,
+            th,
+            settings,
+            scrollback,
+        )?;
+        let active = snapshot.active_pane;
+        return Ok((layout, panes, active));
+    }
+
+    if config.commands.is_empty() && matches!(config.layout, LayoutSpec::Grid { rows: 1, cols: 2 })
+    {
+        if let Some(result) = project::load_project() {
+            let proj = result.map_err(|e| anyhow::anyhow!("{e}"))?;
+            let panes = spawn_project_panes(&proj, default_shell, tw, th, settings, scrollback)?;
+            *restart_policies = proj.restarts.clone();
+            let active = *proj.layout.pane_ids().first().unwrap_or(&0);
+            return Ok((proj.layout, panes, active));
+        } else if let Some((layout, launches)) = try_load_procfile() {
+            let panes = spawn_layout_panes(
+                &layout,
+                launches,
+                default_shell,
+                tw,
+                th,
+                settings,
+                scrollback,
+            )?;
+            let active = *layout.pane_ids().first().unwrap_or(&0);
+            return Ok((layout, panes, active));
+        } else {
+            let layout = Layout::from_grid(1, 2);
+            let panes = spawn_layout_panes(
+                &layout,
+                build_command_launches(&layout, &config.commands),
+                default_shell,
+                tw,
+                th,
+                settings,
+                scrollback,
+            )?;
+            let active = *layout.pane_ids().first().unwrap_or(&0);
+            return Ok((layout, panes, active));
+        }
+    }
+
+    let layout = match &config.layout {
+        LayoutSpec::Grid { rows, cols } => Layout::from_grid(*rows, *cols),
+        LayoutSpec::Spec(spec) => {
+            Layout::from_spec(spec).map_err(|error| anyhow::anyhow!(error))?
+        }
+    };
+    let panes = spawn_layout_panes(
+        &layout,
+        build_command_launches(&layout, &config.commands),
+        default_shell,
+        tw,
+        th,
+        settings,
+        scrollback,
+    )?;
+    let active = *layout.pane_ids().first().unwrap_or(&0);
+    Ok((layout, panes, active))
+}
+
+/// Extract selected text — server-friendly version that takes individual coords.
+pub(crate) fn extract_selected_text(
+    screen: &vt100::Screen,
+    _pane_id: usize,
+    start_row: u16,
+    start_col: u16,
+    end_row: u16,
+    end_col: u16,
+) -> String {
+    // Normalize
+    let (sr, sc, er, ec) = if start_row < end_row || (start_row == end_row && start_col <= end_col)
+    {
+        (start_row, start_col, end_row, end_col)
+    } else {
+        (end_row, end_col, start_row, start_col)
+    };
+
+    let mut text = String::new();
+    for r in sr..=er {
+        let col_start = if r == sr { sc } else { 0 };
+        let col_end = if r == er { ec } else { u16::MAX };
+        let mut row_text = String::new();
+        let mut c = col_start;
+        loop {
+            if c > col_end {
+                break;
+            }
+            if let Some(cell) = screen.cell(r, c) {
+                let contents = cell.contents();
+                if contents.is_empty() {
+                    row_text.push(' ');
+                } else {
+                    row_text.push_str(&contents);
+                }
+            } else {
+                break;
+            }
+            c += 1;
+        }
+        let trimmed = row_text.trim_end();
+        text.push_str(trimmed);
+        if r < er {
+            text.push('\n');
+        }
+    }
+    text
 }
 
 /// Try to load a Procfile from the current directory. Returns layout + launches.
@@ -1754,7 +2216,10 @@ fn try_load_procfile() -> Option<(Layout, HashMap<usize, PaneLaunch>)> {
     Some((layout, launches))
 }
 
-fn build_command_launches(layout: &Layout, commands: &[String]) -> HashMap<usize, PaneLaunch> {
+pub(crate) fn build_command_launches(
+    layout: &Layout,
+    commands: &[String],
+) -> HashMap<usize, PaneLaunch> {
     layout
         .pane_ids()
         .into_iter()
@@ -1777,7 +2242,7 @@ fn build_snapshot_launches(snapshot: &WorkspaceSnapshot) -> HashMap<usize, PaneL
         .collect()
 }
 
-fn spawn_layout_panes(
+pub(crate) fn spawn_layout_panes(
     layout: &Layout,
     launches: HashMap<usize, PaneLaunch>,
     shell: &str,
@@ -1842,7 +2307,7 @@ fn spawn_snapshot_panes(
     )
 }
 
-fn spawn_pane(
+pub(crate) fn spawn_pane(
     shell: &str,
     launch: &PaneLaunch,
     cols: u16,
@@ -1852,7 +2317,7 @@ fn spawn_pane(
     Pane::with_scrollback(shell, launch.clone(), cols, rows, scrollback)
 }
 
-fn spawn_project_panes(
+pub(crate) fn spawn_project_panes(
     proj: &project::ResolvedProject,
     shell: &str,
     tw: u16,
@@ -1886,7 +2351,7 @@ fn spawn_project_panes(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn replace_pane(
+pub(crate) fn replace_pane(
     panes: &mut HashMap<usize, Pane>,
     layout: &Layout,
     pane_id: usize,
@@ -1909,7 +2374,7 @@ fn replace_pane(
     Ok(())
 }
 
-fn kill_all_panes(panes: &mut HashMap<usize, Pane>) {
+pub(crate) fn kill_all_panes(panes: &mut HashMap<usize, Pane>) {
     for (_, mut pane) in panes.drain() {
         pane.kill();
     }
@@ -1951,7 +2416,7 @@ fn apply_snapshot(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn do_split(
+pub(crate) fn do_split(
     layout: &mut Layout,
     panes: &mut HashMap<usize, Pane>,
     active: usize,
@@ -1993,7 +2458,7 @@ fn do_split(
     Ok(())
 }
 
-fn close_pane(
+pub(crate) fn close_pane(
     layout: &mut Layout,
     panes: &mut HashMap<usize, Pane>,
     active: &mut usize,
@@ -2008,7 +2473,7 @@ fn close_pane(
     }
 }
 
-fn resize_all(
+pub(crate) fn resize_all(
     panes: &mut HashMap<usize, Pane>,
     layout: &Layout,
     tw: u16,
@@ -2083,64 +2548,30 @@ impl DragState {
 }
 
 #[derive(Default)]
-struct RenderUpdate {
-    dirty_panes: HashSet<usize>,
-    full_redraw: bool,
-    border_dirty: bool,
+pub(crate) struct RenderUpdate {
+    pub dirty_panes: HashSet<usize>,
+    pub full_redraw: bool,
+    pub border_dirty: bool,
 }
 
 impl RenderUpdate {
-    fn mark_all(&mut self, layout: &Layout) {
+    pub fn mark_all(&mut self, layout: &Layout) {
         self.full_redraw = true;
         self.dirty_panes.extend(layout.pane_ids());
     }
 
-    fn merge(&mut self, other: &mut Self) {
+    pub fn merge(&mut self, other: &mut Self) {
         self.dirty_panes.extend(other.dirty_panes.drain());
         self.full_redraw |= other.full_redraw;
         self.border_dirty |= other.border_dirty;
     }
 
-    fn needs_render(&self) -> bool {
+    pub fn needs_render(&self) -> bool {
         self.full_redraw || !self.dirty_panes.is_empty()
     }
 }
 
-/// Extract text from vt100 screen within a selection range.
-fn extract_selected_text(screen: &vt100::Screen, sel: &TextSelection) -> String {
-    let (sr, sc, er, ec) = sel.normalized();
-    let mut text = String::new();
-
-    for r in sr..=er {
-        let col_start = if r == sr { sc } else { 0 };
-        let col_end = if r == er { ec } else { u16::MAX };
-        let mut row_text = String::new();
-        let mut c = col_start;
-        loop {
-            if c > col_end {
-                break;
-            }
-            if let Some(cell) = screen.cell(r, c) {
-                let contents = cell.contents();
-                if contents.is_empty() {
-                    row_text.push(' ');
-                } else {
-                    row_text.push_str(&contents);
-                }
-            } else {
-                break;
-            }
-            c += 1;
-        }
-        // Trim trailing spaces per line
-        let trimmed = row_text.trim_end();
-        text.push_str(trimmed);
-        if r < er {
-            text.push('\n');
-        }
-    }
-    text
-}
+// Old extract_selected_text removed — see pub(crate) extract_selected_text above.
 
 /// Minimal base64 encoder for OSC 52 clipboard.
 fn base64_encode(data: &[u8]) -> String {
@@ -2168,7 +2599,7 @@ fn base64_encode(data: &[u8]) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn handle_ipc_command(
+pub(crate) fn handle_ipc_command(
     cmd: ipc::IpcRequest,
     layout: &mut Layout,
     panes: &mut HashMap<usize, Pane>,

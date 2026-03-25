@@ -23,6 +23,12 @@ pub struct Pane {
     scroll_offset: usize, // 0 = live (bottom), >0 = scrolled up N lines
     name: Option<String>,
     exit_code: Option<u32>,
+    /// Pending OSC 52 clipboard sequences from child to forward to the terminal.
+    osc52_pending: Vec<Vec<u8>>,
+    /// Whether the child has enabled bracketed paste mode (\x1b[?2004h).
+    bracketed_paste: bool,
+    /// Whether the child has requested focus events (\x1b[?1004h).
+    focus_events: bool,
 }
 
 impl Pane {
@@ -103,6 +109,7 @@ impl Pane {
             cmd.cwd(dir);
         }
         cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
         cmd.env("EZPN", "1"); // prevent nesting
         for (k, v) in env {
             cmd.env(k, v);
@@ -145,22 +152,36 @@ impl Pane {
             scroll_offset: 0,
             name: None,
             exit_code: None,
+            osc52_pending: Vec::new(),
+            bracketed_paste: false,
+            focus_events: false,
         })
     }
 
     /// Read pending output from PTY. Returns true if new data was received.
+    /// Drains at most MAX_DRAIN chunks per call to ensure fair scheduling across panes.
     pub fn read_output(&mut self) -> bool {
+        const MAX_DRAIN: usize = 8; // 8 * 4KB = 32KB max per iteration
         let was_alive = self.alive;
         let mut got_data = false;
+        let mut count = 0;
         loop {
+            if count >= MAX_DRAIN {
+                break;
+            }
             match self.reader_rx.try_recv() {
                 Ok(data) => {
+                    // Intercept OSC 52 clipboard sequences before vt100 processing
+                    scan_osc52(&data, &mut self.osc52_pending);
+                    // Track DEC private modes from child output
+                    track_dec_modes(&data, &mut self.bracketed_paste, &mut self.focus_events);
                     self.parser.process(&data);
                     // New output snaps scroll to bottom
                     if self.scroll_offset > 0 {
                         self.scroll_offset = 0;
                     }
                     got_data = true;
+                    count += 1;
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -211,10 +232,11 @@ impl Pane {
         // portable_pty's ioctl(TIOCSWINSZ) should trigger this via the kernel,
         // but we also send directly to cover edge cases.
         #[cfg(unix)]
-        if let Some(pid) = self.child.process_id() {
-            unsafe {
-                // Send to process group (negative PID) to reach shell's children (e.g. claude)
-                libc::kill(-(pid as libc::pid_t), libc::SIGWINCH);
+        if self.alive {
+            if let Some(pid) = self.child.process_id() {
+                unsafe {
+                    libc::kill(-(pid as libc::pid_t), libc::SIGWINCH);
+                }
             }
         }
     }
@@ -337,61 +359,183 @@ impl Pane {
     pub fn set_name(&mut self, name: Option<String>) {
         self.name = name;
     }
+
+    /// Take pending OSC 52 clipboard sequences (clears the queue).
+    pub fn take_osc52(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.osc52_pending)
+    }
+
+    /// Whether the child has bracketed paste enabled.
+    pub fn bracketed_paste(&self) -> bool {
+        self.bracketed_paste
+    }
+
+    /// Whether the child has requested focus events.
+    pub fn wants_focus(&self) -> bool {
+        self.focus_events
+    }
+}
+
+/// Scan raw PTY output for OSC 52 clipboard sequences and collect them.
+fn scan_osc52(data: &[u8], out: &mut Vec<Vec<u8>>) {
+    const PREFIX: &[u8] = b"\x1b]52;";
+    let mut i = 0;
+    while i + PREFIX.len() < data.len() {
+        if data[i..].starts_with(PREFIX) {
+            let start = i;
+            i += PREFIX.len();
+            // Find terminator: BEL (\x07) or ST (\x1b\\)
+            while i < data.len() {
+                if data[i] == 0x07 {
+                    out.push(data[start..=i].to_vec());
+                    break;
+                }
+                if i + 1 < data.len() && data[i] == 0x1b && data[i + 1] == b'\\' {
+                    out.push(data[start..i + 2].to_vec());
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+        }
+        i += 1;
+    }
+}
+
+/// Track DEC private mode changes in raw PTY output.
+fn track_dec_modes(data: &[u8], bracketed_paste: &mut bool, focus_events: &mut bool) {
+    // \x1b[?2004h = enable bracketed paste, \x1b[?2004l = disable
+    // \x1b[?1004h = enable focus events, \x1b[?1004l = disable
+    const BP_ON: &[u8] = b"\x1b[?2004h";
+    const BP_OFF: &[u8] = b"\x1b[?2004l";
+    const FE_ON: &[u8] = b"\x1b[?1004h";
+    const FE_OFF: &[u8] = b"\x1b[?1004l";
+
+    for window in data.windows(BP_ON.len().max(FE_ON.len())) {
+        if window.starts_with(BP_ON) {
+            *bracketed_paste = true;
+        } else if window.starts_with(BP_OFF) {
+            *bracketed_paste = false;
+        } else if window.starts_with(FE_ON) {
+            *focus_events = true;
+        } else if window.starts_with(FE_OFF) {
+            *focus_events = false;
+        }
+    }
 }
 
 fn encode_key(key: KeyEvent) -> Vec<u8> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+    // CSI u modifier parameter: 1 + (shift=1 | alt=2 | ctrl=4)
+    let mods_param =
+        1 + if shift { 1 } else { 0 } + if alt { 2 } else { 0 } + if ctrl { 4 } else { 0 };
+    let has_mods = shift || alt || ctrl;
 
     match key.code {
-        KeyCode::Char(c) if ctrl => {
+        KeyCode::Char(c) if ctrl && !shift && !alt => {
             let byte = (c.to_ascii_lowercase() as u8)
                 .wrapping_sub(b'a')
                 .wrapping_add(1);
-            if alt {
-                vec![0x1b, byte]
-            } else {
-                vec![byte]
-            }
+            vec![byte]
+        }
+        KeyCode::Char(c) if ctrl && alt => {
+            let byte = (c.to_ascii_lowercase() as u8)
+                .wrapping_sub(b'a')
+                .wrapping_add(1);
+            vec![0x1b, byte]
         }
         KeyCode::Char(c) => {
             let mut buf = [0u8; 4];
             let s = c.encode_utf8(&mut buf);
-            if alt {
+            if alt && !shift {
                 let mut v = vec![0x1b];
                 v.extend_from_slice(s.as_bytes());
                 v
+            } else if shift && (alt || ctrl) {
+                // CSI u for modified chars: ESC [ <codepoint> ; <mods> u
+                format!("\x1b[{};{}u", c as u32, mods_param).into_bytes()
             } else {
                 s.as_bytes().to_vec()
             }
         }
-        KeyCode::Enter => vec![b'\r'],
-        KeyCode::Backspace => vec![0x7f],
+        // Enter: plain \r, or CSI u when modified (Shift+Enter, Ctrl+Enter)
+        KeyCode::Enter => {
+            if has_mods {
+                format!("\x1b[13;{}u", mods_param).into_bytes()
+            } else {
+                vec![b'\r']
+            }
+        }
+        KeyCode::Backspace => {
+            if has_mods {
+                format!("\x1b[127;{}u", mods_param).into_bytes()
+            } else {
+                vec![0x7f]
+            }
+        }
         KeyCode::Tab => {
-            if key.modifiers.contains(KeyModifiers::SHIFT) {
-                vec![0x1b, b'[', b'Z'] // Shift+Tab = reverse tab
+            if shift && !alt && !ctrl {
+                vec![0x1b, b'[', b'Z'] // Shift+Tab = reverse tab (legacy)
+            } else if has_mods {
+                format!("\x1b[9;{}u", mods_param).into_bytes()
             } else {
                 vec![b'\t']
             }
         }
-        KeyCode::Esc => vec![0x1b],
-        KeyCode::Up => esc_bracket(b'A'),
-        KeyCode::Down => esc_bracket(b'B'),
-        KeyCode::Right => esc_bracket(b'C'),
-        KeyCode::Left => esc_bracket(b'D'),
-        KeyCode::Home => vec![0x1b, b'[', b'H'],
-        KeyCode::End => vec![0x1b, b'[', b'F'],
-        KeyCode::Delete => vec![0x1b, b'[', b'3', b'~'],
-        KeyCode::PageUp => vec![0x1b, b'[', b'5', b'~'],
-        KeyCode::PageDown => vec![0x1b, b'[', b'6', b'~'],
-        KeyCode::Insert => vec![0x1b, b'[', b'2', b'~'],
+        KeyCode::Esc => {
+            if has_mods {
+                format!("\x1b[27;{}u", mods_param).into_bytes()
+            } else {
+                vec![0x1b]
+            }
+        }
+        // Arrow keys with modifiers: ESC [ 1 ; <mods> A/B/C/D
+        KeyCode::Up => arrow_with_mods(b'A', has_mods, mods_param),
+        KeyCode::Down => arrow_with_mods(b'B', has_mods, mods_param),
+        KeyCode::Right => arrow_with_mods(b'C', has_mods, mods_param),
+        KeyCode::Left => arrow_with_mods(b'D', has_mods, mods_param),
+        KeyCode::Home => {
+            if has_mods {
+                format!("\x1b[1;{}H", mods_param).into_bytes()
+            } else {
+                vec![0x1b, b'[', b'H']
+            }
+        }
+        KeyCode::End => {
+            if has_mods {
+                format!("\x1b[1;{}F", mods_param).into_bytes()
+            } else {
+                vec![0x1b, b'[', b'F']
+            }
+        }
+        KeyCode::Delete => tilde_with_mods(3, has_mods, mods_param),
+        KeyCode::PageUp => tilde_with_mods(5, has_mods, mods_param),
+        KeyCode::PageDown => tilde_with_mods(6, has_mods, mods_param),
+        KeyCode::Insert => tilde_with_mods(2, has_mods, mods_param),
         KeyCode::F(n) => encode_f_key(n),
         _ => vec![],
     }
 }
 
-fn esc_bracket(code: u8) -> Vec<u8> {
-    vec![0x1b, b'[', code]
+/// Arrow keys: ESC [ A (plain) or ESC [ 1 ; <mods> A (with modifiers).
+fn arrow_with_mods(code: u8, has_mods: bool, mods_param: u8) -> Vec<u8> {
+    if has_mods {
+        format!("\x1b[1;{}{}", mods_param, code as char).into_bytes()
+    } else {
+        vec![0x1b, b'[', code]
+    }
+}
+
+/// Tilde keys (Delete/PageUp/etc): ESC [ N ~ (plain) or ESC [ N ; <mods> ~ (with modifiers).
+fn tilde_with_mods(n: u8, has_mods: bool, mods_param: u8) -> Vec<u8> {
+    if has_mods {
+        format!("\x1b[{};{}~", n, mods_param).into_bytes()
+    } else {
+        format!("\x1b[{}~", n).into_bytes()
+    }
 }
 
 fn encode_f_key(n: u8) -> Vec<u8> {

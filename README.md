@@ -4,13 +4,32 @@
 
 # ezpn
 
-Split your terminal in one command. Click, drag, done.
+Dead simple terminal pane splitting with session persistence. Think tmux, but instant.
 
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
-[![Crate](https://img.shields.io/badge/crates.io-v0.3.0-orange)](https://crates.io/crates/ezpn)
+[![Crate](https://img.shields.io/badge/crates.io-v0.4.0-orange)](https://crates.io/crates/ezpn)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)]()
 
 **English** | [한국어](docs/README.ko.md) | [日本語](docs/README.ja.md) | [中文](docs/README.zh.md) | [Español](docs/README.es.md) | [Français](docs/README.fr.md)
+
+## Why ezpn?
+
+```bash
+# tmux: 4 steps
+tmux new-session -d -s dev
+tmux split-window -h
+tmux split-window -v
+tmux attach -t dev
+
+# ezpn: 1 step
+ezpn -l ide
+```
+
+- **Zero config** — Works out of the box. No `.tmux.conf` needed.
+- **Instant layouts** — `ezpn -l ide` gives you an IDE layout in one command.
+- **Session persistence** — `Ctrl+B d` to detach, `ezpn a` to reattach. Processes keep running.
+- **Mouse-first** — Click to focus, drag to resize, scroll to browse output.
+- **Project-aware** — Drop `.ezpn.toml` in your project root, run `ezpn`, done.
 
 ## Install
 
@@ -22,55 +41,156 @@ Or build from source:
 
 ```bash
 git clone https://github.com/subinium/ezpn
-cd ezpn
-cargo install --path .
+cd ezpn && cargo install --path .
 ```
 
-## Usage
+## Quick Start
 
 ```bash
-ezpn                # 2 panes side by side (or load .ezpn.toml)
-ezpn 4              # 4 horizontal panes
-ezpn 3 -d v         # 3 vertical panes
-ezpn 2 3            # 2x3 grid
-
-# Layout presets
-ezpn -l dev          # 70/30 split
-ezpn -l ide          # editor + sidebar + 2 bottom panes
-ezpn -l monitor      # 3 equal columns
-ezpn -l quad         # 2x2 grid
-ezpn -l stack        # 3 stacked rows
-ezpn -l main         # wide top pair + full bottom
-ezpn -l trio         # full top + 2 bottom
-
-# Custom ratios
-ezpn -l '7:3/1:1'
-ezpn -l '1:1:1' -e 'cargo watch -x test' -e 'npm run dev' -e 'tail -f app.log'
-
-# Project config
-ezpn init            # generate .ezpn.toml template
-ezpn from Procfile   # import from Procfile
-ezpn                 # auto-loads .ezpn.toml or Procfile
-
-# Restore session
-ezpn --restore .ezpn-session.json
+ezpn                    # 2 panes (or load .ezpn.toml)
+ezpn 2 3                # 2x3 grid (6 panes)
+ezpn -l ide             # IDE layout preset
+ezpn -e 'npm dev' -e 'cargo watch -x test'   # per-pane commands
 ```
 
-Commands passed with `-e/--exec` run via `$SHELL -l -c`, so pipes, redirects, and shell syntax work as expected.
+### Sessions (tmux-compatible)
+
+```bash
+ezpn                    # Creates a session + attaches
+# Ctrl+B d              # Detach (session keeps running in background)
+ezpn a                  # Reattach to most recent session
+ezpn ls                 # List active sessions
+ezpn kill myproject     # Kill a session
+ezpn -S myproject       # Create a named session
+ezpn rename old new     # Rename a session
+```
+
+### Tabs (tmux windows)
+
+| Key | Action |
+|-----|--------|
+| `Ctrl+B c` | New tab |
+| `Ctrl+B n` / `p` | Next / previous tab |
+| `Ctrl+B 0-9` | Jump to tab by number |
+| `Ctrl+B ,` | Rename current tab |
+| `Ctrl+B &` | Close current tab |
+
+Tab bar appears automatically when you have 2+ tabs. Click tabs to switch.
+
+### Command Palette
+
+`Ctrl+B :` opens a command prompt (like tmux/vim). Commands:
+
+```
+split                  Split horizontally (alias: split-window)
+split -v               Split vertically
+new-tab                Create new tab (alias: new-window)
+next-tab / prev-tab    Switch tabs (alias: next-window / previous-window)
+close-pane             Close active pane (alias: kill-pane)
+close-tab              Close current tab (alias: kill-window)
+rename-tab <name>      Rename tab (alias: rename-window)
+layout <spec>          Change layout (alias: select-layout)
+equalize               Equalize pane sizes (alias: even)
+zoom                   Toggle zoom
+broadcast              Toggle broadcast mode
+```
+
+All tmux command aliases (`split-window`, `kill-pane`, `new-window`, etc.) are supported for muscle memory compatibility.
+
+## Controls
+
+### Mouse
+
+| Action | Effect |
+|--------|--------|
+| Click pane | Focus |
+| Double-click | Zoom toggle |
+| Click tab bar | Switch tab |
+| Click `[x]` | Close pane |
+| Drag border | Resize |
+| Drag text | Select + copy (OSC 52) |
+| Scroll wheel | Scrollback history |
+
+### Keyboard
+
+**Direct shortcuts:**
+
+| Key | Action |
+|-----|--------|
+| `Ctrl+D` | Split left / right |
+| `Ctrl+E` | Split top / bottom |
+| `Ctrl+N` | Next pane |
+| `F2` | Equalize all sizes |
+| `Ctrl+G` | Settings panel |
+| `Ctrl+W` | Kill session |
+
+**Prefix mode (`Ctrl+B` then):**
+
+| Key | Action |
+|-----|--------|
+| **Tabs** | |
+| `c` | New tab |
+| `n` / `p` | Next / previous tab |
+| `0-9` | Go to tab |
+| `,` | Rename tab |
+| `&` | Close tab |
+| **Panes** | |
+| `%` / `"` | Split H / V |
+| `o` / Arrow | Next / navigate pane |
+| `x` | Close pane |
+| `z` | Zoom toggle |
+| `{` / `}` | Swap pane prev / next |
+| `E` / Space | Equalize |
+| **Modes** | |
+| `R` | Resize mode (hjkl/arrows, q to exit) |
+| `[` | Scroll mode (j/k/g/G, q to exit) |
+| `B` | Broadcast (type in all panes) |
+| `:` | Command palette |
+| `?` | Help overlay |
+| **Session** | |
+| `d` | Detach (session keeps running) |
+| `s` | Toggle status bar |
+| `q` | Pane numbers + quick jump |
+
+<details>
+<summary>macOS: Alt+Arrow for directional navigation</summary>
+
+`Alt+Arrow` navigates between panes directionally. This requires your terminal to send Option as Meta:
+
+- **iTerm2**: Preferences > Profiles > Keys > Left Option Key > `Esc+`
+- **Terminal.app**: Settings > Profiles > Keyboard > Use Option as Meta Key
+- **Ghostty**: Works by default
+</details>
+
+## Layout Presets
+
+```bash
+ezpn -l dev       # 7:3 — main + side
+ezpn -l ide       # 7:3/1:1 — editor + sidebar + 2 bottom
+ezpn -l monitor   # 1:1:1 — 3 equal columns
+ezpn -l quad      # 2x2 grid
+ezpn -l stack     # 1/1/1 — 3 stacked rows
+ezpn -l main      # 6:4/1 — wide top pair + full bottom
+ezpn -l trio      # 1/1:1 — full top + 2 bottom
+```
+
+Custom ratios: `ezpn -l '7:3/5:5'` — 2 rows, first 70/30, second 50/50.
+
+Presets work in `.ezpn.toml` too: `layout = "ide"`.
 
 ## Project Config (.ezpn.toml)
 
-Place `.ezpn.toml` in your project root. Run `ezpn init` to generate a template.
+Drop `.ezpn.toml` in your project root. Run `ezpn init` to generate a template.
 
 ```toml
 [workspace]
-layout = "ide"    # or "7:3", "1:1:1", "dev", "monitor", etc.
+layout = "ide"
 
 [[pane]]
 name = "server"
 command = "npm run dev"
 cwd = "./frontend"
-restart = "on_failure"    # never | on_failure | always
+restart = "on_failure"
 
 [pane.env]
 NODE_ENV = "development"
@@ -87,122 +207,87 @@ command = "tail -f /var/log/app.log"
 shell = "/bin/bash"
 ```
 
-Supported fields per pane:
-- `command` — shell command to run (default: interactive shell)
-- `cwd` — working directory (relative to .ezpn.toml)
-- `name` — custom title bar label
-- `env` — environment variables table
-- `restart` — `never` (default), `on_failure`, or `always`
-- `shell` — per-pane shell override
+**Per-pane fields:** `command`, `cwd`, `name`, `env`, `restart` (`never`/`on_failure`/`always`), `shell`.
 
-Also auto-detects `Procfile` when no `.ezpn.toml` exists.
+Also auto-detects `Procfile` when no `.ezpn.toml` exists:
 
-## Controls
+```bash
+ezpn from Procfile   # Generate .ezpn.toml from Procfile
+```
 
-**Mouse** — the primary way to interact:
+## Global Config
 
-| | |
-|---|---|
-| Click pane | Focus |
-| Double-click pane | Zoom toggle |
-| Click `[x]` | Close pane |
-| Drag border | Resize |
-| Scroll wheel | Scroll through output (scrollback) |
+`~/.config/ezpn/config.toml`:
 
-**Keyboard (direct shortcuts):**
+```toml
+border = rounded        # single | rounded | heavy | double
+shell = /bin/zsh
+scrollback = 10000
+status_bar = true
+tab_bar = true
+prefix = b              # prefix key (Ctrl+<key>), default: b
+```
 
-| | |
-|---|---|
-| `Ctrl+D` | Split left \| right |
-| `Ctrl+E` | Split top / bottom |
-| `F2` | Equalize all sizes |
-| `Ctrl+N` | Next pane |
-| `Ctrl+G` | Settings (j/k/Enter to navigate) |
-| `Ctrl+W` | Quit |
+## Options
 
-**tmux-compatible prefix keys (`Ctrl+B` then...):**
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-l, --layout <SPEC>` | Layout spec or preset | — |
+| `-e, --exec <CMD>` | Command per pane (repeatable) | `$SHELL` |
+| `-S, --session <NAME>` | Custom session name | auto from dir |
+| `-r, --restore <FILE>` | Restore workspace snapshot | — |
+| `-b, --border <STYLE>` | Border style | `rounded` |
+| `-d, --direction <DIR>` | `h` or `v` | `h` |
+| `-s, --shell <SHELL>` | Shell path | `$SHELL` |
+| `--no-daemon` | Single-process mode (no detach) | — |
 
-| | |
-|---|---|
-| `%` | Split left \| right |
-| `"` | Split top / bottom |
-| `o` | Next pane |
-| `Arrow` | Navigate directionally |
-| `x` | Close pane |
-| `z` | Zoom / unzoom pane (full screen) |
-| `B` | Broadcast mode (type in all panes) |
-| `R` | Resize mode (arrow/hjkl to resize, q to exit) |
-| `q` | Show pane numbers, press 1-9 to jump |
-| `{` `}` | Swap pane with prev / next |
-| `E` | Equalize |
-| `[` | Scroll mode (j/k/g/G/PgUp/PgDn, q to exit) |
-| `s` | Toggle status bar |
-| `?` | Help overlay |
-| `d` | Quit (with confirmation if panes are live) |
+## Session Management
 
-<details>
-<summary>macOS: Alt+Arrow for directional navigation</summary>
+ezpn runs as a daemon by default. When you run `ezpn`, it:
+1. Starts a background server (manages PTYs)
+2. Connects a thin client (renders + handles input)
+3. `Ctrl+B d` detaches the client; server keeps running
+4. `ezpn a` reconnects
 
-`Alt+Arrow` navigates between panes directionally. This requires your terminal to send Option as Meta:
+```bash
+ezpn ls                 # List sessions
+ezpn a [name]           # Attach (most recent, or by name)
+ezpn kill [name]        # Kill session (most recent, or by name)
+ezpn rename old new     # Rename session
+ezpn -S myproject       # Start with custom name
+ezpn init               # Generate .ezpn.toml template
+ezpn from Procfile      # Generate .ezpn.toml from Procfile
+```
 
-- **iTerm2**: Preferences → Profiles → Keys → Left Option Key → `Esc+`
-- **Terminal.app**: Settings → Profiles → Keyboard → Use Option as Meta Key
-</details>
+Multiple sessions are supported. `ezpn a` without a name attaches to the most recently used session.
 
 ## Features
 
-**Layout presets** — Named presets for common workflows:
+**Broadcast mode** — `Ctrl+B B` sends keystrokes to all panes simultaneously. All borders turn orange. Press again to stop.
 
-```bash
-ezpn -l dev       # 7:3 split — main + side
-ezpn -l ide       # 7:3/1:1 — editor + sidebar + 2 bottom
-ezpn -l monitor   # 1:1:1 — 3 equal columns
-ezpn -l quad      # 2x2 grid
-```
+**Mouse wheel scrollback** — Scroll through terminal output. `[SCROLL]` indicator in title bar. New output snaps back to live.
 
-Presets also work in `.ezpn.toml`: `layout = "ide"`.
+**Auto-restart** — Panes with `restart = "on_failure"` or `"always"` in `.ezpn.toml` respawn automatically with backoff.
 
-**Flexible layouts** — Start with a grid, use ratio layouts with `--layout`, split individual panes, and drag to resize. Auto-equalizes on split. Press `F2` to reset sizes.
+**Text selection** — Drag to select text in any pane. Copies via OSC 52 (works over SSH).
 
-```
-╭────────┬────╮       ╭────────┬────╮
-│        │ 2  │       │        │ 2  │
-│   1    ├────┤  ──>  │   1    ├──┬─┤
-│        │ 3  │       │        │3 │4│
-╰────────┴────╯       ╰────────┴──┴─╯
-```
+**OSC 52 passthrough** — Clipboard operations from child processes (vim, neovim) are forwarded to your terminal.
 
-**Per-pane commands** — Launch each pane with a different command:
+**Focus events** — `FocusIn`/`FocusOut` forwarded to active pane. vim auto-reloads on focus.
 
-```bash
-ezpn --layout '1/1:1' -e 'htop' -e 'npm run dev' -e 'tail -f app.log'
-```
+**Bracketed paste** — Paste operations are properly wrapped when the child process requests it.
 
-**Broadcast mode** — `Ctrl+B B` sends your keystrokes to all panes simultaneously. Status bar shows `BROADCAST`. Press `Ctrl+B B` again to stop.
+**Kitty keyboard protocol** — `Shift+Enter`, `Ctrl+Arrow`, and other modified keys work correctly. (Requires Ghostty/Kitty/WezTerm)
 
-**Mouse wheel scrollback** — Scroll through terminal output with the mouse wheel. Shows `[SCROLL]` indicator in the title bar. New output snaps back to live view.
+**24-bit color** — Full truecolor support. `COLORTERM=truecolor` set automatically.
 
-**Auto-restart** — Panes with `restart = "on_failure"` or `restart = "always"` in `.ezpn.toml` automatically respawn when they exit. Includes backoff to prevent restart loops.
+**CJK/Unicode** — Proper width calculation for Korean, Chinese, Japanese characters and emoji.
 
-**Title bar** — Each pane shows its number, custom name, and running command. `[━]` `[┃]` `[×]` buttons for split/close.
+**Dead pane recovery** — Process exits show dimmed overlay. Press `Enter` to respawn.
 
-**Zoom mode** — `Ctrl+B z` or double-click expands any pane to full terminal. Press again to restore.
+**Settings panel** — `Ctrl+G` opens a modal for border style, status bar toggle, split actions.
 
-**Keyboard resize** — `Ctrl+B R` enters resize mode. Use arrow keys or `h`/`j`/`k`/`l` to grow/shrink.
-
-**Pane swap** — `Ctrl+B {` and `Ctrl+B }` swap the active pane with the previous/next.
-
-**Quick jump** — `Ctrl+B q` overlays pane numbers. Press `1`-`9` to jump.
-
-**Scroll mode** — `Ctrl+B [` enters scroll mode. Navigate with `j`/`k`, `g`/`G`, `PgUp`/`PgDn`, `Ctrl+U`/`Ctrl+D`.
-
-**Settings panel** — `Ctrl+G` opens a dark modal. Navigate with `j`/`k`, apply with `Enter`, quick-select borders with `1`-`4`.
-
-**Dead pane recovery** — When a process exits, the pane dims and shows "Process exited". Press `Enter` to respawn, or `×` to close.
-
-**Config file** — Reads `~/.config/ezpn/config.toml` for defaults (border style, status bar, shell, scrollback). CLI flags override.
-
-**Border styles** — `--border` flag or change in settings:
+**Border styles** — `--border` or change in settings:
 
 ```
 single           rounded (default) heavy            double
@@ -211,102 +296,64 @@ single           rounded (default) heavy            double
 └──────┴──────┘  ╰──────┴──────╯  ┗━━━━━━┻━━━━━━┛  ╚══════╩══════╝
 ```
 
-**Procfile import** — `ezpn from Procfile` generates `.ezpn.toml` from a Procfile. Also auto-detects Procfile when no config exists.
+## ezpn-ctl (IPC)
 
-**IPC + automation** — Control a live instance from another terminal:
-
-```bash
-ezpn-ctl list
-ezpn-ctl split horizontal
-ezpn-ctl exec 1 'cargo test'
-ezpn-ctl save .ezpn-session.json
-ezpn-ctl load .ezpn-session.json
-```
-
-**Workspace snapshots** — Save layout ratios, active pane, commands, shell path, and UI settings. Restore them later with `ezpn --restore`.
-
-**Nesting prevention** — Running `ezpn` inside an ezpn pane is blocked via `$EZPN`.
-
-## Options
-
-| Flag | Values | Default |
-|---|---|---|
-| `-l` | layout spec or preset (`ide`, `dev`, `7:3/1:1`) | — |
-| `-e` | shell command (repeatable) | interactive `$SHELL` |
-| `-r` | snapshot file path | — |
-| `-d` | `h`, `v` | `h` |
-| `-b` | `single`, `rounded`, `heavy`, `double` | `rounded` |
-| `-s` | shell path | `$SHELL` |
-| `-V` | show version | — |
-
-## Layout Presets
-
-| Name | Layout | Panes | Use Case |
-|------|--------|-------|----------|
-| `dev` | 7:3 | 2 | Main editor + side terminal |
-| `ide` | 7:3/1:1 | 4 | Editor + sidebar + 2 bottom |
-| `monitor` | 1:1:1 | 3 | Dashboards, logs, monitoring |
-| `quad` | 2x2 | 4 | Equal grid |
-| `stack` | 1/1/1 | 3 | Stacked rows |
-| `main` | 6:4/1 | 3 | Wide top pair + full bottom |
-| `trio` | 1/1:1 | 3 | Full top + 2 bottom |
-
-## ezpn-ctl
-
-`ezpn-ctl` talks to a running ezpn instance over a Unix socket using JSON messages.
+Control a running instance from another terminal:
 
 ```bash
-ezpn-ctl list
-ezpn-ctl --pid 12345 focus 2
-ezpn-ctl --json list
-```
-
-Commands:
-
-- `split horizontal [pane]`
-- `split vertical [pane]`
-- `close <pane>`
-- `focus <pane>`
-- `equalize`
-- `layout <spec>`
-- `exec <pane> <command>`
-- `save <path>`
-- `load <path>`
-
-## How it works
-
-Each pane owns a PTY pair ([portable-pty](https://crates.io/crates/portable-pty)) running either an interactive shell or a shell command. Output is parsed by a per-pane VT100 emulator ([vt100](https://crates.io/crates/vt100)) with configurable scrollback. The layout is a binary split tree where each node is either a leaf (pane) or a split with a direction and ratio. Rendering caches border geometry and redraws only dirty panes unless the layout chrome changes.
-
-```
-src/
-├── main.rs          Event loop, prefix key state machine, pane lifecycle
-├── layout.rs        Binary split tree + named presets
-├── pane.rs          PTY + VT100 emulation + scrollback + mouse forwarding
-├── render.rs        Dirty render path + border cache + title bar buttons
-├── settings.rs      Dark modal with vim navigation
-├── project.rs       .ezpn.toml parsing + Procfile import
-├── ipc.rs           JSON IPC protocol + Unix socket listener
-├── workspace.rs     Snapshot save/load and validation
-├── config.rs        Config file loading (~/.config/ezpn/config.toml)
-├── tab.rs           Tab manager (prepared)
-└── bin/ezpn-ctl.rs  External control client
+ezpn-ctl list                    # List panes
+ezpn-ctl split horizontal       # Split active pane
+ezpn-ctl exec 1 'cargo test'    # Run command in pane 1
+ezpn-ctl save session.json      # Save workspace
+ezpn-ctl load session.json      # Restore workspace
 ```
 
 ## vs. tmux / Zellij
 
 |  | tmux | Zellij | ezpn |
 |---|---|---|---|
-| Config | `.tmux.conf` | KDL files | `.ezpn.toml` / CLI flags |
+| First use | Empty screen, read docs | Tutorial mode | `ezpn -l ide` |
+| Config | `.tmux.conf` required | KDL files | Works out of the box |
+| Sessions | `tmux a` | `zellij a` | `ezpn a` |
 | Split | `Ctrl+B %` | Mode switch | `Ctrl+D` / click |
 | Resize | `:resize-pane` | Resize mode | Drag / `Ctrl+B R` |
-| Select | `Ctrl+B` arrow | Click | Click |
-| Project setup | tmuxinator | — | `.ezpn.toml` / Procfile |
+| Project setup | tmuxinator (gem) | — | `.ezpn.toml` (built-in) |
 | Broadcast | `:setw synchronize-panes` | — | `Ctrl+B B` |
 | Auto-restart | — | — | `restart = "always"` |
-| Scrollback | `Ctrl+B [` | Scroll mode | Mouse wheel / `Ctrl+B [` |
-| Detach | Yes | Yes | No |
+| Scrollback | `Ctrl+B [` | Scroll mode | Mouse wheel |
+| Kitty keyboard | Not supported | Supported | Supported |
+| Render quality | May tear | Synchronized | Synchronized |
+| Plugin system | — | WASM | — |
+| Ecosystem | Massive (30 years) | Growing | New |
 
-Use ezpn when you want split terminals with zero config. Use tmux/Zellij when you need detach/reattach session persistence.
+**Choose ezpn** when you want terminal splits that just work — zero config, instant layouts, project-aware.
+
+**Choose tmux** when you need maximum scripting, plugin ecosystem, or your team already uses it.
+
+**Choose Zellij** when you want a modern UI with plugin extensibility.
+
+## Architecture
+
+```
+src/
+├── main.rs        CLI routing, direct mode, shared helpers
+├── server.rs      Daemon event loop (PTY management, rendering, client I/O)
+├── client.rs      Thin terminal proxy (raw mode, event forwarding)
+├── protocol.rs    Binary wire protocol (TLV framing)
+├── session.rs     Session naming, discovery, daemon spawning
+├── tab.rs         Tab (window) manager with save/restore
+├── layout.rs      Binary split tree + named presets
+├── pane.rs        PTY + VT100 emulation + scrollback + input encoding
+├── render.rs      Incremental render + border cache + tab bar + status bar
+├── settings.rs    Settings modal UI
+├── project.rs     .ezpn.toml parsing + Procfile import
+├── ipc.rs         JSON IPC for ezpn-ctl
+├── workspace.rs   Snapshot save/load
+├── config.rs      Global config (~/.config/ezpn/config.toml)
+└── bin/ezpn-ctl.rs  External control client
+```
+
+The server renders frames server-side with `BeginSynchronizedUpdate`/`EndSynchronizedUpdate` to prevent tearing. Only dirty panes are redrawn. Border geometry is cached and recomputed only on layout changes. The wire protocol uses 5-byte TLV headers with zero-copy frame transfer.
 
 ## License
 

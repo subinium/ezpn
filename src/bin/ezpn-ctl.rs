@@ -187,7 +187,13 @@ fn find_latest_socket() -> Option<PathBuf> {
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("ezpn-") && name.ends_with(".sock"))
+                .is_some_and(|name| {
+                    // Match IPC sockets (ezpn-{PID}.sock) but NOT session sockets
+                    // (ezpn-session-*.sock) which use a different binary protocol.
+                    name.starts_with("ezpn-")
+                        && name.ends_with(".sock")
+                        && !name.starts_with("ezpn-session-")
+                })
         })
         .filter(|path| {
             // Validate socket is connectable (rejects stale sockets from dead processes)
