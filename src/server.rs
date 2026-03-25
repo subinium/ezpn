@@ -1040,6 +1040,9 @@ fn render_frame_to_buf(
         _ => {}
     }
 
+    // Ensure cursor is hidden at the end — prevents blinking on status/tab bar
+    queue!(buf, cursor::Hide)?;
+
     Ok(())
 }
 
@@ -1095,7 +1098,7 @@ fn process_event(
         }
         Event::Mouse(mouse) => {
             if let Some(ref cache) = border_cache {
-                let inner = super::make_inner(tw, th, settings.show_status_bar);
+                let inner = cache.inner().clone();
                 process_mouse(
                     mouse,
                     mode,
@@ -2147,8 +2150,9 @@ fn process_mouse(
                     );
                     pane.reset_scrollback_view();
                     if !text.is_empty() {
-                        // OSC 52 will be included in the next output frame
-                        // For now, we'll handle it differently
+                        let encoded = super::base64_encode(text.as_bytes());
+                        let osc = format!("\x1b]52;c;{}\x07", encoded);
+                        pane.osc52_pending.push(osc.into_bytes());
                     }
                 }
                 let pid = sel.pane_id;
