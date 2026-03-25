@@ -354,11 +354,12 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                     prev_active = active;
                     mode = InputMode::Normal;
                     super::resize_all(&mut panes, &layout, tw, th, &settings);
-                    border_cache = Some(render::build_border_cache(
+                    border_cache = Some(render::build_border_cache_with_style(
                         &layout,
                         settings.show_status_bar,
                         tw,
                         th,
+                        settings.border_style,
                     ));
                     update.mark_all(&layout);
                     update.border_dirty = true;
@@ -594,11 +595,12 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                         last_active = active;
                         prev_active = active;
                         mode = InputMode::Normal;
-                        border_cache = Some(render::build_border_cache(
+                        border_cache = Some(render::build_border_cache_with_style(
                             &layout,
                             settings.show_status_bar,
                             tw,
                             th,
+                            settings.border_style,
                         ));
                         update.mark_all(&layout);
                         update.border_dirty = true;
@@ -615,11 +617,12 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                             zoomed_pane = restored.zoomed_pane;
                             broadcast = restored.broadcast;
                             super::resize_all(&mut panes, &layout, tw, th, &settings);
-                            border_cache = Some(render::build_border_cache(
+                            border_cache = Some(render::build_border_cache_with_style(
                                 &layout,
                                 settings.show_status_bar,
                                 tw,
                                 th,
+                                settings.border_style,
                             ));
                             update.mark_all(&layout);
                             update.border_dirty = true;
@@ -663,11 +666,12 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                         prev_active = active;
                         mode = InputMode::Normal;
                         super::resize_all(&mut panes, &layout, tw, th, &settings);
-                        border_cache = Some(render::build_border_cache(
+                        border_cache = Some(render::build_border_cache_with_style(
                             &layout,
                             settings.show_status_bar,
                             tw,
                             th,
+                            settings.border_style,
                         ));
                         update.mark_all(&layout);
                         update.border_dirty = true;
@@ -694,11 +698,12 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                         prev_active = active;
                         mode = InputMode::Normal;
                         super::resize_all(&mut panes, &layout, tw, th, &settings);
-                        border_cache = Some(render::build_border_cache(
+                        border_cache = Some(render::build_border_cache_with_style(
                             &layout,
                             settings.show_status_bar,
                             tw,
                             th,
+                            settings.border_style,
                         ));
                         update.mark_all(&layout);
                         update.border_dirty = true;
@@ -744,11 +749,12 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
 
         // ── Render and send to client ──
         if update.border_dirty {
-            border_cache = Some(render::build_border_cache(
+            border_cache = Some(render::build_border_cache_with_style(
                 &layout,
                 settings.show_status_bar,
                 tw,
                 th,
+                settings.border_style,
             ));
         }
 

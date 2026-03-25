@@ -122,6 +122,7 @@ impl Settings {
                 BorderStyle::Rounded => I_ROUNDED,
                 BorderStyle::Heavy => I_HEAVY,
                 BorderStyle::Double => I_DOUBLE,
+                BorderStyle::None => I_SINGLE, // default focus position
             };
         }
     }

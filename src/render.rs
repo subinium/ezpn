@@ -51,6 +51,7 @@ pub enum BorderStyle {
     Rounded,
     Heavy,
     Double,
+    None,
 }
 
 impl BorderStyle {
@@ -60,8 +61,13 @@ impl BorderStyle {
             "rounded" => Some(Self::Rounded),
             "heavy" => Some(Self::Heavy),
             "double" => Some(Self::Double),
-            _ => None,
+            "none" | "borderless" => Some(Self::None),
+            _ => Option::None,
         }
+    }
+
+    pub fn is_none(self) -> bool {
+        matches!(self, Self::None)
     }
 
     pub fn chars(self) -> BorderChars {
@@ -117,6 +123,19 @@ impl BorderStyle {
                 lj: "╠",
                 rj: "╣",
                 xj: "╬",
+            },
+            Self::None => BorderChars {
+                h: " ",
+                v: "│",
+                tl: " ",
+                tr: " ",
+                bl: " ",
+                br: " ",
+                tj: "│",
+                bj: "│",
+                lj: "│",
+                rj: "│",
+                xj: "│",
             },
         }
     }
@@ -221,8 +240,25 @@ pub fn build_border_cache(
     term_w: u16,
     term_h: u16,
 ) -> BorderCache {
+    build_border_cache_with_style(
+        layout,
+        show_status_bar,
+        term_w,
+        term_h,
+        BorderStyle::Rounded,
+    )
+}
+
+pub fn build_border_cache_with_style(
+    layout: &Layout,
+    show_status_bar: bool,
+    term_w: u16,
+    term_h: u16,
+    style: BorderStyle,
+) -> BorderCache {
     let status_h = if show_status_bar { 1u16 } else { 0 };
     let border_h = term_h.saturating_sub(status_h);
+    let borderless = style.is_none();
 
     let outer = Rect {
         x: 0,
@@ -230,23 +266,35 @@ pub fn build_border_cache(
         w: term_w,
         h: border_h,
     };
-    let inner = Rect {
-        x: 1,
-        y: 1,
-        w: term_w.saturating_sub(2),
-        h: border_h.saturating_sub(2),
+    // Borderless: full width, y=1 for title strip row
+    let inner = if borderless {
+        Rect {
+            x: 0,
+            y: 1,
+            w: term_w,
+            h: border_h.saturating_sub(1),
+        }
+    } else {
+        Rect {
+            x: 1,
+            y: 1,
+            w: term_w.saturating_sub(2),
+            h: border_h.saturating_sub(2),
+        }
     };
 
     let pane_rects = layout.pane_rects(&inner);
     let separators = layout.separators(&inner, &outer);
 
     let mut bmap = BorderMap::new();
-    if outer.w > 0 && outer.h > 0 {
+    // Only draw outer frame for bordered styles
+    if !borderless && outer.w > 0 && outer.h > 0 {
         bmap.add_h_line(outer.x, outer.x + outer.w - 1, outer.y);
         bmap.add_h_line(outer.x, outer.x + outer.w - 1, outer.y + outer.h - 1);
         bmap.add_v_line(outer.x, outer.y, outer.y + outer.h - 1);
         bmap.add_v_line(outer.x + outer.w - 1, outer.y, outer.y + outer.h - 1);
     }
+    // Internal separators always drawn (thin line for borderless)
     for sep in &separators {
         if sep.horizontal {
             bmap.add_h_line(sep.x, sep.x + sep.length - 1, sep.y);
@@ -323,7 +371,14 @@ pub fn render_panes(
             let is_active = active_rect
                 .map(|r| is_pane_border(cell.x, cell.y, r))
                 .unwrap_or(false);
-            let color = if dragging_sep {
+            let color = if border_style.is_none() {
+                // Borderless: visible but minimal separator
+                Color::Rgb {
+                    r: 70,
+                    g: 75,
+                    b: 90,
+                }
+            } else if dragging_sep {
                 DRAG_COLOR
             } else if broadcast {
                 BROADCAST_COLOR
@@ -358,17 +413,19 @@ pub fn render_panes(
             let label = pane_ref.map(|p| p.launch_label("")).unwrap_or_default();
             let is_scrolled = pane_ref.is_some_and(|p| p.is_scrolled());
             let exit_code = pane_ref.and_then(|p| p.exit_code());
-            draw_pane_title(
-                stdout,
-                rect,
-                display_idx,
-                is_active,
-                is_alive,
-                &label,
-                is_scrolled,
-                &chars,
-                exit_code,
-            )?;
+            {
+                draw_pane_title(
+                    stdout,
+                    rect,
+                    display_idx,
+                    is_active,
+                    is_alive,
+                    &label,
+                    is_scrolled,
+                    &chars,
+                    exit_code,
+                )?;
+            }
             if let Some(pane) = panes.get(&pid) {
                 let pane_sel = selection
                     .filter(|(sel_pid, ..)| *sel_pid == pid)
@@ -465,25 +522,46 @@ fn draw_pane_title(
         return Ok(());
     }
 
+    let borderless = chars.h == " ";
     let scroll_ind = if is_scrolled { " [SCROLL]" } else { "" };
+
+    // Borderless: "N:label" no leading space. Bordered: " N:label "
     let title = if !is_alive {
         match exit_code {
-            Some(code) => format!(" {} [exit {}] ", idx + 1, code),
-            None => format!(" {} [exited] ", idx + 1),
+            Some(code) => {
+                if borderless {
+                    format!("{} [exit {}]", idx + 1, code)
+                } else {
+                    format!(" {} [exit {}] ", idx + 1, code)
+                }
+            }
+            None => {
+                if borderless {
+                    format!("{} [exited]", idx + 1)
+                } else {
+                    format!(" {} [exited] ", idx + 1)
+                }
+            }
         }
     } else if label.is_empty() || avail < 12 {
-        format!(" {}{} ", idx + 1, scroll_ind)
+        if borderless {
+            format!("{}{}", idx + 1, scroll_ind)
+        } else {
+            format!(" {}{} ", idx + 1, scroll_ind)
+        }
     } else {
-        // Truncate label to fit
-        let max_label = avail.saturating_sub(8 + scroll_ind.len()); // room for " N: ... "
+        let pad = if borderless { 4 } else { 8 };
+        let max_label = avail.saturating_sub(pad + scroll_ind.len());
         let short = truncate_label(label, max_label);
-        format!(" {}:{}{} ", idx + 1, short, scroll_ind)
+        if borderless {
+            format!("{}:{}{}", idx + 1, short, scroll_ind)
+        } else {
+            format!(" {}:{}{} ", idx + 1, short, scroll_ind)
+        }
     };
     let tlen = title.len();
-    // Buttons: [━] [┃] [×] — 11 display columns total
     let show_buttons = avail >= tlen + 13;
     let btn_len = if show_buttons { 11 } else { 0 };
-    // Fallback: just close button
     let show_close = !show_buttons && avail >= tlen + 4;
     let close_len = if show_close { 2 } else { 0 };
     let right_len = btn_len + close_len;
@@ -494,12 +572,39 @@ fn draw_pane_title(
         } else {
             BORDER_COLOR
         };
-        queue!(
-            stdout,
-            cursor::MoveTo(title_x, title_y),
-            SetForegroundColor(color)
-        )?;
-        queue!(stdout, Print(chars.h))?;
+
+        // Borderless: fill title row with subtle background for visual separation
+        if borderless {
+            let title_bg = if is_active {
+                Color::Rgb {
+                    r: 30,
+                    g: 34,
+                    b: 46,
+                }
+            } else {
+                Color::Rgb {
+                    r: 18,
+                    g: 20,
+                    b: 28,
+                }
+            };
+            queue!(
+                stdout,
+                cursor::MoveTo(title_x, title_y),
+                SetBackgroundColor(title_bg),
+            )?;
+            for _ in 0..avail {
+                queue!(stdout, Print(" "))?;
+            }
+            queue!(stdout, cursor::MoveTo(title_x, title_y))?;
+        } else {
+            queue!(
+                stdout,
+                cursor::MoveTo(title_x, title_y),
+                SetForegroundColor(color)
+            )?;
+            queue!(stdout, Print(chars.h))?;
+        }
 
         if is_active {
             queue!(
@@ -512,19 +617,41 @@ fn draw_pane_title(
             queue!(stdout, SetForegroundColor(DEAD_FG))?;
         }
         queue!(stdout, Print(&title))?;
-        queue!(
-            stdout,
-            SetAttribute(Attribute::Reset),
-            SetForegroundColor(color)
-        )?;
+        queue!(stdout, SetAttribute(Attribute::Reset))?;
 
-        let fill = avail - tlen - 1 - right_len;
-        for _ in 0..fill {
-            queue!(stdout, Print(chars.h))?;
+        // For borderless: keep the title_bg set so buttons share the same background
+        if borderless {
+            let title_bg = if is_active {
+                Color::Rgb {
+                    r: 30,
+                    g: 34,
+                    b: 46,
+                }
+            } else {
+                Color::Rgb {
+                    r: 18,
+                    g: 20,
+                    b: 28,
+                }
+            };
+            queue!(stdout, SetBackgroundColor(title_bg))?;
+        }
+        queue!(stdout, SetForegroundColor(color))?;
+
+        let leading = if borderless { 0 } else { 1 };
+        let fill = avail.saturating_sub(tlen + leading + right_len);
+        if !borderless {
+            for _ in 0..fill {
+                queue!(stdout, Print(chars.h))?;
+            }
         }
 
         if show_buttons {
             let btn_fg = if is_active { MUTED_FG } else { BORDER_COLOR };
+            if borderless {
+                let btn_x = title_x + (avail as u16).saturating_sub(11);
+                queue!(stdout, cursor::MoveTo(btn_x, title_y))?;
+            }
             queue!(
                 stdout,
                 SetForegroundColor(btn_fg),
@@ -533,11 +660,15 @@ fn draw_pane_title(
                 Print("[×]")
             )?;
         } else if show_close {
+            if borderless {
+                let btn_x = title_x + (avail as u16).saturating_sub(2);
+                queue!(stdout, cursor::MoveTo(btn_x, title_y))?;
+            }
             queue!(stdout, SetForegroundColor(CLOSE_COLOR), Print(" ×"))?;
         }
     }
 
-    queue!(stdout, ResetColor)?;
+    queue!(stdout, ResetColor, SetAttribute(Attribute::Reset))?;
     Ok(())
 }
 
