@@ -546,6 +546,14 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
             }
         }
 
+        // Pre-fill rename buffer with current tab name (one-shot on transition)
+        if let InputMode::RenameTab { ref mut buffer } = mode {
+            // Sentinel: "\0" means "just entered, needs pre-fill"
+            if buffer == "\0" {
+                *buffer = tab_name.clone();
+            }
+        }
+
         if detach_requested {
             if let Some(ref mut c) = client {
                 let _ = protocol::write_msg(&mut c.writer, protocol::S_DETACHED, &[]);
@@ -976,17 +984,12 @@ fn render_frame_to_buf(
             sel_for_render,
             broadcast,
         )?;
-        // Text input overlay (rename / command palette)
-        match mode {
-            InputMode::RenameTab { buffer } => {
-                render::draw_text_input(buf, tw, th, "Rename tab: ", buffer)?;
-            }
-            InputMode::CommandPalette { buffer } => {
-                render::draw_text_input(buf, tw, th, ":", buffer)?;
-            }
-            _ => {}
-        }
-        if settings.show_status_bar && (!mode_label.is_empty() || sel_chars > 0) {
+        let is_text_input = matches!(
+            mode,
+            InputMode::RenameTab { .. } | InputMode::CommandPalette { .. }
+        );
+        // Status bar (skip if text input mode will draw over it)
+        if !is_text_input && settings.show_status_bar && (!mode_label.is_empty() || sel_chars > 0) {
             let ids = layout.pane_ids();
             let active_idx = ids.iter().position(|&id| id == active).unwrap_or(0);
             let pane_name = panes.get(&active).and_then(|p| p.name()).unwrap_or("");
@@ -1020,6 +1023,17 @@ fn render_frame_to_buf(
     if matches!(mode, InputMode::PaneSelect) {
         let inner = super::make_inner(tw, th, settings.show_status_bar);
         render::draw_pane_numbers(buf, layout, &inner)?;
+    }
+
+    // Text input overlay — drawn LAST so it's on top of status bar
+    match mode {
+        InputMode::RenameTab { buffer } => {
+            render::draw_text_input(buf, tw, th, "Rename tab: ", buffer)?;
+        }
+        InputMode::CommandPalette { buffer } => {
+            render::draw_text_input(buf, tw, th, ":", buffer)?;
+        }
+        _ => {}
     }
 
     Ok(())
@@ -1555,10 +1569,12 @@ fn process_key(
             KeyCode::Char('&') => {
                 *tab_action = TabAction::CloseTab;
             }
-            // Rename tab (tmux ,)
+            // Rename tab (tmux ,) — pre-fill with current tab name
             KeyCode::Char(',') => {
+                // tab_name is not accessible here directly, use empty for now
+                // The actual pre-fill happens in the render where the prompt shows current name
                 next_mode = InputMode::RenameTab {
-                    buffer: String::new(),
+                    buffer: "\0".to_string(), // sentinel: will be pre-filled by main loop
                 };
             }
             // Command palette (tmux :)
@@ -1899,9 +1915,9 @@ fn process_mouse(
                             if idx != tab_names.iter().position(|(_, _, a)| *a).unwrap_or(0) {
                                 *tab_action = TabAction::GoToTab(idx);
                             }
-                            // Enter rename mode with current tab name as initial buffer
+                            // Enter rename mode — sentinel will be pre-filled by main loop
                             *_mode = InputMode::RenameTab {
-                                buffer: String::new(),
+                                buffer: "\0".to_string(),
                             };
                             update.full_redraw = true;
                         } else {
