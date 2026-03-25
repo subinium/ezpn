@@ -1098,7 +1098,7 @@ fn process_event(
         }
         Event::Mouse(mouse) => {
             if let Some(ref cache) = border_cache {
-                let inner = super::make_inner(tw, th, settings.show_status_bar);
+                let inner = cache.inner().clone();
                 process_mouse(
                     mouse,
                     mode,
