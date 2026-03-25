@@ -2,15 +2,65 @@
   <img src="../assets/hero.png" width="720" alt="ezpn デモ">
 </p>
 
-# ezpn
+<h1 align="center">ezpn</h1>
 
-コマンド一つでターミナルを分割。クリック、ドラッグ、完了。
+<p align="center">
+  <strong>ターミナルペイン、瞬時に。</strong><br>
+  ゼロ設定でセッション永続化とtmux互換キーを提供するターミナルマルチプレクサ。
+</p>
 
-[![License](https://img.shields.io/badge/license-MIT-blue)](../LICENSE)
-[![Crate](https://img.shields.io/badge/crates.io-v0.2.0-orange)](https://crates.io/crates/ezpn)
-[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)]()
+<p align="center">
+  <a href="https://crates.io/crates/ezpn"><img src="https://img.shields.io/crates/v/ezpn?style=flat-square&color=orange" alt="crates.io"></a>
+  <a href="../LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="MIT License"></a>
+  <a href="https://github.com/subinium/ezpn/actions"><img src="https://img.shields.io/github/actions/workflow/status/subinium/ezpn/ci.yml?style=flat-square&label=CI" alt="CI"></a>
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey?style=flat-square" alt="Platform">
+</p>
 
-[English](../README.md) | [한국어](README.ko.md) | **日本語** | [中文](README.zh.md) | [Español](README.es.md) | [Français](README.fr.md)
+<p align="center">
+  <a href="../README.md">English</a> | <a href="README.ko.md">한국어</a> | <b>日本語</b> | <a href="README.zh.md">中文</a> | <a href="README.es.md">Español</a> | <a href="README.fr.md">Français</a>
+</p>
+
+---
+
+## なぜ ezpn？
+
+```bash
+$ ezpn -e 'npm run dev' -e 'npm test --watch' -e 'tail -f logs/app.log'
+```
+
+3つのペイン。3つのコマンド。1行。設定ファイルも、セットアップも、学習コストもなし。
+
+セッションはバックグラウンドで永続化 — `Ctrl+B d` でデタッチ、`ezpn a` で復帰。プロセスは実行され続けます。
+
+**チーム向け**に、`.ezpn.toml` をリポジトリに入れれば全員が同じワークスペースを使えます：
+
+```toml
+[workspace]
+layout = "7:3/1:1"
+
+[[pane]]
+name = "editor"
+command = "nvim ."
+
+[[pane]]
+name = "server"
+command = "npm run dev"
+restart = "on_failure"
+
+[[pane]]
+name = "tests"
+command = "npm test -- --watch"
+
+[[pane]]
+name = "logs"
+command = "tail -f logs/app.log"
+```
+
+```bash
+$ ezpn   # .ezpn.toml を読んですべて起動
+```
+
+tmuxinatorも不要。YAMLも不要。リポジトリにTOMLファイル1つだけ。
 
 ## インストール
 
@@ -18,69 +68,237 @@
 cargo install ezpn
 ```
 
-## 使い方
+<details>
+<summary>ソースからビルド</summary>
 
 ```bash
-ezpn              # 2ペイン（横並び）
-ezpn 4            # 4ペイン（横方向）
-ezpn 3 -d v       # 3ペイン（縦方向）
-ezpn 2 3          # 2×3グリッド
-ezpn --layout '7:3/1:1'   # 比率指定レイアウト
-ezpn -e 'make watch' -e 'npm dev'   # ペインごとのコマンド
+git clone https://github.com/subinium/ezpn
+cd ezpn && cargo install --path .
 ```
 
-## 操作方法
+</details>
 
-**マウス:** クリックで選択 / `×`で閉じる / ボーダーをドラッグでリサイズ / ダブルクリックでズーム切替 / スクロール対応
+## クイックスタート
 
-**キーボード:**
+```bash
+ezpn                  # 2ペイン（または .ezpn.toml を読み込み）
+ezpn 2 3              # 2x3 グリッド
+ezpn -l dev           # レイアウトプリセット (dev, monitor, quad, stack, trio...)
+ezpn -e 'cmd1' -e 'cmd2'   # ペインごとのコマンド
+```
+
+### セッション
+
+```bash
+Ctrl+B d               # デタッチ（セッションは実行継続）
+ezpn a                 # 最新のセッションに再接続
+ezpn a myproject       # 名前で再接続
+ezpn ls                # アクティブなセッション一覧
+ezpn kill myproject    # セッションを終了
+```
+
+### タブ
+
+```bash
+Ctrl+B c               # 新しいタブ
+Ctrl+B n / p           # 次 / 前のタブ
+Ctrl+B 0-9             # 番号でタブに移動
+```
+
+すべてのtmuxキーが動作します — `Ctrl+B %` で分割、`Ctrl+B x` で閉じる、`Ctrl+B [` でコピーモード。
+
+## 主な機能
+
+| | |
+|---|---|
+| **ゼロ設定** | そのまま使える。rcファイル不要。 |
+| **レイアウトプリセット** | `dev`, `ide`, `monitor`, `quad`, `stack`, `main`, `trio` |
+| **セッション永続化** | tmuxのようにデタッチ/アタッチ。バックグラウンドデーモンがプロセスを維持。 |
+| **タブ** | tmuxスタイルのウィンドウ。タブバーとマウスクリック切り替え対応。 |
+| **マウスファースト** | クリックでフォーカス、ドラッグでリサイズ、スクロールで履歴、ドラッグで選択&コピー。 |
+| **コピーモード** | Viキー、ビジュアル選択、インクリメンタル検索、OSC 52クリップボード。 |
+| **コマンドパレット** | `Ctrl+B :` tmux互換コマンド。 |
+| **ブロードキャストモード** | 全ペインに同時入力。 |
+| **プロジェクト設定** | `.ezpn.toml` — レイアウト、コマンド、環境変数、自動再起動。 |
+| **ボーダーレスモード** | `ezpn -b none` で画面スペースを最大化。 |
+| **Kittyキーボード** | `Shift+Enter`、`Ctrl+Arrow`などの修飾キーが正常動作。 |
+| **CJK/Unicode** | 日本語、中国語、韓国語、絵文字の正確な幅計算。 |
+
+## レイアウトプリセット
+
+```bash
+ezpn -l dev       # 7:3 — メイン + サイド
+ezpn -l ide       # 7:3/1:1 — エディタ + サイドバー + 下部2つ
+ezpn -l monitor   # 1:1:1 — 3列均等
+ezpn -l quad      # 2x2 グリッド
+ezpn -l stack     # 1/1/1 — 3行スタック
+ezpn -l main      # 6:4/1 — 上部ワイドペア + 下部フル
+ezpn -l trio      # 1/1:1 — 上部フル + 下部2つ
+```
+
+カスタム比率: `ezpn -l '7:3/5:5'`
+
+## プロジェクト設定
+
+プロジェクトルートに `.ezpn.toml` を配置して `ezpn` を実行。以上。
+
+**ペインごとのオプション:** `command`, `cwd`, `name`, `env`, `restart` (`never`/`on_failure`/`always`), `shell`
+
+```bash
+ezpn init              # .ezpn.toml テンプレート生成
+ezpn from Procfile     # Procfileからインポート
+```
+
+<details>
+<summary>グローバル設定</summary>
+
+`~/.config/ezpn/config.toml`:
+
+```toml
+border = rounded        # single | rounded | heavy | double | none
+shell = /bin/zsh
+scrollback = 10000
+status_bar = true
+tab_bar = true
+prefix = b              # プリフィクスキー (Ctrl+<key>)
+```
+
+</details>
+
+## キーバインド
+
+**直接ショートカット:**
 
 | キー | 操作 |
 |---|---|
 | `Ctrl+D` | 左右分割 |
 | `Ctrl+E` | 上下分割 |
 | `Ctrl+N` | 次のペイン |
-| `Ctrl+G` | 設定パネル |
-| `Ctrl+W` | 終了 |
+| `F2` | サイズ均等化 |
 
-**tmux互換キー (`Ctrl+B` の後):**
+**プリフィクスモード** (`Ctrl+B` の後):
 
 | キー | 操作 |
 |---|---|
-| `%` | 左右分割 |
-| `"` | 上下分割 |
-| `o` | 次のペイン |
-| `Arrow` | 方向移動 |
+| `%` / `"` | 左右 / 上下分割 |
+| `o` / Arrow | ペイン移動 |
 | `x` | ペインを閉じる |
 | `z` | ズーム切替 |
 | `R` | リサイズモード |
-| `q` | ペイン番号表示＋1-9でジャンプ（0は10番目） |
-| `{ }` | ペイン入替 |
+| `[` | コピーモード |
+| `B` | ブロードキャスト |
+| `:` | コマンドパレット |
+| `d` | デタッチ |
 | `?` | ヘルプ |
-| `[` | スクロールモード (j/k/g/G、qで終了) |
-| `d` | 終了（確認あり） |
 
-## 主な機能
+<details>
+<summary>全キーバインド一覧</summary>
 
-- **自由なレイアウト** — グリッド、比率指定、個別分割、ドラッグリサイズ
-- **ペインごとのコマンド** — `-e`フラグで個別コマンド起動
-- **タイトルバー** — `[━] [┃] [×]` ボタン + 実行中コマンド表示
-- **ズームモード** — `Ctrl+B z` またはダブルクリックで全画面
-- **キーボードリサイズ** — `Ctrl+B R` → 矢印キー/hjklでサイズ調整
-- **ペイン入替** — `Ctrl+B {` / `}` でペイン位置を交換
-- **クイックジャンプ** — `Ctrl+B q` → 番号表示、1-9キーでジャンプ
-- **tmuxプリフィクスキー** — `Ctrl+B`の後にtmuxキーが使用可能
-- **設定ファイル** — `~/.config/ezpn/config.toml` 対応
-- **IPC自動化** — `ezpn-ctl`による外部制御
-- **ワークスペースの保存・復元** — `ezpn-ctl save/load`
+**タブ:**
 
-## 比較
+| キー | 操作 |
+|---|---|
+| `Ctrl+B c` | 新しいタブ |
+| `Ctrl+B n` / `p` | 次 / 前のタブ |
+| `Ctrl+B 0-9` | 番号でタブに移動 |
+| `Ctrl+B ,` | タブ名変更 |
+| `Ctrl+B &` | タブを閉じる |
 
-|  | tmux | Zellij | ezpn |
+**ペイン:**
+
+| キー | 操作 |
+|---|---|
+| `Ctrl+B {` / `}` | 前 / 次のペインと交換 |
+| `Ctrl+B E` / `Space` | サイズ均等化 |
+| `Ctrl+B s` | ステータスバー切替 |
+| `Ctrl+B q` | ペイン番号 + クイックジャンプ |
+
+**コピーモード** (`Ctrl+B [`):
+
+| キー | 操作 |
+|---|---|
+| `h` `j` `k` `l` | カーソル移動 |
+| `w` / `b` | 次 / 前の単語 |
+| `0` / `$` / `^` | 行頭 / 行末 / 最初の非空白文字 |
+| `g` / `G` | スクロールバック先頭 / 末尾 |
+| `Ctrl+U` / `Ctrl+D` | 半ページ上 / 下 |
+| `v` | 文字選択 |
+| `V` | 行選択 |
+| `y` / `Enter` | コピーして終了 |
+| `/` / `?` | 前方 / 後方検索 |
+| `n` / `N` | 次 / 前のマッチ |
+| `q` / `Esc` | 終了 |
+
+**マウス:**
+
+| 操作 | 効果 |
+|---|---|
+| ペインクリック | フォーカス |
+| ダブルクリック | ズーム切替 |
+| タブクリック | タブ切替 |
+| `[x]` クリック | ペインを閉じる |
+| ボーダードラッグ | リサイズ |
+| テキストドラッグ | 選択 + コピー |
+| スクロールホイール | スクロールバック履歴 |
+
+**macOS注意:** Alt+Arrowの方向移動にはOptionをMetaに設定する必要があります（iTerm2: Preferences > Profiles > Keys > `Esc+`）。
+
+</details>
+
+<details>
+<summary>コマンドパレットのコマンド</summary>
+
+`Ctrl+B :` でコマンドプロンプトを開きます。tmuxエイリアスすべて対応。
+
+```
+split / split-window         左右分割
+split -v                     上下分割
+new-tab / new-window         新しいタブ
+next-tab / prev-tab          タブ切替
+close-pane / kill-pane       ペインを閉じる
+close-tab / kill-window      タブを閉じる
+rename-tab <name>            タブ名変更
+layout <spec>                レイアウト変更
+equalize / even              サイズ均等化
+zoom                         ズーム切替
+broadcast                    ブロードキャスト切替
+```
+
+</details>
+
+## ezpn vs. tmux vs. Zellij
+
+| | tmux | Zellij | **ezpn** |
 |---|---|---|---|
-| 設定 | `.tmux.conf` | KDLファイル | CLIフラグ |
-| 分割 | `Ctrl+B %` | モード切替 | `Ctrl+D` / クリック |
-| Detach | 可能 | 可能 | 不可 |
+| 設定 | `.tmux.conf` 必要 | KDL設定 | **ゼロ設定** |
+| 初回使用 | 空の画面 | チュートリアルモード | **`ezpn`** |
+| セッション | `tmux a` | `zellij a` | **`ezpn a`** |
+| プロジェクト設定 | tmuxinator (gem) | — | **`.ezpn.toml` 内蔵** |
+| ブロードキャスト | `:setw synchronize-panes` | — | **`Ctrl+B B`** |
+| 自動再起動 | — | — | **`restart = "always"`** |
+| Kittyキーボード | 非対応 | 対応 | **対応** |
+| プラグイン | — | WASM | — |
+| エコシステム | 巨大（30年） | 成長中 | 新規 |
+
+**ezpn** — 設定不要で即使えるターミナル分割。
+**tmux** — 深いスクリプティングとプラグインエコシステムが必要な場合。
+**Zellij** — モダンUIとWASMプラグインが欲しい場合。
+
+## CLIリファレンス
+
+```
+ezpn [ROWS COLS]         グリッドレイアウトで開始
+ezpn -l <PRESET>         レイアウトプリセットで開始
+ezpn -e <CMD> [-e ...]   ペインごとのコマンド
+ezpn -S <NAME>           名前付きセッション
+ezpn -b <STYLE>          ボーダースタイル (single/rounded/heavy/double/none)
+ezpn a [NAME]            セッションに接続
+ezpn ls                  セッション一覧
+ezpn kill [NAME]         セッション終了
+ezpn rename OLD NEW      セッション名変更
+ezpn init                .ezpn.toml テンプレート生成
+ezpn from <FILE>         Procfileからインポート
+```
 
 ## ライセンス
 

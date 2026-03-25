@@ -2,15 +2,65 @@
   <img src="../assets/hero.png" width="720" alt="ezpn 演示">
 </p>
 
-# ezpn
+<h1 align="center">ezpn</h1>
 
-一条命令分割终端。点击、拖拽，搞定。
+<p align="center">
+  <strong>终端面板，即刻呈现。</strong><br>
+  零配置终端复用器，支持会话持久化和 tmux 兼容按键。
+</p>
 
-[![License](https://img.shields.io/badge/license-MIT-blue)](../LICENSE)
-[![Crate](https://img.shields.io/badge/crates.io-v0.2.0-orange)](https://crates.io/crates/ezpn)
-[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)]()
+<p align="center">
+  <a href="https://crates.io/crates/ezpn"><img src="https://img.shields.io/crates/v/ezpn?style=flat-square&color=orange" alt="crates.io"></a>
+  <a href="../LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="MIT License"></a>
+  <a href="https://github.com/subinium/ezpn/actions"><img src="https://img.shields.io/github/actions/workflow/status/subinium/ezpn/ci.yml?style=flat-square&label=CI" alt="CI"></a>
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey?style=flat-square" alt="Platform">
+</p>
 
-[English](../README.md) | [한국어](README.ko.md) | [日本語](README.ja.md) | **中文** | [Español](README.es.md) | [Français](README.fr.md)
+<p align="center">
+  <a href="../README.md">English</a> | <a href="README.ko.md">한국어</a> | <a href="README.ja.md">日本語</a> | <b>中文</b> | <a href="README.es.md">Español</a> | <a href="README.fr.md">Français</a>
+</p>
+
+---
+
+## 为什么选择 ezpn？
+
+```bash
+$ ezpn -e 'npm run dev' -e 'npm test --watch' -e 'tail -f logs/app.log'
+```
+
+三个面板。三条命令。一行搞定。无需配置文件，无需设置，无需学习成本。
+
+会话在后台持久运行 — `Ctrl+B d` 分离，`ezpn a` 回来。进程继续运行。
+
+**团队协作**，将 `.ezpn.toml` 放入仓库，所有人共享相同的工作空间：
+
+```toml
+[workspace]
+layout = "7:3/1:1"
+
+[[pane]]
+name = "editor"
+command = "nvim ."
+
+[[pane]]
+name = "server"
+command = "npm run dev"
+restart = "on_failure"
+
+[[pane]]
+name = "tests"
+command = "npm test -- --watch"
+
+[[pane]]
+name = "logs"
+command = "tail -f logs/app.log"
+```
+
+```bash
+$ ezpn   # 读取 .ezpn.toml，启动一切
+```
+
+不需要 tmuxinator。不需要 YAML。仓库里放一个 TOML 文件就行。
 
 ## 安装
 
@@ -18,71 +68,237 @@
 cargo install ezpn
 ```
 
-## 用法
+<details>
+<summary>从源码构建</summary>
 
 ```bash
-ezpn              # 左右两个面板
-ezpn 4            # 4个水平面板
-ezpn 3 -d v       # 3个垂直面板
-ezpn 2 3          # 2×3 网格
-ezpn --layout '7:3/1:1'   # 比例布局
-ezpn -e 'make watch' -e 'npm dev'   # 每个面板运行不同命令
+git clone https://github.com/subinium/ezpn
+cd ezpn && cargo install --path .
 ```
 
-## 操作
+</details>
 
-**鼠标：** 点击选择 / `×`关闭 / 拖拽边框调整大小 / 双击缩放切换 / 滚轮滚动
+## 快速开始
 
-**键盘：**
+```bash
+ezpn                  # 2 个面板（或加载 .ezpn.toml）
+ezpn 2 3              # 2x3 网格
+ezpn -l dev           # 布局预设 (dev, monitor, quad, stack, trio...)
+ezpn -e 'cmd1' -e 'cmd2'   # 每个面板的命令
+```
+
+### 会话
+
+```bash
+Ctrl+B d               # 分离（会话继续运行）
+ezpn a                 # 重新连接最近的会话
+ezpn a myproject       # 按名称重新连接
+ezpn ls                # 列出活动会话
+ezpn kill myproject    # 终止会话
+```
+
+### 标签页
+
+```bash
+Ctrl+B c               # 新标签页
+Ctrl+B n / p           # 下一个 / 上一个标签页
+Ctrl+B 0-9             # 按编号跳转标签页
+```
+
+所有 tmux 按键都可用 — `Ctrl+B %` 分割，`Ctrl+B x` 关闭，`Ctrl+B [` 进入复制模式。
+
+## 主要功能
+
+| | |
+|---|---|
+| **零配置** | 开箱即用，无需 rc 文件。 |
+| **布局预设** | `dev`、`ide`、`monitor`、`quad`、`stack`、`main`、`trio` |
+| **会话持久化** | 像 tmux 一样分离/连接。后台守护进程保持进程运行。 |
+| **标签页** | tmux 风格窗口，支持标签栏和鼠标点击切换。 |
+| **鼠标优先** | 点击聚焦、拖拽调整大小、滚轮浏览历史、拖拽选择和复制。 |
+| **复制模式** | Vi 按键、可视选择、增量搜索、OSC 52 剪贴板。 |
+| **命令面板** | `Ctrl+B :` tmux 兼容命令。 |
+| **广播模式** | 同时向所有面板输入。 |
+| **项目配置** | `.ezpn.toml` — 布局、命令、环境变量、自动重启。 |
+| **无边框模式** | `ezpn -b none` 最大化屏幕空间。 |
+| **Kitty 键盘** | `Shift+Enter`、`Ctrl+Arrow` 等修饰键正常工作。 |
+| **CJK/Unicode** | 中文、日文、韩文和 emoji 的精确宽度计算。 |
+
+## 布局预设
+
+```bash
+ezpn -l dev       # 7:3 — 主区 + 侧边
+ezpn -l ide       # 7:3/1:1 — 编辑器 + 侧边栏 + 底部两个
+ezpn -l monitor   # 1:1:1 — 三列均等
+ezpn -l quad      # 2x2 网格
+ezpn -l stack     # 1/1/1 — 三行堆叠
+ezpn -l main      # 6:4/1 — 上方宽对 + 下方全宽
+ezpn -l trio      # 1/1:1 — 上方全宽 + 下方两个
+```
+
+自定义比例：`ezpn -l '7:3/5:5'`
+
+## 项目配置
+
+在项目根目录放置 `.ezpn.toml` 然后运行 `ezpn`。完毕。
+
+**面板选项：** `command`、`cwd`、`name`、`env`、`restart`（`never`/`on_failure`/`always`）、`shell`
+
+```bash
+ezpn init              # 生成 .ezpn.toml 模板
+ezpn from Procfile     # 从 Procfile 导入
+```
+
+<details>
+<summary>全局配置</summary>
+
+`~/.config/ezpn/config.toml`：
+
+```toml
+border = rounded        # single | rounded | heavy | double | none
+shell = /bin/zsh
+scrollback = 10000
+status_bar = true
+tab_bar = true
+prefix = b              # 前缀键 (Ctrl+<key>)
+```
+
+</details>
+
+## 键绑定
+
+**直接快捷键：**
 
 | 按键 | 操作 |
 |---|---|
 | `Ctrl+D` | 左右分割 |
 | `Ctrl+E` | 上下分割 |
 | `Ctrl+N` | 下一个面板 |
-| `Ctrl+G` | 设置面板 |
-| `Ctrl+W` | 退出 |
+| `F2` | 均等化大小 |
 
-**tmux 兼容键（`Ctrl+B` 之后）：**
+**前缀模式**（`Ctrl+B` 之后）：
 
 | 按键 | 操作 |
 |---|---|
-| `%` | 左右分割 |
-| `"` | 上下分割 |
-| `o` | 下一个面板 |
-| `Arrow` | 方向导航 |
+| `%` / `"` | 左右 / 上下分割 |
+| `o` / Arrow | 面板导航 |
 | `x` | 关闭面板 |
 | `z` | 缩放切换 |
 | `R` | 调整大小模式 |
-| `q` | 面板编号 + 按1-9跳转（0为第10个） |
-| `{ }` | 交换面板 |
+| `[` | 复制模式 |
+| `B` | 广播 |
+| `:` | 命令面板 |
+| `d` | 分离 |
 | `?` | 帮助 |
-| `[` | 滚动模式（j/k/g/G，q退出） |
-| `d` | 退出（有确认提示） |
 
-## 主要功能
+<details>
+<summary>完整键绑定参考</summary>
 
-- **灵活布局** — 网格、比例指定、自由分割、拖拽调整
-- **面板独立命令** — `-e`标志为每个面板指定命令
-- **标题栏** — `[━] [┃] [×]` 按钮 + 运行命令显示
-- **缩放模式** — `Ctrl+B z` 或双击全屏放大
-- **键盘调整大小** — `Ctrl+B R` → 方向键/hjkl调整
-- **面板交换** — `Ctrl+B {` / `}` 交换面板位置
-- **快速跳转** — `Ctrl+B q` → 显示编号，1-9键跳转
-- **tmux 前缀键** — `Ctrl+B` 后使用 tmux 按键
-- **配置文件** — `~/.config/ezpn/config.toml` 支持
-- **IPC 自动化** — `ezpn-ctl` 外部控制
-- **工作区快照** — `ezpn-ctl save/load` 保存和恢复
+**标签页：**
 
-## 对比
+| 按键 | 操作 |
+|---|---|
+| `Ctrl+B c` | 新标签页 |
+| `Ctrl+B n` / `p` | 下一个 / 上一个标签页 |
+| `Ctrl+B 0-9` | 按编号跳转标签页 |
+| `Ctrl+B ,` | 重命名标签页 |
+| `Ctrl+B &` | 关闭标签页 |
 
-|  | tmux | Zellij | ezpn |
+**面板：**
+
+| 按键 | 操作 |
+|---|---|
+| `Ctrl+B {` / `}` | 与前 / 后面板交换 |
+| `Ctrl+B E` / `Space` | 均等化 |
+| `Ctrl+B s` | 切换状态栏 |
+| `Ctrl+B q` | 面板编号 + 快速跳转 |
+
+**复制模式**（`Ctrl+B [`）：
+
+| 按键 | 操作 |
+|---|---|
+| `h` `j` `k` `l` | 移动光标 |
+| `w` / `b` | 下一个 / 上一个单词 |
+| `0` / `$` / `^` | 行首 / 行尾 / 第一个非空白字符 |
+| `g` / `G` | 滚动缓冲区顶部 / 底部 |
+| `Ctrl+U` / `Ctrl+D` | 半页上 / 下 |
+| `v` | 字符选择 |
+| `V` | 行选择 |
+| `y` / `Enter` | 复制并退出 |
+| `/` / `?` | 向前 / 向后搜索 |
+| `n` / `N` | 下一个 / 上一个匹配 |
+| `q` / `Esc` | 退出 |
+
+**鼠标：**
+
+| 操作 | 效果 |
+|---|---|
+| 点击面板 | 聚焦 |
+| 双击 | 缩放切换 |
+| 点击标签 | 切换标签页 |
+| 点击 `[x]` | 关闭面板 |
+| 拖拽边框 | 调整大小 |
+| 拖拽文本 | 选择 + 复制 |
+| 滚轮 | 滚动缓冲区历史 |
+
+**macOS 注意：** Alt+Arrow 方向导航需要将 Option 设置为 Meta（iTerm2：Preferences > Profiles > Keys > `Esc+`）。
+
+</details>
+
+<details>
+<summary>命令面板命令</summary>
+
+`Ctrl+B :` 打开命令提示符。支持所有 tmux 别名。
+
+```
+split / split-window         左右分割
+split -v                     上下分割
+new-tab / new-window         新标签页
+next-tab / prev-tab          切换标签页
+close-pane / kill-pane       关闭面板
+close-tab / kill-window      关闭标签页
+rename-tab <name>            重命名标签页
+layout <spec>                更改布局
+equalize / even              均等化大小
+zoom                         缩放切换
+broadcast                    广播切换
+```
+
+</details>
+
+## ezpn vs. tmux vs. Zellij
+
+| | tmux | Zellij | **ezpn** |
 |---|---|---|---|
-| 配置 | `.tmux.conf` | KDL文件 | CLI参数 |
-| 分割 | `Ctrl+B %` | 模式切换 | `Ctrl+D` / 点击 |
-| 分离 | 支持 | 支持 | 不支持 |
+| 配置 | 需要 `.tmux.conf` | KDL 配置 | **零配置** |
+| 首次使用 | 空白屏幕 | 教程模式 | **`ezpn`** |
+| 会话 | `tmux a` | `zellij a` | **`ezpn a`** |
+| 项目配置 | tmuxinator (gem) | — | **`.ezpn.toml` 内置** |
+| 广播 | `:setw synchronize-panes` | — | **`Ctrl+B B`** |
+| 自动重启 | — | — | **`restart = "always"`** |
+| Kitty 键盘 | 不支持 | 支持 | **支持** |
+| 插件 | — | WASM | — |
+| 生态系统 | 庞大（30年） | 成长中 | 新兴 |
 
-需要会话持久化用 tmux/Zellij，只想快速分屏用 ezpn。
+**ezpn** — 零配置即用的终端分屏。
+**tmux** — 需要深度脚本和插件生态系统时。
+**Zellij** — 想要现代 UI 和 WASM 插件时。
+
+## CLI 参考
+
+```
+ezpn [ROWS COLS]         以网格布局启动
+ezpn -l <PRESET>         以布局预设启动
+ezpn -e <CMD> [-e ...]   每个面板的命令
+ezpn -S <NAME>           命名会话
+ezpn -b <STYLE>          边框样式 (single/rounded/heavy/double/none)
+ezpn a [NAME]            连接会话
+ezpn ls                  列出会话
+ezpn kill [NAME]         终止会话
+ezpn rename OLD NEW      重命名会话
+ezpn init                生成 .ezpn.toml 模板
+ezpn from <FILE>         从 Procfile 导入
+```
 
 ## 许可证
 
