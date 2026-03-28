@@ -28,7 +28,17 @@ pub enum ExitReason {
 }
 
 /// Connect to a running server and act as a terminal proxy.
+/// Uses legacy C_RESIZE handshake (steal mode).
 pub fn run(socket_path: &std::path::Path, session_name: &str) -> anyhow::Result<()> {
+    run_with_mode(socket_path, session_name, protocol::AttachMode::Steal)
+}
+
+/// Connect to a running server with a specific attach mode.
+pub fn run_with_mode(
+    socket_path: &std::path::Path,
+    session_name: &str,
+    attach_mode: protocol::AttachMode,
+) -> anyhow::Result<()> {
     let stream = UnixStream::connect(socket_path)?;
     stream.set_nonblocking(false)?;
 
@@ -66,7 +76,7 @@ pub fn run(socket_path: &std::path::Path, session_name: &str) -> anyhow::Result<
     let _ = write!(stdout, "\x1b]0;ezpn: {}\x07", session_name);
     let _ = stdout.flush();
 
-    let reason = client_loop(&mut stdout, write_stream, &server_rx);
+    let reason = client_loop(&mut stdout, write_stream, &server_rx, attach_mode);
 
     // Cleanup terminal FIRST — before printing any messages
     {
@@ -105,11 +115,24 @@ fn client_loop(
     stdout: &mut io::Stdout,
     mut writer: UnixStream,
     server_rx: &mpsc::Receiver<(u8, Vec<u8>)>,
+    attach_mode: protocol::AttachMode,
 ) -> anyhow::Result<ExitReason> {
-    // Send initial terminal size
+    // Send initial handshake with terminal size and attach mode
     let (cols, rows) = terminal::size()?;
-    let resize_data = protocol::encode_resize(cols, rows);
-    protocol::write_msg(&mut writer, protocol::C_RESIZE, &resize_data)?;
+    if attach_mode == protocol::AttachMode::Steal {
+        // Legacy handshake for backward compatibility
+        let resize_data = protocol::encode_resize(cols, rows);
+        protocol::write_msg(&mut writer, protocol::C_RESIZE, &resize_data)?;
+    } else {
+        // New protocol with attach mode
+        let req = protocol::AttachRequest {
+            cols,
+            rows,
+            mode: attach_mode,
+        };
+        let json = serde_json::to_vec(&req)?;
+        protocol::write_msg(&mut writer, protocol::C_ATTACH, &json)?;
+    }
 
     loop {
         // 1. Process server messages — batch all output, flush once
@@ -140,7 +163,10 @@ fn client_loop(
         }
 
         // 2. Read terminal events and forward to server
-        while event::poll(Duration::from_millis(8))? {
+        // Use 1ms poll when we had output (expect more soon), 4ms otherwise.
+        // This reduces input latency vs the previous 8ms fixed poll.
+        let poll_ms = if got_output { 1 } else { 4 };
+        while event::poll(Duration::from_millis(poll_ms))? {
             let ev = event::read()?;
 
             match &ev {

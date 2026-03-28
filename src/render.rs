@@ -163,11 +163,16 @@ pub struct BorderCell {
 
 pub struct BorderCache {
     inner: Rect,
+    pane_order: Vec<usize>,
     pane_rects: HashMap<usize, Rect>,
     cells: Vec<BorderCell>,
 }
 
 impl BorderCache {
+    pub fn pane_order(&self) -> &[usize] {
+        &self.pane_order
+    }
+
     pub fn pane_rects(&self) -> &HashMap<usize, Rect> {
         &self.pane_rects
     }
@@ -283,6 +288,7 @@ pub fn build_border_cache_with_style(
         }
     };
 
+    let pane_order = layout.pane_ids();
     let pane_rects = layout.pane_rects(&inner);
     let separators = layout.separators(&inner, &outer);
 
@@ -311,6 +317,7 @@ pub fn build_border_cache_with_style(
 
     BorderCache {
         inner,
+        pane_order,
         pane_rects,
         cells,
     }
@@ -326,7 +333,7 @@ pub type PaneSelection = Option<(usize, u16, u16, u16, u16)>;
 pub fn render_panes(
     stdout: &mut impl Write,
     panes: &HashMap<usize, Pane>,
-    layout: &Layout,
+    _layout: &Layout,
     active_id: usize,
     border_style: BorderStyle,
     show_status_bar: bool,
@@ -397,7 +404,7 @@ pub fn render_panes(
     }
 
     // Pane titles + content
-    let ids = layout.pane_ids();
+    let ids = border_cache.pane_order();
     for (display_idx, &pid) in ids.iter().enumerate() {
         if !full_redraw && !dirty_panes.contains(&pid) {
             continue;
@@ -469,11 +476,14 @@ fn clear_rect(stdout: &mut impl Write, rect: &Rect) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let blanks = " ".repeat(rect.w as usize);
     for row in 0..rect.h {
-        queue!(stdout, cursor::MoveTo(rect.x, rect.y + row))?;
-        for _ in 0..rect.w {
-            queue!(stdout, ResetColor, Print(" "))?;
-        }
+        queue!(
+            stdout,
+            cursor::MoveTo(rect.x, rect.y + row),
+            ResetColor,
+            Print(&blanks)
+        )?;
     }
 
     Ok(())
@@ -486,11 +496,8 @@ fn clear_title(stdout: &mut impl Write, rect: &Rect) -> anyhow::Result<()> {
 
     let y = rect.y.saturating_sub(1);
     let x = rect.x;
-    let width = rect.w;
-    queue!(stdout, cursor::MoveTo(x, y))?;
-    for _ in 0..width {
-        queue!(stdout, ResetColor, Print(" "))?;
-    }
+    let blanks = " ".repeat(rect.w as usize);
+    queue!(stdout, cursor::MoveTo(x, y), ResetColor, Print(&blanks))?;
     Ok(())
 }
 
@@ -593,9 +600,8 @@ fn draw_pane_title(
                 cursor::MoveTo(title_x, title_y),
                 SetBackgroundColor(title_bg),
             )?;
-            for _ in 0..avail {
-                queue!(stdout, Print(" "))?;
-            }
+            let blanks = " ".repeat(avail);
+            queue!(stdout, Print(&blanks))?;
             queue!(stdout, cursor::MoveTo(title_x, title_y))?;
         } else {
             queue!(

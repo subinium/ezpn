@@ -19,18 +19,17 @@ const Y_I0: u16 = 5; // Single
 const Y_I1: u16 = 6; // Rounded
 const Y_I2: u16 = 7; // Heavy
 const Y_I3: u16 = 8; // Double
-const Y_DIV1: u16 = 9;
-const Y_SEC2: u16 = 10; // "PANE"
-const Y_I4: u16 = 11; // Split H
-const Y_I5: u16 = 12; // Split V
-const Y_DIV2: u16 = 13;
-const Y_SEC3: u16 = 14; // "DISPLAY"
-const Y_I6: u16 = 15; // Status Bar
-const Y_DIV3: u16 = 16;
-const Y_I7: u16 = 17; // Close
+const Y_I4: u16 = 9; // None
+const Y_DIV1: u16 = 10;
+const Y_SEC2: u16 = 11; // "DISPLAY"
+const Y_I5: u16 = 12; // Status Bar
+const Y_I6: u16 = 13; // Tab Bar
+const Y_I7: u16 = 14; // Broadcast
+const Y_DIV2: u16 = 15;
+const Y_I8: u16 = 16; // Close
 
-const ITEM_Y: [u16; 8] = [Y_I0, Y_I1, Y_I2, Y_I3, Y_I4, Y_I5, Y_I6, Y_I7];
-const ITEM_COUNT: usize = 8;
+const ITEM_Y: [u16; 9] = [Y_I0, Y_I1, Y_I2, Y_I3, Y_I4, Y_I5, Y_I6, Y_I7, Y_I8];
+const ITEM_COUNT: usize = 9;
 
 // ─── Colors ────────────────────────────────────────────
 
@@ -81,10 +80,11 @@ const I_SINGLE: usize = 0;
 const I_ROUNDED: usize = 1;
 const I_HEAVY: usize = 2;
 const I_DOUBLE: usize = 3;
-const I_SPLIT_H: usize = 4;
-const I_SPLIT_V: usize = 5;
-const I_STATUS: usize = 6;
-const I_CLOSE: usize = 7;
+const I_NONE: usize = 4;
+const I_STATUS: usize = 5;
+const I_TAB_BAR: usize = 6;
+const I_BROADCAST: usize = 7;
+const I_CLOSE: usize = 8;
 
 // ─── State ─────────────────────────────────────────────
 
@@ -92,6 +92,7 @@ pub struct Settings {
     pub visible: bool,
     pub border_style: BorderStyle,
     pub show_status_bar: bool,
+    pub show_tab_bar: bool,
     focused: usize,
 }
 
@@ -100,8 +101,7 @@ pub enum SettingsAction {
     None,
     Close,
     Changed,
-    SplitH,
-    SplitV,
+    BroadcastToggle,
 }
 
 impl Settings {
@@ -110,6 +110,7 @@ impl Settings {
             visible: false,
             border_style: border,
             show_status_bar: true,
+            show_tab_bar: true,
             focused: I_ROUNDED,
         }
     }
@@ -122,7 +123,7 @@ impl Settings {
                 BorderStyle::Rounded => I_ROUNDED,
                 BorderStyle::Heavy => I_HEAVY,
                 BorderStyle::Double => I_DOUBLE,
-                BorderStyle::None => I_SINGLE, // default focus position
+                BorderStyle::None => I_NONE,
             };
         }
     }
@@ -147,6 +148,7 @@ impl Settings {
             KeyCode::Char('2') => self.set_border(BorderStyle::Rounded, I_ROUNDED),
             KeyCode::Char('3') => self.set_border(BorderStyle::Heavy, I_HEAVY),
             KeyCode::Char('4') => self.set_border(BorderStyle::Double, I_DOUBLE),
+            KeyCode::Char('5') => self.set_border(BorderStyle::None, I_NONE),
             KeyCode::Enter | KeyCode::Char(' ') => self.activate(self.focused),
             _ => SettingsAction::None,
         }
@@ -169,7 +171,13 @@ impl Settings {
 
     // ─── Render ────────────────────────────────────────
 
-    pub fn render_overlay(&self, stdout: &mut impl Write, tw: u16, th: u16) -> anyhow::Result<()> {
+    pub fn render_overlay(
+        &self,
+        stdout: &mut impl Write,
+        tw: u16,
+        th: u16,
+        broadcast: bool,
+    ) -> anyhow::Result<()> {
         if tw < W + 4 || th < H + 2 {
             return Ok(());
         }
@@ -206,7 +214,7 @@ impl Settings {
             BG,
             DIM_FG,
             false,
-            "j/k move  Enter apply  1-4 border  q close",
+            "j/k move  Enter apply  1-5 border  q close",
         )?;
 
         // Section: Border Style
@@ -223,20 +231,25 @@ impl Settings {
         )?;
         self.item_border(stdout, x, xr, oy, I_HEAVY, "Heavy", BorderStyle::Heavy)?;
         self.item_border(stdout, x, xr, oy, I_DOUBLE, "Double", BorderStyle::Double)?;
-
-        // Divider + Section: Pane
-        div(stdout, x, oy + Y_DIV1, inner_w)?;
-        text(stdout, x, oy + Y_SEC2, BG, SEC_FG, true, "PANE")?;
-        self.item_action(stdout, x, xr, oy, I_SPLIT_H, "Split Left | Right", "Ctrl+D")?;
-        self.item_action(stdout, x, xr, oy, I_SPLIT_V, "Split Top / Bottom", "Ctrl+E")?;
+        self.item_border(stdout, x, xr, oy, I_NONE, "None", BorderStyle::None)?;
 
         // Divider + Section: Display
-        div(stdout, x, oy + Y_DIV2, inner_w)?;
-        text(stdout, x, oy + Y_SEC3, BG, SEC_FG, true, "DISPLAY")?;
-        self.item_toggle(stdout, x, xr, oy)?;
+        div(stdout, x, oy + Y_DIV1, inner_w)?;
+        text(stdout, x, oy + Y_SEC2, BG, SEC_FG, true, "DISPLAY")?;
+        self.item_toggle(
+            stdout,
+            x,
+            xr,
+            oy,
+            I_STATUS,
+            "Status Bar",
+            self.show_status_bar,
+        )?;
+        self.item_toggle(stdout, x, xr, oy, I_TAB_BAR, "Tab Bar", self.show_tab_bar)?;
+        self.item_toggle(stdout, x, xr, oy, I_BROADCAST, "Broadcast", broadcast)?;
 
         // Divider + Close
-        div(stdout, x, oy + Y_DIV3, inner_w)?;
+        div(stdout, x, oy + Y_DIV2, inner_w)?;
         self.item_close(stdout, x, xr, oy)?;
 
         queue!(stdout, ResetColor, SetAttribute(Attribute::Reset))?;
@@ -294,15 +307,15 @@ impl Settings {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn item_action(
+    fn item_toggle(
         &self,
         stdout: &mut impl Write,
         x: u16,
         xr: u16,
         oy: u16,
         item: usize,
-        name: &str,
-        hint: &str,
+        label: &str,
+        value: bool,
     ) -> anyhow::Result<()> {
         let y = oy + ITEM_Y[item];
         let f = self.focused == item;
@@ -323,41 +336,12 @@ impl Settings {
         if f {
             queue!(stdout, SetAttribute(Attribute::Bold))?;
         }
-        queue!(stdout, Print(name))?;
+        queue!(stdout, Print(label))?;
         if f {
             queue!(stdout, SetAttribute(Attribute::Reset))?;
         }
 
-        right_tag(stdout, xr, y, bg, DIM_FG, hint)?;
-        Ok(())
-    }
-
-    fn item_toggle(&self, stdout: &mut impl Write, x: u16, xr: u16, oy: u16) -> anyhow::Result<()> {
-        let y = oy + ITEM_Y[I_STATUS];
-        let f = self.focused == I_STATUS;
-        let bg = if f { FOCUS_BG } else { BG };
-
-        row_bg(stdout, x - 1, y, (xr - x + 2) as usize, bg)?;
-        if f {
-            focus_marker(stdout, x - 1, y)?;
-        }
-
-        let nx = if f { x + 3 } else { x + 1 };
-        queue!(
-            stdout,
-            cursor::MoveTo(nx, y),
-            SetBackgroundColor(bg),
-            SetForegroundColor(if f { Color::White } else { LBL_FG }),
-        )?;
-        if f {
-            queue!(stdout, SetAttribute(Attribute::Bold))?;
-        }
-        queue!(stdout, Print("Status Bar"))?;
-        if f {
-            queue!(stdout, SetAttribute(Attribute::Reset))?;
-        }
-
-        let (tag, tag_fg) = if self.show_status_bar {
+        let (tag, tag_fg) = if value {
             ("ON", ACCENT)
         } else {
             ("OFF", DIM_FG)
@@ -399,15 +383,16 @@ impl Settings {
 
     fn adjust(&mut self, delta: isize) -> SettingsAction {
         match self.focused {
-            I_SINGLE | I_ROUNDED | I_HEAVY | I_DOUBLE => {
+            I_SINGLE | I_ROUNDED | I_HEAVY | I_DOUBLE | I_NONE => {
                 let o = [
                     BorderStyle::Single,
                     BorderStyle::Rounded,
                     BorderStyle::Heavy,
                     BorderStyle::Double,
+                    BorderStyle::None,
                 ];
                 let i = o.iter().position(|s| *s == self.border_style).unwrap_or(1);
-                let n = ((i as isize + delta).rem_euclid(4)) as usize;
+                let n = ((i as isize + delta).rem_euclid(5)) as usize;
                 self.border_style = o[n];
                 self.focused = n;
                 SettingsAction::Changed
@@ -416,6 +401,11 @@ impl Settings {
                 self.show_status_bar = !self.show_status_bar;
                 SettingsAction::Changed
             }
+            I_TAB_BAR => {
+                self.show_tab_bar = !self.show_tab_bar;
+                SettingsAction::Changed
+            }
+            I_BROADCAST => SettingsAction::BroadcastToggle,
             _ => SettingsAction::None,
         }
     }
@@ -426,18 +416,16 @@ impl Settings {
             I_ROUNDED => self.set_border(BorderStyle::Rounded, I_ROUNDED),
             I_HEAVY => self.set_border(BorderStyle::Heavy, I_HEAVY),
             I_DOUBLE => self.set_border(BorderStyle::Double, I_DOUBLE),
-            I_SPLIT_H => {
-                self.visible = false;
-                SettingsAction::SplitH
-            }
-            I_SPLIT_V => {
-                self.visible = false;
-                SettingsAction::SplitV
-            }
+            I_NONE => self.set_border(BorderStyle::None, I_NONE),
             I_STATUS => {
                 self.show_status_bar = !self.show_status_bar;
                 SettingsAction::Changed
             }
+            I_TAB_BAR => {
+                self.show_tab_bar = !self.show_tab_bar;
+                SettingsAction::Changed
+            }
+            I_BROADCAST => SettingsAction::BroadcastToggle,
             I_CLOSE => {
                 self.visible = false;
                 SettingsAction::Close
