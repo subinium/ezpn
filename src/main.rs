@@ -53,7 +53,7 @@ fn main() -> anyhow::Result<()> {
         Some("from") => return cmd_from(args.get(2).map(|s| s.as_str())),
         Some("ls") => return cmd_ls(),
         Some("kill") => return cmd_kill(args.get(2).map(|s| s.as_str())),
-        Some("a") | Some("attach") => return cmd_attach(args.get(2).map(|s| s.as_str())),
+        Some("a") | Some("attach") => return cmd_attach(&args[2..]),
         Some("rename") => {
             return cmd_rename(
                 args.get(2).map(|s| s.as_str()),
@@ -222,7 +222,20 @@ fn cmd_rename(old: Option<&str>, new: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_attach(name: Option<&str>) -> anyhow::Result<()> {
+fn cmd_attach(args: &[String]) -> anyhow::Result<()> {
+    let mut name: Option<&str> = None;
+    let mut attach_mode = protocol::AttachMode::Steal;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--shared" => attach_mode = protocol::AttachMode::Shared,
+            "--readonly" => attach_mode = protocol::AttachMode::Readonly,
+            other if !other.starts_with('-') && name.is_none() => name = Some(other),
+            other => anyhow::bail!("unknown attach option: {}", other),
+        }
+        i += 1;
+    }
+
     let (session_name, path) = session::find(name).ok_or_else(|| {
         anyhow::anyhow!(
             "no session found{}",
@@ -235,7 +248,7 @@ fn cmd_attach(name: Option<&str>) -> anyhow::Result<()> {
         std::process::exit(1);
     }
 
-    client::run(&path, &session_name)
+    client::run_with_mode(&path, &session_name, attach_mode)
 }
 
 fn cmd_init() -> anyhow::Result<()> {
@@ -772,20 +785,22 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
 
     let (mut layout, mut panes, mut active) = if let Some(path) = &config.restore {
         let snapshot = workspace::load_snapshot(path)?;
-        let layout = snapshot.layout.clone();
+        let tab = &snapshot.tabs[snapshot.active_tab];
+        let layout = tab.layout.clone();
         default_shell = snapshot.shell.clone();
         settings.border_style = snapshot.border_style;
         settings.show_status_bar = snapshot.show_status_bar;
+        settings.show_tab_bar = snapshot.show_tab_bar;
         let panes = spawn_snapshot_panes(
             &layout,
-            &snapshot,
+            tab,
             &default_shell,
             tw,
             th,
             &settings,
-            effective_scrollback,
+            snapshot.scrollback,
         )?;
-        let active = snapshot.active_pane;
+        let active = tab.active_pane;
         (layout, panes, active)
     } else if config.commands.is_empty()
         && matches!(config.layout, LayoutSpec::Grid { rows: 1, cols: 2 })
@@ -874,6 +889,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
         .map_err(|e| eprintln!("ezpn: IPC unavailable ({e}), ezpn-ctl disabled"))
         .ok();
     let mut border_cache = render::build_border_cache(&layout, settings.show_status_bar, tw, th);
+    let mut last_title_state: Option<(usize, usize)> = None;
     let initial_dirty = layout.pane_ids().into_iter().collect::<HashSet<_>>();
     render_frame(
         stdout,
@@ -942,16 +958,23 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                     continue; // wait before restarting
                 }
 
-                let (launch, old_name) = panes
+                let (launch, old_name, pane_shell) = panes
                     .get(&pid)
-                    .map(|p| (p.launch().clone(), p.name().map(String::from)))
-                    .unwrap_or((PaneLaunch::Shell, None));
+                    .map(|p| {
+                        (
+                            p.launch().clone(),
+                            p.name().map(String::from),
+                            p.initial_shell().map(String::from),
+                        )
+                    })
+                    .unwrap_or((PaneLaunch::Shell, None, None));
+                let eff_shell = pane_shell.as_deref().unwrap_or(&default_shell);
                 if replace_pane(
                     &mut panes,
                     &layout,
                     pid,
                     launch,
-                    &default_shell,
+                    eff_shell,
                     tw,
                     th,
                     &settings,
@@ -959,9 +982,12 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                 )
                 .is_ok()
                 {
-                    // Preserve the pane name from config
+                    // Preserve pane name and shell override
                     if let Some(pane) = panes.get_mut(&pid) {
                         pane.set_name(old_name);
+                        if let Some(ref s) = pane_shell {
+                            pane.set_initial_shell(Some(s.clone()));
+                        }
                     }
                     *retries += 1;
                     *last_death = Instant::now();
@@ -1366,49 +1392,21 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                         else if settings.visible {
                             let prev_border = settings.border_style;
                             let prev_status = settings.show_status_bar;
+                            let prev_tab_bar = settings.show_tab_bar;
                             let action = settings.handle_key(key);
-                            match action {
-                                SettingsAction::SplitH => {
-                                    do_split(
-                                        &mut layout,
-                                        &mut panes,
-                                        active,
-                                        Direction::Horizontal,
-                                        &default_shell,
-                                        tw,
-                                        th,
-                                        &settings,
-                                        effective_scrollback,
-                                    )?;
-                                    update.mark_all(&layout);
-                                    update.border_dirty = true;
-                                }
-                                SettingsAction::SplitV => {
-                                    do_split(
-                                        &mut layout,
-                                        &mut panes,
-                                        active,
-                                        Direction::Vertical,
-                                        &default_shell,
-                                        tw,
-                                        th,
-                                        &settings,
-                                        effective_scrollback,
-                                    )?;
-                                    update.mark_all(&layout);
-                                    update.border_dirty = true;
-                                }
-                                _ => {}
+                            if action == SettingsAction::BroadcastToggle {
+                                broadcast = !broadcast;
                             }
                             if settings.border_style != prev_border {
                                 update.full_redraw = true;
                             }
-                            if settings.show_status_bar != prev_status {
+                            if settings.show_status_bar != prev_status
+                                || settings.show_tab_bar != prev_tab_bar
+                            {
                                 resize_all(&mut panes, &layout, tw, th, &settings);
                                 update.border_dirty = true;
                                 update.mark_all(&layout);
                             }
-                            // Any settings interaction needs a redraw (focus movement, value change, close)
                             {
                                 update.full_redraw = true;
                             }
@@ -1480,21 +1478,37 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                         } else if key.code == KeyCode::Enter
                             && panes.get(&active).is_some_and(|p| !p.is_alive())
                         {
-                            let launch = panes
+                            let (launch, old_name, pane_shell) = panes
                                 .get(&active)
-                                .map(|p| p.launch().clone())
-                                .unwrap_or(PaneLaunch::Shell);
-                            replace_pane(
+                                .map(|p| {
+                                    (
+                                        p.launch().clone(),
+                                        p.name().map(String::from),
+                                        p.initial_shell().map(String::from),
+                                    )
+                                })
+                                .unwrap_or((PaneLaunch::Shell, None, None));
+                            let eff_shell = pane_shell.as_deref().unwrap_or(&default_shell);
+                            if replace_pane(
                                 &mut panes,
                                 &layout,
                                 active,
                                 launch,
-                                &default_shell,
+                                eff_shell,
                                 tw,
                                 th,
                                 &settings,
                                 effective_scrollback,
-                            )?;
+                            )
+                            .is_ok()
+                            {
+                                if let Some(pane) = panes.get_mut(&active) {
+                                    pane.set_name(old_name);
+                                    if let Some(ref s) = pane_shell {
+                                        pane.set_initial_shell(Some(s.clone()));
+                                    }
+                                }
+                            }
                             update.dirty_panes.insert(active);
                         } else if broadcast {
                             // Broadcast: send key to all live panes
@@ -1525,52 +1539,24 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                             if settings.visible {
                                 let prev_border = settings.border_style;
                                 let prev_status = settings.show_status_bar;
+                                let prev_tab_bar = settings.show_tab_bar;
                                 let action = settings.handle_click(mouse.column, mouse.row, tw, th);
-                                match action {
-                                    SettingsAction::SplitH => {
-                                        do_split(
-                                            &mut layout,
-                                            &mut panes,
-                                            active,
-                                            Direction::Horizontal,
-                                            &default_shell,
-                                            tw,
-                                            th,
-                                            &settings,
-                                            effective_scrollback,
-                                        )?;
-                                        update.mark_all(&layout);
-                                        update.border_dirty = true;
-                                    }
-                                    SettingsAction::SplitV => {
-                                        do_split(
-                                            &mut layout,
-                                            &mut panes,
-                                            active,
-                                            Direction::Vertical,
-                                            &default_shell,
-                                            tw,
-                                            th,
-                                            &settings,
-                                            effective_scrollback,
-                                        )?;
-                                        update.mark_all(&layout);
-                                        update.border_dirty = true;
-                                    }
-                                    SettingsAction::Changed
-                                    | SettingsAction::Close
-                                    | SettingsAction::None => {}
+                                if action == SettingsAction::BroadcastToggle {
+                                    broadcast = !broadcast;
                                 }
                                 if settings.border_style != prev_border {
                                     update.full_redraw = true;
                                 }
-                                if settings.show_status_bar != prev_status {
+                                if settings.show_status_bar != prev_status
+                                    || settings.show_tab_bar != prev_tab_bar
+                                {
                                     resize_all(&mut panes, &layout, tw, th, &settings);
                                     update.border_dirty = true;
                                     update.mark_all(&layout);
                                 }
                                 if action == SettingsAction::Changed
                                     || action == SettingsAction::Close
+                                    || action == SettingsAction::BroadcastToggle
                                 {
                                     update.full_redraw = true;
                                 }
@@ -1842,11 +1828,6 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
         }
 
         if update.needs_render() {
-            // Sync scrollback offsets to vt100 parser before rendering
-            for pane in panes.values_mut() {
-                pane.sync_scrollback();
-            }
-
             let mode_label = match &mode {
                 InputMode::Prefix { .. } => "PREFIX",
                 InputMode::ScrollMode => "SCROLL",
@@ -1858,11 +1839,24 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                 InputMode::Normal => "",
             };
 
+            let needs_selection_chars =
+                zoomed_pane.is_none() && settings.show_status_bar && text_selection.is_some();
+            let render_targets = collect_render_targets(
+                &panes,
+                &update.dirty_panes,
+                update.full_redraw,
+                zoomed_pane,
+                needs_selection_chars
+                    .then(|| text_selection.as_ref().map(|s| s.pane_id))
+                    .flatten(),
+            );
+            sync_render_targets(&mut panes, &render_targets);
+
             if let Some(zpid) = zoomed_pane {
                 // Zoomed mode: render only the zoomed pane at full size
                 queue!(stdout, terminal::BeginSynchronizedUpdate)?;
-                let ids = layout.pane_ids();
-                let pane_idx = ids.iter().position(|&id| id == zpid).unwrap_or(0);
+                let pane_order = border_cache.pane_order();
+                let pane_idx = pane_order.iter().position(|&id| id == zpid).unwrap_or(0);
                 let label = panes
                     .get(&zpid)
                     .map(|p| p.launch_label(&default_shell))
@@ -1892,7 +1886,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                         tw,
                         th,
                         pane_idx,
-                        ids.len(),
+                        pane_order.len(),
                         zoom_label,
                         pane_name,
                         0,
@@ -1905,23 +1899,11 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                     let (sr, sc, er, ec) = s.normalized();
                     (s.pane_id, sr, sc, er, ec)
                 });
-                // Compute selection char count for status bar
-                let sel_chars = text_selection
-                    .as_ref()
-                    .and_then(|sel| {
-                        panes.get(&sel.pane_id).map(|pane| {
-                            let text = extract_selected_text(
-                                pane.screen(),
-                                sel.pane_id,
-                                sel.start_row,
-                                sel.start_col,
-                                sel.end_row,
-                                sel.end_col,
-                            );
-                            text.chars().count()
-                        })
-                    })
-                    .unwrap_or(0);
+                let sel_chars = if needs_selection_chars {
+                    selection_char_count_from_synced(&panes, sel_for_render)
+                } else {
+                    0
+                };
                 render_frame(
                     stdout,
                     &panes,
@@ -1956,17 +1938,18 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                 stdout.flush()?;
             }
 
-            // Reset scrollback view so process() isn't affected
-            for pane in panes.values_mut() {
-                pane.reset_scrollback_view();
-            }
+            reset_render_targets(&mut panes, &render_targets);
         }
 
         // Update window title with pane count
         {
-            let ids = layout.pane_ids();
-            let idx = ids.iter().position(|&id| id == active).unwrap_or(0);
-            let _ = write!(stdout, "\x1b]0;ezpn [{}/{}]\x07", idx + 1, ids.len());
+            let pane_order = border_cache.pane_order();
+            let idx = pane_order.iter().position(|&id| id == active).unwrap_or(0);
+            let next_title = (idx, pane_order.len());
+            if last_title_state != Some(next_title) {
+                let _ = write!(stdout, "\x1b]0;ezpn [{}/{}]\x07", idx + 1, pane_order.len());
+                last_title_state = Some(next_title);
+            }
         }
     }
 
@@ -2041,22 +2024,22 @@ fn render_frame(
     )?;
     // Mode-aware status bar (render over the default one if we have a mode)
     if settings.show_status_bar && (!mode_label.is_empty() || selection_chars > 0) {
-        let ids = layout.pane_ids();
-        let active_idx = ids.iter().position(|&id| id == active).unwrap_or(0);
+        let pane_order = border_cache.pane_order();
+        let active_idx = pane_order.iter().position(|&id| id == active).unwrap_or(0);
         let pane_name = panes.get(&active).and_then(|p| p.name()).unwrap_or("");
         render::draw_status_bar_full(
             stdout,
             tw,
             th,
             active_idx,
-            ids.len(),
+            pane_order.len(),
             mode_label,
             pane_name,
             selection_chars,
         )?;
     }
     if settings.visible {
-        settings.render_overlay(stdout, tw, th)?;
+        settings.render_overlay(stdout, tw, th, broadcast)?;
         queue!(stdout, cursor::Hide)?; // no blinking cursor over modal
     }
     queue!(stdout, terminal::EndSynchronizedUpdate)?;
@@ -2064,8 +2047,81 @@ fn render_frame(
     Ok(())
 }
 
+fn collect_render_targets(
+    panes: &HashMap<usize, Pane>,
+    dirty_panes: &HashSet<usize>,
+    full_redraw: bool,
+    zoomed_pane: Option<usize>,
+    extra_pane: Option<usize>,
+) -> Vec<usize> {
+    let mut targets = if let Some(pid) = zoomed_pane {
+        let mut out = Vec::with_capacity(1 + usize::from(extra_pane.is_some()));
+        if panes.contains_key(&pid) {
+            out.push(pid);
+        }
+        out
+    } else if full_redraw {
+        panes.keys().copied().collect::<Vec<_>>()
+    } else {
+        dirty_panes
+            .iter()
+            .copied()
+            .filter(|pid| panes.contains_key(pid))
+            .collect::<Vec<_>>()
+    };
+
+    if let Some(pid) = extra_pane {
+        if panes.contains_key(&pid) && !targets.contains(&pid) {
+            targets.push(pid);
+        }
+    }
+
+    targets
+}
+
+fn sync_render_targets(panes: &mut HashMap<usize, Pane>, targets: &[usize]) {
+    for pid in targets {
+        if let Some(pane) = panes.get_mut(pid) {
+            pane.sync_scrollback();
+        }
+    }
+}
+
+fn reset_render_targets(panes: &mut HashMap<usize, Pane>, targets: &[usize]) {
+    for pid in targets {
+        if let Some(pane) = panes.get_mut(pid) {
+            pane.reset_scrollback_view();
+        }
+    }
+}
+
+fn selection_char_count_from_synced(
+    panes: &HashMap<usize, Pane>,
+    selection: render::PaneSelection,
+) -> usize {
+    selection
+        .and_then(|(pane_id, sr, sc, er, ec)| {
+            panes.get(&pane_id).map(|pane| {
+                let text = extract_selected_text(pane.screen(), pane_id, sr, sc, er, ec);
+                text.chars().count()
+            })
+        })
+        .unwrap_or(0)
+}
+
+/// Extra state from a snapshot restore (all tabs in order).
+pub(crate) struct SnapshotExtra {
+    /// All tabs in their original order.
+    pub all_tabs: Vec<workspace::TabSnapshot>,
+    /// Which index in `all_tabs` is the active one (already spawned by build_initial_state).
+    pub active_tab_idx: usize,
+    /// The snapshot's scrollback value (for consistency across all tabs).
+    pub scrollback: usize,
+}
+
 /// Build initial layout, panes, and active pane ID from config.
 /// Used by both direct mode and server mode.
+/// Returns optional `SnapshotExtra` when restoring a multi-tab snapshot.
 #[allow(clippy::type_complexity)]
 pub(crate) fn build_initial_state(
     config: &Config,
@@ -2073,7 +2129,7 @@ pub(crate) fn build_initial_state(
     settings: &mut Settings,
     restart_policies: &mut HashMap<usize, project::RestartPolicy>,
     scrollback: usize,
-) -> anyhow::Result<(Layout, HashMap<usize, Pane>, usize)> {
+) -> anyhow::Result<(Layout, HashMap<usize, Pane>, usize, Option<SnapshotExtra>)> {
     // Use a default terminal size for initial spawn (server doesn't have a terminal yet).
     // Panes will be resized when a client connects.
     let tw: u16 = 80;
@@ -2081,21 +2137,41 @@ pub(crate) fn build_initial_state(
 
     if let Some(path) = &config.restore {
         let snapshot = workspace::load_snapshot(path)?;
-        let layout = snapshot.layout.clone();
+        let active_idx = snapshot.active_tab;
+        let tab = &snapshot.tabs[active_idx];
+        let layout = tab.layout.clone();
         *default_shell = snapshot.shell.clone();
         settings.border_style = snapshot.border_style;
         settings.show_status_bar = snapshot.show_status_bar;
+        settings.show_tab_bar = snapshot.show_tab_bar;
+        let effective_scrollback = snapshot.scrollback;
+
+        // Restore restart policies from snapshot
+        for ps in &tab.panes {
+            if ps.restart != project::RestartPolicy::Never {
+                restart_policies.insert(ps.id, ps.restart.clone());
+            }
+        }
+
         let panes = spawn_snapshot_panes(
             &layout,
-            &snapshot,
+            tab,
             default_shell,
             tw,
             th,
             settings,
-            scrollback,
+            effective_scrollback,
         )?;
-        let active = snapshot.active_pane;
-        return Ok((layout, panes, active));
+        let active = tab.active_pane;
+
+        // Pass all tabs to the caller for full restore
+        let extra = Some(SnapshotExtra {
+            all_tabs: snapshot.tabs.clone(),
+            active_tab_idx: active_idx,
+            scrollback: effective_scrollback,
+        });
+
+        return Ok((layout, panes, active, extra));
     }
 
     if config.commands.is_empty() && matches!(config.layout, LayoutSpec::Grid { rows: 1, cols: 2 })
@@ -2105,7 +2181,7 @@ pub(crate) fn build_initial_state(
             let panes = spawn_project_panes(&proj, default_shell, tw, th, settings, scrollback)?;
             *restart_policies = proj.restarts.clone();
             let active = *proj.layout.pane_ids().first().unwrap_or(&0);
-            return Ok((proj.layout, panes, active));
+            return Ok((proj.layout, panes, active, None));
         } else if let Some((layout, launches)) = try_load_procfile() {
             let panes = spawn_layout_panes(
                 &layout,
@@ -2117,7 +2193,7 @@ pub(crate) fn build_initial_state(
                 scrollback,
             )?;
             let active = *layout.pane_ids().first().unwrap_or(&0);
-            return Ok((layout, panes, active));
+            return Ok((layout, panes, active, None));
         } else {
             let layout = Layout::from_grid(1, 2);
             let panes = spawn_layout_panes(
@@ -2130,7 +2206,7 @@ pub(crate) fn build_initial_state(
                 scrollback,
             )?;
             let active = *layout.pane_ids().first().unwrap_or(&0);
-            return Ok((layout, panes, active));
+            return Ok((layout, panes, active, None));
         }
     }
 
@@ -2150,7 +2226,7 @@ pub(crate) fn build_initial_state(
         scrollback,
     )?;
     let active = *layout.pane_ids().first().unwrap_or(&0);
-    Ok((layout, panes, active))
+    Ok((layout, panes, active, None))
 }
 
 /// Extract selected text — server-friendly version that takes individual coords.
@@ -2252,14 +2328,6 @@ pub(crate) fn build_command_launches(
         .collect()
 }
 
-fn build_snapshot_launches(snapshot: &WorkspaceSnapshot) -> HashMap<usize, PaneLaunch> {
-    snapshot
-        .panes
-        .iter()
-        .map(|pane| (pane.id, pane.launch.clone()))
-        .collect()
-}
-
 pub(crate) fn spawn_layout_panes(
     layout: &Layout,
     launches: HashMap<usize, PaneLaunch>,
@@ -2305,24 +2373,49 @@ pub(crate) fn spawn_layout_panes(
     Ok(panes)
 }
 
-fn spawn_snapshot_panes(
+pub(crate) fn spawn_snapshot_panes(
     layout: &Layout,
-    snapshot: &WorkspaceSnapshot,
+    tab: &workspace::TabSnapshot,
     shell: &str,
     tw: u16,
     th: u16,
     settings: &Settings,
     scrollback: usize,
 ) -> anyhow::Result<HashMap<usize, Pane>> {
-    spawn_layout_panes(
-        layout,
-        build_snapshot_launches(snapshot),
-        shell,
-        tw,
-        th,
-        settings,
-        scrollback,
-    )
+    let inner = make_inner(tw, th, settings.show_status_bar);
+    let rects = layout.pane_rects(&inner);
+    let mut panes = HashMap::new();
+
+    for ps in &tab.panes {
+        let rect = rects.get(&ps.id).cloned().unwrap_or(crate::layout::Rect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 24,
+        });
+        let cols = rect.w.max(1);
+        let rows = rect.h.max(1);
+        let pane_shell = ps.shell.as_deref().unwrap_or(shell);
+        let cwd = ps.cwd.as_ref().map(std::path::PathBuf::from);
+        let cwd_ref = cwd.as_deref();
+        let mut pane = Pane::with_full_config(
+            pane_shell,
+            ps.launch.clone(),
+            cols,
+            rows,
+            scrollback,
+            cwd_ref,
+            &ps.env,
+        )?;
+        if let Some(name) = &ps.name {
+            pane.set_name(Some(name.clone()));
+        }
+        if ps.shell.is_some() {
+            pane.set_initial_shell(ps.shell.clone());
+        }
+        panes.insert(ps.id, pane);
+    }
+    Ok(panes)
 }
 
 pub(crate) fn spawn_pane(
@@ -2363,6 +2456,10 @@ pub(crate) fn spawn_project_panes(
         if let Some(name) = proj.names.get(&pid) {
             pane.set_name(Some(name.clone()));
         }
+        // Track per-pane shell override for snapshot/restart
+        if proj.shells.contains_key(&pid) {
+            pane.set_initial_shell(Some(pane_shell.to_string()));
+        }
         panes.insert(pid, pane);
     }
     Ok(panes)
@@ -2380,12 +2477,31 @@ pub(crate) fn replace_pane(
     settings: &Settings,
     scrollback: usize,
 ) -> anyhow::Result<()> {
+    // Extract cwd/env from the old pane before replacing
+    let (cwd, env) = panes
+        .get(&pane_id)
+        .map(|p| {
+            (
+                p.live_cwd()
+                    .or_else(|| p.initial_cwd().map(|c| c.to_path_buf())),
+                p.initial_env().clone(),
+            )
+        })
+        .unwrap_or((None, std::collections::HashMap::new()));
     let inner = make_inner(tw, th, settings.show_status_bar);
     let rect = layout
         .pane_rects(&inner)
         .remove(&pane_id)
         .ok_or_else(|| anyhow::anyhow!("pane rect not found"))?;
-    let new_pane = spawn_pane(shell, &launch, rect.w.max(1), rect.h.max(1), scrollback)?;
+    let new_pane = Pane::with_full_config(
+        shell,
+        launch,
+        rect.w.max(1),
+        rect.h.max(1),
+        scrollback,
+        cwd.as_deref(),
+        &env,
+    )?;
     if let Some(mut old_pane) = panes.insert(pane_id, new_pane) {
         old_pane.kill();
     }
@@ -2408,19 +2524,21 @@ fn apply_snapshot(
     settings: &mut Settings,
     tw: u16,
     th: u16,
-    scrollback: usize,
+    _scrollback: usize,
 ) -> anyhow::Result<()> {
+    let tab = &snapshot.tabs[snapshot.active_tab];
     let mut next_settings = Settings::new(snapshot.border_style);
     next_settings.show_status_bar = snapshot.show_status_bar;
-    let next_layout = snapshot.layout.clone();
+    next_settings.show_tab_bar = snapshot.show_tab_bar;
+    let next_layout = tab.layout.clone();
     let next_panes = spawn_snapshot_panes(
         &next_layout,
-        &snapshot,
+        tab,
         &snapshot.shell,
         tw,
         th,
         &next_settings,
-        scrollback,
+        snapshot.scrollback,
     )?;
 
     kill_all_panes(panes);
@@ -2429,7 +2547,7 @@ fn apply_snapshot(
     *panes = next_panes;
     *settings = next_settings;
     settings.visible = false;
-    *active = snapshot.active_pane;
+    *active = tab.active_pane;
     Ok(())
 }
 
@@ -2756,14 +2874,44 @@ pub(crate) fn handle_ipc_command(
             }
         }
         ipc::IpcRequest::Save { path } => {
-            let snapshot = WorkspaceSnapshot::from_live(
-                layout,
-                panes,
-                *active,
-                shell,
-                settings.border_style,
-                settings.show_status_bar,
-            );
+            // IPC save uses a single-tab snapshot (no TabManager available here)
+            let tab = workspace::TabSnapshot {
+                name: "1".to_string(),
+                layout: layout.clone(),
+                active_pane: *active,
+                zoomed_pane: None,
+                broadcast: false,
+                panes: layout
+                    .pane_ids()
+                    .into_iter()
+                    .map(|id| {
+                        let pane = panes.get(&id);
+                        workspace::PaneSnapshot {
+                            id,
+                            launch: pane
+                                .map(|p| p.launch().clone())
+                                .unwrap_or(PaneLaunch::Shell),
+                            name: pane.and_then(|p| p.name().map(|s| s.to_string())),
+                            cwd: pane
+                                .and_then(|p| p.live_cwd())
+                                .map(|p| p.to_string_lossy().to_string()),
+                            env: pane.map(|p| p.initial_env().clone()).unwrap_or_default(),
+                            restart: project::RestartPolicy::default(),
+                            shell: pane.and_then(|p| p.initial_shell().map(|s| s.to_string())),
+                        }
+                    })
+                    .collect(),
+            };
+            let snapshot = WorkspaceSnapshot {
+                version: 2,
+                shell: shell.clone(),
+                border_style: settings.border_style,
+                show_status_bar: settings.show_status_bar,
+                show_tab_bar: settings.show_tab_bar,
+                scrollback,
+                active_tab: 0,
+                tabs: vec![tab],
+            };
             match workspace::save_snapshot(&path, &snapshot) {
                 Ok(()) => ipc::IpcResponse::success(format!("saved {}", path)),
                 Err(error) => ipc::IpcResponse::error(error.to_string()),

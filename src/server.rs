@@ -1,7 +1,8 @@
 //! Server daemon that manages PTYs, layout, and state.
 //!
-//! Accepts one client at a time. Renders frames to a buffer and streams
-//! them to the connected client. Goes headless when no client is attached.
+//! Accepts multiple clients with attach modes (steal/shared/readonly).
+//! Renders frames to a buffer and streams them to all connected clients.
+//! Goes headless when no client is attached.
 
 use std::collections::{HashMap, HashSet};
 use std::io::BufReader;
@@ -23,6 +24,7 @@ use crate::protocol;
 use crate::render::{self, BorderCache};
 use crate::session;
 use crate::settings::{Settings, SettingsAction};
+use crate::workspace::{self, WorkspaceSnapshot};
 
 /// Input state machine for prefix key support.
 #[allow(dead_code)]
@@ -129,19 +131,40 @@ enum ClientMsg {
     Kill,
 }
 
-/// Connected client state.
-struct ClientConn {
+/// Connected client with attach mode and per-client state.
+struct ConnectedClient {
+    id: u64,
     writer: std::io::BufWriter<UnixStream>,
     event_rx: mpsc::Receiver<ClientMsg>,
+    mode: protocol::AttachMode,
+    tw: u16,
+    th: u16,
 }
 
-impl Drop for ClientConn {
+impl Drop for ConnectedClient {
     fn drop(&mut self) {
         // Shutdown the underlying socket to force the reader thread to exit.
-        // BufWriter wraps the UnixStream; get_ref() gives us the inner stream.
         let _ = self.writer.get_ref().shutdown(std::net::Shutdown::Both);
     }
 }
+
+/// Compute the effective terminal size from all active clients.
+/// Uses smallest-client policy (like tmux).
+fn effective_size(clients: &[ConnectedClient]) -> (u16, u16) {
+    let mut min_w: u16 = u16::MAX;
+    let mut min_h: u16 = u16::MAX;
+    for c in clients {
+        min_w = min_w.min(c.tw);
+        min_h = min_h.min(c.th);
+    }
+    if min_w == u16::MAX {
+        (80, 24)
+    } else {
+        (min_w, min_h)
+    }
+}
+
+static NEXT_CLIENT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Run the server daemon. This function does not return until all panes die
 /// or the server is killed.
@@ -163,13 +186,14 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
     };
     let mut settings = Settings::new(effective_border);
     settings.show_status_bar = file_config.show_status_bar;
+    settings.show_tab_bar = file_config.show_tab_bar;
     let prefix_key = file_config.prefix_key;
 
     // Auto-restart state
     let mut restart_policies: HashMap<usize, project::RestartPolicy> = HashMap::new();
 
     // Build layout and spawn panes (same logic as direct mode)
-    let (mut layout, mut panes, mut active) = super::build_initial_state(
+    let (mut layout, mut panes, mut active, snapshot_extra) = super::build_initial_state(
         &config,
         &mut default_shell,
         &mut settings,
@@ -191,6 +215,66 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
     use crate::tab::{Tab, TabManager};
     let mut tab_mgr = TabManager::new();
     let mut tab_name = String::from("1");
+    let mut tab_names_cache: Vec<(usize, String, bool)> = Vec::new();
+    let mut tab_names_dirty = true;
+
+    // Restore all tabs from snapshot, preserving original order.
+    if let Some(extra) = snapshot_extra {
+        if extra.all_tabs.len() > 1 {
+            // Spawn ALL tabs in original order, using snapshot's scrollback
+            let mut all_spawned: Vec<Tab> = Vec::with_capacity(extra.all_tabs.len());
+            let snap_scrollback = extra.scrollback;
+
+            for tab_snap in &extra.all_tabs {
+                let tab_panes = super::spawn_snapshot_panes(
+                    &tab_snap.layout,
+                    tab_snap,
+                    &default_shell,
+                    80,
+                    24,
+                    &settings,
+                    snap_scrollback,
+                )?;
+                let mut tab_restart = HashMap::new();
+                for ps in &tab_snap.panes {
+                    if ps.restart != project::RestartPolicy::Never {
+                        tab_restart.insert(ps.id, ps.restart.clone());
+                    }
+                }
+                let mut tab = Tab::new(
+                    tab_snap.name.clone(),
+                    tab_snap.layout.clone(),
+                    tab_panes,
+                    tab_snap.active_pane,
+                );
+                tab.restart_policies = tab_restart;
+                tab.zoomed_pane = tab_snap.zoomed_pane;
+                tab.broadcast = tab_snap.broadcast;
+                all_spawned.push(tab);
+            }
+
+            // Kill the panes from build_initial_state (we re-spawned everything)
+            super::kill_all_panes(&mut panes);
+
+            // Build TabManager with correct order; active tab is unpacked
+            let (new_mgr, active_tab) = TabManager::from_tabs(all_spawned, extra.active_tab_idx);
+            tab_mgr = new_mgr;
+            tab_name = active_tab.name;
+            layout = active_tab.layout;
+            panes = active_tab.panes;
+            active = active_tab.active_pane;
+            restart_policies = active_tab.restart_policies;
+            restart_state = active_tab.restart_state;
+            zoomed_pane = active_tab.zoomed_pane;
+            broadcast = active_tab.broadcast;
+        } else {
+            // Single tab — just apply metadata
+            let snap = &extra.all_tabs[0];
+            tab_name = snap.name.clone();
+            zoomed_pane = snap.zoomed_pane;
+            broadcast = snap.broadcast;
+        }
+    }
     const MAX_RESTART_RETRIES: u32 = 10;
     const RESTART_DELAY: Duration = Duration::from_secs(2);
     const RESTART_BACKOFF_THRESHOLD: u32 = 3;
@@ -219,7 +303,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
         let _ = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600));
     }
 
-    let mut client: Option<ClientConn> = None;
+    let mut clients: Vec<ConnectedClient> = Vec::new();
     let mut border_cache: Option<BorderCache> = None;
     let mut render_buf: Vec<u8> = Vec::with_capacity(64 * 1024); // Reusable render buffer
 
@@ -251,12 +335,12 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
             if pane.read_output() {
                 update.dirty_panes.insert(pid);
             }
-            // Forward OSC 52 clipboard sequences from child to client terminal
+            // Forward OSC 52 clipboard sequences from child to all clients
             let osc52_seqs = pane.take_osc52();
             if !osc52_seqs.is_empty() {
-                if let Some(ref mut c) = client {
-                    for seq in osc52_seqs {
-                        let _ = protocol::write_msg(&mut c.writer, protocol::S_OUTPUT, &seq);
+                for c in &mut clients {
+                    for seq in &osc52_seqs {
+                        let _ = protocol::write_msg(&mut c.writer, protocol::S_OUTPUT, seq);
                     }
                 }
             }
@@ -295,16 +379,23 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                     continue;
                 }
 
-                let (launch, old_name) = panes
+                let (launch, old_name, pane_shell) = panes
                     .get(&pid)
-                    .map(|p| (p.launch().clone(), p.name().map(String::from)))
-                    .unwrap_or((PaneLaunch::Shell, None));
+                    .map(|p| {
+                        (
+                            p.launch().clone(),
+                            p.name().map(String::from),
+                            p.initial_shell().map(String::from),
+                        )
+                    })
+                    .unwrap_or((PaneLaunch::Shell, None, None));
+                let effective_shell = pane_shell.as_deref().unwrap_or(&default_shell);
                 if super::replace_pane(
                     &mut panes,
                     &layout,
                     pid,
                     launch,
-                    &default_shell,
+                    effective_shell,
                     tw,
                     th,
                     &settings,
@@ -314,6 +405,9 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                 {
                     if let Some(pane) = panes.get_mut(&pid) {
                         pane.set_name(old_name);
+                        if let Some(ref shell_override) = pane_shell {
+                            pane.set_initial_shell(Some(shell_override.clone()));
+                        }
                     }
                     *retries += 1;
                     *last_death = Instant::now();
@@ -371,7 +465,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                 }
             } else {
                 // Last tab — exit server
-                if let Some(ref mut c) = client {
+                for c in &mut clients {
                     let _ = protocol::write_msg(&mut c.writer, protocol::S_EXIT, &[]);
                 }
                 break;
@@ -398,9 +492,10 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
 
         // ── Accept new connections with handshake ──
         // Read the first message to determine intent:
-        //   C_PING  → respond with S_PONG, close (no side effects)
-        //   C_KILL  → kill server
-        //   C_RESIZE → real client attach (detach old client first)
+        //   C_PING   → respond with S_PONG, close (no side effects)
+        //   C_KILL   → kill server
+        //   C_RESIZE → legacy client attach (steal mode)
+        //   C_ATTACH → new protocol attach with mode
         if let Ok((conn, _)) = listener.accept() {
             conn.set_nonblocking(false).ok();
             // Short timeout for handshake — fail-close if setting fails
@@ -421,48 +516,52 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                         for pane in panes.values_mut() {
                             pane.kill();
                         }
-                        if let Some(ref mut c) = client {
+                        for c in &mut clients {
                             let _ = protocol::write_msg(&mut c.writer, protocol::S_EXIT, &[]);
                         }
                         session::cleanup(session_name);
                         ipc::cleanup();
                         return Ok(());
                     }
+                    Ok((protocol::C_ATTACH, payload)) => {
+                        // New protocol: attach with mode
+                        if let Ok(req) = serde_json::from_slice::<protocol::AttachRequest>(&payload)
+                        {
+                            accept_client(
+                                conn,
+                                req.cols,
+                                req.rows,
+                                req.mode,
+                                &mut clients,
+                                &mut panes,
+                                &layout,
+                                &settings,
+                                &mut tw,
+                                &mut th,
+                                &mut drag,
+                                zoomed_pane,
+                                &mut update,
+                            );
+                        }
+                    }
                     Ok((protocol::C_RESIZE, payload)) => {
-                        // Real client attach — detach old client first
-                        if let Some(ref mut old) = client {
-                            let _ = protocol::write_msg(&mut old.writer, protocol::S_DETACHED, &[]);
-                        }
-                        client = None;
-
-                        // Apply the initial terminal size
+                        // Legacy client attach — always steal mode
                         if let Some((w, h)) = protocol::decode_resize(&payload) {
-                            tw = w;
-                            th = h;
-                            drag = None;
-                            super::resize_all(&mut panes, &layout, tw, th, &settings);
-                            if let Some(zpid) = zoomed_pane {
-                                super::resize_zoomed_pane(&mut panes, zpid, tw, th, &settings);
-                            }
-                        }
-
-                        // Set up new client with a read timeout on the reader socket
-                        // so it doesn't block forever when client is replaced later
-                        if let Ok(read_conn) = conn.try_clone() {
-                            // No read timeout — client may be idle for long periods.
-                            // Thread exits when socket is closed (client disconnect).
-                            conn.set_read_timeout(None).ok();
-                            let (msg_tx, msg_rx) = mpsc::channel();
-                            std::thread::spawn(move || {
-                                client_reader(read_conn, msg_tx);
-                            });
-                            client = Some(ClientConn {
-                                writer: std::io::BufWriter::new(conn),
-                                event_rx: msg_rx,
-                            });
-                            // Force full redraw for new client
-                            update.mark_all(&layout);
-                            update.border_dirty = true;
+                            accept_client(
+                                conn,
+                                w,
+                                h,
+                                protocol::AttachMode::Steal,
+                                &mut clients,
+                                &mut panes,
+                                &layout,
+                                &settings,
+                                &mut tw,
+                                &mut th,
+                                &mut drag,
+                                zoomed_pane,
+                                &mut update,
+                            );
                         }
                     }
                     _ => {
@@ -472,15 +571,25 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
             }
         }
 
-        // ── Process client events ──
-        let mut client_disconnected = false;
-        let mut detach_requested = false;
+        // ── Process client events from all clients ──
+        let mut detach_ids: Vec<u64> = Vec::new();
+        let mut disconnect_ids: Vec<u64> = Vec::new();
+        let mut kill_requested = false;
+        let mut detach_all = false; // Set by Ctrl+B d via process_key
         let mut tab_action = TabAction::None;
+        let mut size_changed = false;
         let current_tab_names = tab_mgr.tab_names(&tab_name);
-        if let Some(ref c) = client {
+
+        for client in &mut clients {
+            let client_mode = client.mode;
+            let client_id = client.id;
             loop {
-                match c.event_rx.try_recv() {
+                match client.event_rx.try_recv() {
                     Ok(ClientMsg::Event(event)) => {
+                        // Readonly clients cannot send input
+                        if client_mode == protocol::AttachMode::Readonly {
+                            continue;
+                        }
                         process_event(
                             event,
                             &mut mode,
@@ -501,50 +610,66 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                             th,
                             effective_scrollback,
                             &border_cache,
-                            &mut detach_requested,
+                            &mut detach_all,
                             &mut tab_action,
                             &current_tab_names,
                             prefix_key,
                         );
                     }
                     Ok(ClientMsg::Resize(w, h)) => {
-                        tw = w;
-                        th = h;
-                        drag = None;
-                        super::resize_all(&mut panes, &layout, tw, th, &settings);
-                        if let Some(zpid) = zoomed_pane {
-                            super::resize_zoomed_pane(&mut panes, zpid, tw, th, &settings);
-                        }
-                        update.mark_all(&layout);
-                        update.border_dirty = true;
+                        client.tw = w;
+                        client.th = h;
+                        size_changed = true;
                     }
                     Ok(ClientMsg::Detach) => {
-                        // Protocol-level detach request → send ack
-                        detach_requested = true;
+                        detach_ids.push(client_id);
                         break;
                     }
                     Ok(ClientMsg::Disconnected) => {
-                        client_disconnected = true;
+                        disconnect_ids.push(client_id);
                         break;
                     }
                     Ok(ClientMsg::Kill) => {
-                        // Kill all panes and exit
-                        for pane in panes.values_mut() {
-                            pane.kill();
-                        }
-                        if let Some(ref mut c) = client {
-                            let _ = protocol::write_msg(&mut c.writer, protocol::S_EXIT, &[]);
-                        }
-                        session::cleanup(session_name);
-                        ipc::cleanup();
-                        return Ok(());
+                        kill_requested = true;
+                        break;
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
-                        client_disconnected = true;
+                        disconnect_ids.push(client_id);
                         break;
                     }
                 }
+            }
+            if kill_requested {
+                break;
+            }
+        }
+
+        if kill_requested {
+            for pane in panes.values_mut() {
+                pane.kill();
+            }
+            for c in &mut clients {
+                let _ = protocol::write_msg(&mut c.writer, protocol::S_EXIT, &[]);
+            }
+            session::cleanup(session_name);
+            ipc::cleanup();
+            return Ok(());
+        }
+
+        // Handle per-client resize
+        if size_changed {
+            let (ew, eh) = effective_size(&clients);
+            if ew != tw || eh != th {
+                tw = ew;
+                th = eh;
+                drag = None;
+                super::resize_all(&mut panes, &layout, tw, th, &settings);
+                if let Some(zpid) = zoomed_pane {
+                    super::resize_zoomed_pane(&mut panes, zpid, tw, th, &settings);
+                }
+                update.mark_all(&layout);
+                update.border_dirty = true;
             }
         }
 
@@ -556,13 +681,72 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
             }
         }
 
-        if detach_requested {
-            if let Some(ref mut c) = client {
-                let _ = protocol::write_msg(&mut c.writer, protocol::S_DETACHED, &[]);
+        // detach_all (from Ctrl+B d): in steal mode, detach all clients.
+        // In shared/readonly mode, only detach writable clients (the ones that
+        // could have triggered the detach).
+        if detach_all {
+            for c in &clients {
+                if c.mode != protocol::AttachMode::Readonly {
+                    detach_ids.push(c.id);
+                }
             }
-            client = None;
-        } else if client_disconnected {
-            client = None;
+        }
+
+        // Handle detach/disconnect — auto-save when last client leaves
+        let had_clients = !clients.is_empty();
+        for id in &detach_ids {
+            if let Some(pos) = clients.iter().position(|c| c.id == *id) {
+                let _ = protocol::write_msg(&mut clients[pos].writer, protocol::S_DETACHED, &[]);
+                clients.remove(pos);
+            }
+        }
+        for id in &disconnect_ids {
+            if let Some(pos) = clients.iter().position(|c| c.id == *id) {
+                clients.remove(pos);
+            }
+        }
+        // Recompute effective size after any client changes
+        if !detach_ids.is_empty() || !disconnect_ids.is_empty() {
+            let (ew, eh) = effective_size(&clients);
+            if ew != tw || eh != th {
+                tw = ew;
+                th = eh;
+                drag = None;
+                super::resize_all(&mut panes, &layout, tw, th, &settings);
+                if let Some(zpid) = zoomed_pane {
+                    super::resize_zoomed_pane(&mut panes, zpid, tw, th, &settings);
+                }
+                update.mark_all(&layout);
+                update.border_dirty = true;
+            }
+        }
+
+        if had_clients
+            && clients.is_empty()
+            && (!detach_ids.is_empty() || !disconnect_ids.is_empty())
+        {
+            // All clients gone — auto-save and reset input state
+            let snapshot = WorkspaceSnapshot::from_live(
+                &tab_mgr,
+                &tab_name,
+                &layout,
+                &panes,
+                active,
+                zoomed_pane,
+                broadcast,
+                &restart_policies,
+                &default_shell,
+                settings.border_style,
+                settings.show_status_bar,
+                settings.show_tab_bar,
+                effective_scrollback,
+            );
+            workspace::auto_save(session_name, &snapshot);
+            mode = InputMode::Normal;
+            drag = None;
+            selection_anchor = None;
+            text_selection = None;
+            last_click = None;
         }
 
         // ── Handle tab actions ──
@@ -617,6 +801,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                         ));
                         update.mark_all(&layout);
                         update.border_dirty = true;
+                        tab_names_dirty = true;
                     }
                     Err(_) => {
                         // Spawn failed — revert: close this empty tab and restore previous
@@ -639,6 +824,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                             ));
                             update.mark_all(&layout);
                             update.border_dirty = true;
+                            tab_names_dirty = true;
                         }
                     }
                 }
@@ -688,6 +874,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                         ));
                         update.mark_all(&layout);
                         update.border_dirty = true;
+                        tab_names_dirty = true;
                     }
                 }
             }
@@ -720,18 +907,20 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                         ));
                         update.mark_all(&layout);
                         update.border_dirty = true;
+                        tab_names_dirty = true;
                     }
                 }
             }
             TabAction::Rename(new_name) => {
                 tab_name = new_name;
                 update.full_redraw = true;
+                tab_names_dirty = true;
             }
             TabAction::KillSession => {
                 // Kill all panes in all tabs
                 super::kill_all_panes(&mut panes);
                 tab_mgr.kill_all_inactive();
-                if let Some(ref mut c) = client {
+                for c in &mut clients {
                     let _ = protocol::write_msg(&mut c.writer, protocol::S_EXIT, &[]);
                 }
                 session::cleanup(session_name);
@@ -744,6 +933,105 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
         // ── Handle IPC commands ──
         if let Some(ref rx) = ipc_rx {
             while let Ok((cmd, resp_tx)) = rx.try_recv() {
+                // Intercept Save/Load to use full-session snapshots (with all tabs)
+                if let ipc::IpcRequest::Save { ref path } = cmd {
+                    let snapshot = WorkspaceSnapshot::from_live(
+                        &tab_mgr,
+                        &tab_name,
+                        &layout,
+                        &panes,
+                        active,
+                        zoomed_pane,
+                        broadcast,
+                        &restart_policies,
+                        &default_shell,
+                        settings.border_style,
+                        settings.show_status_bar,
+                        settings.show_tab_bar,
+                        effective_scrollback,
+                    );
+                    let response = match workspace::save_snapshot(path, &snapshot) {
+                        Ok(()) => ipc::IpcResponse::success(format!("saved {}", path)),
+                        Err(error) => ipc::IpcResponse::error(error.to_string()),
+                    };
+                    let _ = resp_tx.send(response);
+                    continue;
+                }
+
+                // Intercept Load for full-session restore (all tabs)
+                if let ipc::IpcRequest::Load { ref path } = cmd {
+                    let load_result: anyhow::Result<()> = (|| {
+                        let snapshot = workspace::load_snapshot(path)?;
+                        let snap_scrollback = snapshot.scrollback;
+
+                        // Kill current session
+                        super::kill_all_panes(&mut panes);
+                        tab_mgr.kill_all_inactive();
+
+                        default_shell = snapshot.shell.clone();
+                        settings = Settings::new(snapshot.border_style);
+                        settings.show_status_bar = snapshot.show_status_bar;
+                        settings.show_tab_bar = snapshot.show_tab_bar;
+
+                        // Spawn all tabs in order
+                        let mut all_tabs: Vec<Tab> = Vec::new();
+                        for tab_snap in &snapshot.tabs {
+                            let tp = super::spawn_snapshot_panes(
+                                &tab_snap.layout,
+                                tab_snap,
+                                &default_shell,
+                                tw,
+                                th,
+                                &settings,
+                                snap_scrollback,
+                            )?;
+                            let mut tr = HashMap::new();
+                            for ps in &tab_snap.panes {
+                                if ps.restart != project::RestartPolicy::Never {
+                                    tr.insert(ps.id, ps.restart.clone());
+                                }
+                            }
+                            let mut tab = Tab::new(
+                                tab_snap.name.clone(),
+                                tab_snap.layout.clone(),
+                                tp,
+                                tab_snap.active_pane,
+                            );
+                            tab.restart_policies = tr;
+                            tab.zoomed_pane = tab_snap.zoomed_pane;
+                            tab.broadcast = tab_snap.broadcast;
+                            all_tabs.push(tab);
+                        }
+
+                        let (new_mgr, active_tab) =
+                            TabManager::from_tabs(all_tabs, snapshot.active_tab);
+                        tab_mgr = new_mgr;
+                        tab_name = active_tab.name;
+                        layout = active_tab.layout;
+                        panes = active_tab.panes;
+                        active = active_tab.active_pane;
+                        restart_policies = active_tab.restart_policies;
+                        restart_state = active_tab.restart_state;
+                        zoomed_pane = active_tab.zoomed_pane;
+                        broadcast = active_tab.broadcast;
+                        tab_names_dirty = true;
+                        Ok(())
+                    })();
+
+                    match load_result {
+                        Ok(()) => {
+                            update.mark_all(&layout);
+                            update.border_dirty = true;
+                            let _ =
+                                resp_tx.send(ipc::IpcResponse::success(format!("loaded {}", path)));
+                        }
+                        Err(e) => {
+                            let _ = resp_tx.send(ipc::IpcResponse::error(e.to_string()));
+                        }
+                    }
+                    continue;
+                }
+
                 let (response, mut ipc_update) = super::handle_ipc_command(
                     cmd,
                     &mut layout,
@@ -776,62 +1064,89 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
             super::resize_zoomed_pane(&mut panes, active, tw, th, &settings);
         }
 
-        if update.needs_render() {
-            if let Some(ref mut c) = client {
-                if let Some(ref cache) = border_cache {
-                    // Sync scrollback
-                    for pane in panes.values_mut() {
-                        pane.sync_scrollback();
-                    }
-
-                    render_buf.clear();
-                    let tabs = tab_mgr.tab_names(&tab_name);
-                    let render_result = render_frame_to_buf(
-                        &mut render_buf,
-                        &panes,
-                        &layout,
-                        active,
-                        &settings,
-                        tw,
-                        th,
-                        drag.is_some(),
-                        cache,
-                        &update.dirty_panes,
-                        update.full_redraw,
-                        &mode,
-                        broadcast,
-                        &text_selection,
-                        zoomed_pane,
-                        &default_shell,
-                        &tabs,
-                    );
-
-                    // Reset scrollback
-                    for pane in panes.values_mut() {
-                        pane.reset_scrollback_view();
-                    }
-
-                    if render_result.is_ok()
-                        && !render_buf.is_empty()
-                        && protocol::write_msg(&mut c.writer, protocol::S_OUTPUT, &render_buf)
-                            .is_err()
-                    {
-                        client = None;
-                    }
+        let render_needed = update.needs_render();
+        if render_needed && !clients.is_empty() {
+            if let Some(ref cache) = border_cache {
+                if tab_names_dirty {
+                    tab_names_cache = tab_mgr.tab_names(&tab_name);
+                    tab_names_dirty = false;
                 }
-            } else {
-                // No client — just reset scrollback
-                for pane in panes.values_mut() {
-                    pane.sync_scrollback();
-                    pane.reset_scrollback_view();
+
+                let sel_for_render = text_selection.as_ref().map(|s| {
+                    let (sr, sc, er, ec) = s.normalized();
+                    (s.pane_id, sr, sc, er, ec)
+                });
+                let needs_selection_chars =
+                    zoomed_pane.is_none() && settings.show_status_bar && text_selection.is_some();
+                let render_targets = super::collect_render_targets(
+                    &panes,
+                    &update.dirty_panes,
+                    update.full_redraw,
+                    zoomed_pane,
+                    needs_selection_chars
+                        .then(|| text_selection.as_ref().map(|s| s.pane_id))
+                        .flatten(),
+                );
+                super::sync_render_targets(&mut panes, &render_targets);
+                let selection_chars = if needs_selection_chars {
+                    super::selection_char_count_from_synced(&panes, sel_for_render)
+                } else {
+                    0
+                };
+
+                // Render once (smallest-client policy: all clients see the same frame)
+                render_buf.clear();
+                let render_result = render_frame_to_buf(
+                    &mut render_buf,
+                    &panes,
+                    &layout,
+                    active,
+                    &settings,
+                    tw,
+                    th,
+                    drag.is_some(),
+                    cache,
+                    &update.dirty_panes,
+                    update.full_redraw,
+                    &mode,
+                    broadcast,
+                    sel_for_render,
+                    selection_chars,
+                    zoomed_pane,
+                    &default_shell,
+                    &tab_names_cache,
+                );
+
+                super::reset_render_targets(&mut panes, &render_targets);
+
+                // Broadcast frame to all clients; remove failed ones
+                if render_result.is_ok() && !render_buf.is_empty() {
+                    clients.retain_mut(|c| {
+                        if protocol::write_msg(&mut c.writer, protocol::S_OUTPUT, &render_buf)
+                            .is_err()
+                        {
+                            // Try to send detach ack before dropping
+                            let _ = protocol::write_msg(&mut c.writer, protocol::S_DETACHED, &[]);
+                            false
+                        } else {
+                            true
+                        }
+                    });
                 }
             }
         }
 
         // Block until any event source wakes us, or timeout.
-        // With client: 8ms max (frame budget for smooth rendering).
+        // With clients: 2ms when we just rendered (active I/O), 8ms idle.
         // Headless: 20ms (responsive to PING probes for session discovery).
-        let timeout_ms = if client.is_some() { 8 } else { 20 };
+        let rendered_this_frame = render_needed;
+        let timeout_ms = if clients.is_empty() {
+            20
+        } else if rendered_this_frame {
+            2
+        } else {
+            8
+        };
         let _ = wake_rx.recv_timeout(Duration::from_millis(timeout_ms));
         // Drain accumulated wake signals
         while wake_rx.try_recv().is_ok() {}
@@ -874,6 +1189,66 @@ fn client_reader(stream: UnixStream, tx: mpsc::Sender<ClientMsg>) {
     }
 }
 
+/// Accept a new client connection, handling steal/shared/readonly modes.
+#[allow(clippy::too_many_arguments)]
+fn accept_client(
+    conn: UnixStream,
+    new_w: u16,
+    new_h: u16,
+    mode: protocol::AttachMode,
+    clients: &mut Vec<ConnectedClient>,
+    panes: &mut HashMap<usize, Pane>,
+    layout: &Layout,
+    settings: &Settings,
+    tw: &mut u16,
+    th: &mut u16,
+    drag: &mut Option<DragState>,
+    zoomed_pane: Option<usize>,
+    update: &mut RenderUpdate,
+) {
+    // Steal mode: detach all existing clients
+    if mode == protocol::AttachMode::Steal {
+        for c in clients.iter_mut() {
+            let _ = protocol::write_msg(&mut c.writer, protocol::S_DETACHED, &[]);
+        }
+        clients.clear();
+    }
+
+    // Set up the new client
+    if let Ok(read_conn) = conn.try_clone() {
+        conn.set_read_timeout(None).ok();
+        let (msg_tx, msg_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            client_reader(read_conn, msg_tx);
+        });
+        let client_id = NEXT_CLIENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        clients.push(ConnectedClient {
+            id: client_id,
+            writer: std::io::BufWriter::new(conn),
+            event_rx: msg_rx,
+            mode,
+            tw: new_w,
+            th: new_h,
+        });
+    }
+
+    // Recompute effective size and resize panes
+    let (ew, eh) = effective_size(clients);
+    if ew != *tw || eh != *th {
+        *tw = ew;
+        *th = eh;
+        *drag = None;
+        super::resize_all(panes, layout, *tw, *th, settings);
+        if let Some(zpid) = zoomed_pane {
+            super::resize_zoomed_pane(panes, zpid, *tw, *th, settings);
+        }
+    }
+
+    // Force full redraw for new client
+    update.mark_all(layout);
+    update.border_dirty = true;
+}
+
 /// Render a full frame to a byte buffer (instead of stdout).
 #[allow(clippy::too_many_arguments)]
 fn render_frame_to_buf(
@@ -890,7 +1265,8 @@ fn render_frame_to_buf(
     full_redraw: bool,
     mode: &InputMode,
     broadcast: bool,
-    text_selection: &Option<TextSelection>,
+    selection: render::PaneSelection,
+    selection_chars: usize,
     zoomed_pane: Option<usize>,
     default_shell: &str,
     tab_names: &[(usize, String, bool)],
@@ -912,8 +1288,8 @@ fn render_frame_to_buf(
 
     if let Some(zpid) = zoomed_pane {
         queue!(buf, terminal::BeginSynchronizedUpdate)?;
-        let ids = layout.pane_ids();
-        let pane_idx = ids.iter().position(|&id| id == zpid).unwrap_or(0);
+        let pane_order = border_cache.pane_order();
+        let pane_idx = pane_order.iter().position(|&id| id == zpid).unwrap_or(0);
         let label = panes
             .get(&zpid)
             .map(|p| p.launch_label(default_shell))
@@ -942,7 +1318,7 @@ fn render_frame_to_buf(
                 tw,
                 th,
                 pane_idx,
-                ids.len(),
+                pane_order.len(),
                 zoom_label,
                 pane_name,
                 0,
@@ -950,27 +1326,6 @@ fn render_frame_to_buf(
         }
         queue!(buf, terminal::EndSynchronizedUpdate)?;
     } else {
-        let sel_for_render = text_selection.as_ref().map(|s| {
-            let (sr, sc, er, ec) = s.normalized();
-            (s.pane_id, sr, sc, er, ec)
-        });
-        let sel_chars = text_selection
-            .as_ref()
-            .and_then(|sel| {
-                panes.get(&sel.pane_id).map(|pane| {
-                    let text = super::extract_selected_text(
-                        pane.screen(),
-                        sel.pane_id,
-                        sel.start_row,
-                        sel.start_col,
-                        sel.end_row,
-                        sel.end_col,
-                    );
-                    text.chars().count()
-                })
-            })
-            .unwrap_or(0);
-
         queue!(buf, terminal::BeginSynchronizedUpdate)?;
         render::render_panes(
             buf,
@@ -985,7 +1340,7 @@ fn render_frame_to_buf(
             border_cache,
             dirty_panes,
             full_redraw,
-            sel_for_render,
+            selection,
             broadcast,
         )?;
         let is_text_input = matches!(
@@ -993,30 +1348,33 @@ fn render_frame_to_buf(
             InputMode::RenameTab { .. } | InputMode::CommandPalette { .. }
         );
         // Status bar (skip if text input mode will draw over it)
-        if !is_text_input && settings.show_status_bar && (!mode_label.is_empty() || sel_chars > 0) {
-            let ids = layout.pane_ids();
-            let active_idx = ids.iter().position(|&id| id == active).unwrap_or(0);
+        if !is_text_input
+            && settings.show_status_bar
+            && (!mode_label.is_empty() || selection_chars > 0)
+        {
+            let pane_order = border_cache.pane_order();
+            let active_idx = pane_order.iter().position(|&id| id == active).unwrap_or(0);
             let pane_name = panes.get(&active).and_then(|p| p.name()).unwrap_or("");
             render::draw_status_bar_full(
                 buf,
                 tw,
                 th,
                 active_idx,
-                ids.len(),
+                pane_order.len(),
                 mode_label,
                 pane_name,
-                sel_chars,
+                selection_chars,
             )?;
         }
         if settings.visible {
-            settings.render_overlay(buf, tw, th)?;
+            settings.render_overlay(buf, tw, th, broadcast)?;
             queue!(buf, cursor::Hide)?;
         }
         queue!(buf, terminal::EndSynchronizedUpdate)?;
     }
 
-    // Tab bar (only when multiple tabs exist)
-    if tab_names.len() > 1 {
+    // Tab bar (only when multiple tabs exist and show_tab_bar is enabled)
+    if tab_names.len() > 1 && settings.show_tab_bar {
         render::draw_tab_bar(buf, tw, th, tab_names, settings.show_status_bar)?;
     }
 
@@ -1655,44 +2013,15 @@ fn process_key(
     } else if settings.visible {
         let prev_border = settings.border_style;
         let prev_status = settings.show_status_bar;
+        let prev_tab_bar = settings.show_tab_bar;
         let action = settings.handle_key(key);
-        match action {
-            SettingsAction::SplitH => {
-                let _ = super::do_split(
-                    layout,
-                    panes,
-                    *active,
-                    Direction::Horizontal,
-                    default_shell,
-                    tw,
-                    th,
-                    settings,
-                    scrollback,
-                );
-                update.mark_all(layout);
-                update.border_dirty = true;
-            }
-            SettingsAction::SplitV => {
-                let _ = super::do_split(
-                    layout,
-                    panes,
-                    *active,
-                    Direction::Vertical,
-                    default_shell,
-                    tw,
-                    th,
-                    settings,
-                    scrollback,
-                );
-                update.mark_all(layout);
-                update.border_dirty = true;
-            }
-            _ => {}
+        if action == SettingsAction::BroadcastToggle {
+            *broadcast = !*broadcast;
         }
         if settings.border_style != prev_border {
             update.full_redraw = true;
         }
-        if settings.show_status_bar != prev_status {
+        if settings.show_status_bar != prev_status || settings.show_tab_bar != prev_tab_bar {
             super::resize_all(panes, layout, tw, th, settings);
             update.border_dirty = true;
             update.mark_all(layout);
@@ -1760,21 +2089,29 @@ fn process_key(
             }
         }
     } else if key.code == KeyCode::Enter && panes.get(active).is_some_and(|p| !p.is_alive()) {
-        let launch = panes
+        let (launch, old_name, pane_shell) = panes
             .get(active)
-            .map(|p| p.launch().clone())
-            .unwrap_or(PaneLaunch::Shell);
-        let _ = super::replace_pane(
-            panes,
-            layout,
-            *active,
-            launch,
-            default_shell,
-            tw,
-            th,
-            settings,
-            scrollback,
-        );
+            .map(|p| {
+                (
+                    p.launch().clone(),
+                    p.name().map(String::from),
+                    p.initial_shell().map(String::from),
+                )
+            })
+            .unwrap_or((PaneLaunch::Shell, None, None));
+        let eff_shell = pane_shell.as_deref().unwrap_or(default_shell);
+        if super::replace_pane(
+            panes, layout, *active, launch, eff_shell, tw, th, settings, scrollback,
+        )
+        .is_ok()
+        {
+            if let Some(pane) = panes.get_mut(active) {
+                pane.set_name(old_name);
+                if let Some(ref s) = pane_shell {
+                    pane.set_initial_shell(Some(s.clone()));
+                }
+            }
+        }
         update.dirty_panes.insert(*active);
     } else if *broadcast {
         for pane in panes.values_mut() {
@@ -1968,49 +2305,24 @@ fn process_mouse(
             if settings.visible {
                 let prev_border = settings.border_style;
                 let prev_status = settings.show_status_bar;
+                let prev_tab_bar = settings.show_tab_bar;
                 let action = settings.handle_click(mouse.column, mouse.row, tw, th);
-                match action {
-                    SettingsAction::SplitH => {
-                        let _ = super::do_split(
-                            layout,
-                            panes,
-                            *active,
-                            Direction::Horizontal,
-                            default_shell,
-                            tw,
-                            th,
-                            settings,
-                            scrollback,
-                        );
-                        update.mark_all(layout);
-                        update.border_dirty = true;
-                    }
-                    SettingsAction::SplitV => {
-                        let _ = super::do_split(
-                            layout,
-                            panes,
-                            *active,
-                            Direction::Vertical,
-                            default_shell,
-                            tw,
-                            th,
-                            settings,
-                            scrollback,
-                        );
-                        update.mark_all(layout);
-                        update.border_dirty = true;
-                    }
-                    SettingsAction::Changed | SettingsAction::Close | SettingsAction::None => {}
+                if action == SettingsAction::BroadcastToggle {
+                    *broadcast = !*broadcast;
                 }
                 if settings.border_style != prev_border {
                     update.full_redraw = true;
                 }
-                if settings.show_status_bar != prev_status {
+                if settings.show_status_bar != prev_status || settings.show_tab_bar != prev_tab_bar
+                {
                     super::resize_all(panes, layout, tw, th, settings);
                     update.border_dirty = true;
                     update.mark_all(layout);
                 }
-                if action == SettingsAction::Changed || action == SettingsAction::Close {
+                if action == SettingsAction::Changed
+                    || action == SettingsAction::Close
+                    || action == SettingsAction::BroadcastToggle
+                {
                     update.full_redraw = true;
                 }
             } else if let Some(action) =

@@ -16,6 +16,8 @@ pub const C_RESIZE: u8 = 0x03;
 pub const C_KILL: u8 = 0x04;
 /// Lightweight liveness probe (sent by `ezpn ls`). No side effects.
 pub const C_PING: u8 = 0x05;
+/// Client attach with mode. Payload = JSON `AttachRequest`.
+pub const C_ATTACH: u8 = 0x06;
 
 // ── Server → Client tags ──
 
@@ -83,4 +85,66 @@ pub fn decode_resize(payload: &[u8]) -> Option<(u16, u16)> {
     let cols = u16::from_be_bytes([payload[0], payload[1]]);
     let rows = u16::from_be_bytes([payload[2], payload[3]]);
     Some((cols, rows))
+}
+
+/// How a client wants to attach to a session.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachMode {
+    /// Default: detach any existing client (legacy behavior).
+    #[default]
+    Steal,
+    /// Shared session: all clients can send input and see output.
+    Shared,
+    /// Read-only: client can only observe, no input forwarded.
+    Readonly,
+}
+
+/// Attach request sent by C_ATTACH.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct AttachRequest {
+    pub cols: u16,
+    pub rows: u16,
+    pub mode: AttachMode,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attach_request_round_trip() {
+        let req = AttachRequest {
+            cols: 120,
+            rows: 40,
+            mode: AttachMode::Shared,
+        };
+        let json = serde_json::to_vec(&req).unwrap();
+        let decoded: AttachRequest = serde_json::from_slice(&json).unwrap();
+        assert_eq!(decoded.cols, 120);
+        assert_eq!(decoded.rows, 40);
+        assert_eq!(decoded.mode, AttachMode::Shared);
+    }
+
+    #[test]
+    fn attach_mode_default_is_steal() {
+        assert_eq!(AttachMode::default(), AttachMode::Steal);
+    }
+
+    #[test]
+    fn resize_encode_decode() {
+        let encoded = encode_resize(200, 50);
+        let (cols, rows) = decode_resize(&encoded).unwrap();
+        assert_eq!(cols, 200);
+        assert_eq!(rows, 50);
+    }
+
+    #[test]
+    fn framed_message_round_trip() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_msg(&mut buf, C_EVENT, b"hello").unwrap();
+        let (tag, payload) = read_msg(&mut buf.as_slice()).unwrap();
+        assert_eq!(tag, C_EVENT);
+        assert_eq!(payload, b"hello");
+    }
 }

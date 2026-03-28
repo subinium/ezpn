@@ -66,6 +66,24 @@ impl TabManager {
         }
     }
 
+    /// Build a TabManager from an ordered list of tabs, with one designated as active.
+    /// The active tab is removed from the list and returned for the caller to unpack.
+    /// All other tabs go into storage in their original order.
+    pub fn from_tabs(mut tabs: Vec<Tab>, active_idx: usize) -> (Self, Tab) {
+        assert!(!tabs.is_empty());
+        let active_idx = active_idx.min(tabs.len() - 1);
+        let active_tab = tabs.remove(active_idx);
+        let count = tabs.len() + 1; // +1 for the unpacked active tab
+        let next_id = count + 1;
+        let mgr = Self {
+            tabs,
+            active_idx,
+            count,
+            next_id,
+        };
+        (mgr, active_tab)
+    }
+
     /// Save the currently active tab's state and switch to a different tab.
     /// Returns the target tab's state to be unpacked by the caller.
     pub fn switch_to(&mut self, target_idx: usize, current: Tab) -> Option<Tab> {
@@ -157,6 +175,22 @@ impl TabManager {
                 pane.kill();
             }
         }
+    }
+
+    /// Get an inactive tab by its logical index.
+    /// Returns `None` if the index is the active tab or out of bounds.
+    pub fn get_inactive(&self, logical_idx: usize) -> Option<&Tab> {
+        if logical_idx == self.active_idx || logical_idx >= self.count {
+            return None;
+        }
+        // Storage has count-1 elements with a gap at active_idx.
+        // Logical indices below active_idx map directly; those above map to (idx - 1).
+        let storage_idx = if logical_idx < self.active_idx {
+            logical_idx
+        } else {
+            logical_idx - 1
+        };
+        self.tabs.get(storage_idx)
     }
 
     /// Get all tab names in order. The active tab is marked with index.
@@ -344,5 +378,52 @@ mod tests {
         let names = mgr.tab_names("active-0");
         assert_eq!(names[0], (0, "active-0".to_string(), true));
         assert_eq!(names[1], (1, "B-saved".to_string(), false));
+    }
+
+    #[test]
+    fn from_tabs_preserves_order() {
+        let tabs = vec![dummy_tab("A"), dummy_tab("B"), dummy_tab("C")];
+        let (mgr, active) = TabManager::from_tabs(tabs, 1); // B is active
+        assert_eq!(active.name, "B");
+        assert_eq!(mgr.count, 3);
+        assert_eq!(mgr.active_idx, 1);
+
+        // Verify tab order: A at 0, B (unpacked), C at 2
+        let names = mgr.tab_names("B");
+        assert_eq!(names[0], (0, "A".to_string(), false));
+        assert_eq!(names[1], (1, "B".to_string(), true));
+        assert_eq!(names[2], (2, "C".to_string(), false));
+    }
+
+    #[test]
+    fn from_tabs_active_at_zero() {
+        let tabs = vec![dummy_tab("X"), dummy_tab("Y")];
+        let (mgr, active) = TabManager::from_tabs(tabs, 0);
+        assert_eq!(active.name, "X");
+        assert_eq!(mgr.active_idx, 0);
+        let names = mgr.tab_names("X");
+        assert_eq!(names[0], (0, "X".to_string(), true));
+        assert_eq!(names[1], (1, "Y".to_string(), false));
+    }
+
+    #[test]
+    fn from_tabs_active_at_last() {
+        let tabs = vec![dummy_tab("A"), dummy_tab("B"), dummy_tab("C")];
+        let (mgr, active) = TabManager::from_tabs(tabs, 2);
+        assert_eq!(active.name, "C");
+        assert_eq!(mgr.active_idx, 2);
+        let names = mgr.tab_names("C");
+        assert_eq!(names[0], (0, "A".to_string(), false));
+        assert_eq!(names[1], (1, "B".to_string(), false));
+        assert_eq!(names[2], (2, "C".to_string(), true));
+    }
+
+    #[test]
+    fn from_tabs_single() {
+        let tabs = vec![dummy_tab("only")];
+        let (mgr, active) = TabManager::from_tabs(tabs, 0);
+        assert_eq!(active.name, "only");
+        assert_eq!(mgr.count, 1);
+        assert_eq!(mgr.active_idx, 0);
     }
 }

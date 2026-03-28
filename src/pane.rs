@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::OnceLock;
@@ -22,6 +23,8 @@ pub fn wake_main_loop() {
         let _ = tx.send(());
     }
 }
+use std::path::PathBuf;
+
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 
@@ -49,6 +52,12 @@ pub struct Pane {
     bracketed_paste: bool,
     /// Whether the child has requested focus events (\x1b[?1004h).
     focus_events: bool,
+    /// The working directory this pane was launched with.
+    initial_cwd: Option<PathBuf>,
+    /// Custom env vars this pane was launched with.
+    initial_env: HashMap<String, String>,
+    /// Custom shell override for this pane (if different from default).
+    initial_shell: Option<String>,
 }
 
 impl Pane {
@@ -176,6 +185,9 @@ impl Pane {
             osc52_pending: Vec::new(),
             bracketed_paste: false,
             focus_events: false,
+            initial_cwd: cwd.map(|p| p.to_path_buf()),
+            initial_env: env.clone(),
+            initial_shell: None,
         })
     }
 
@@ -394,6 +406,73 @@ impl Pane {
     /// Whether the child has requested focus events.
     pub fn wants_focus(&self) -> bool {
         self.focus_events
+    }
+
+    /// The working directory this pane was launched with.
+    pub fn initial_cwd(&self) -> Option<&std::path::Path> {
+        self.initial_cwd.as_deref()
+    }
+
+    /// Custom env vars this pane was launched with.
+    pub fn initial_env(&self) -> &HashMap<String, String> {
+        &self.initial_env
+    }
+
+    /// Custom shell override for this pane.
+    pub fn initial_shell(&self) -> Option<&str> {
+        self.initial_shell.as_deref()
+    }
+
+    /// Set the custom shell for this pane (for snapshot purposes).
+    pub fn set_initial_shell(&mut self, shell: Option<String>) {
+        self.initial_shell = shell;
+    }
+
+    /// Try to get the current working directory of the child process.
+    /// Falls back to the initial cwd if the child has exited.
+    #[cfg(target_os = "macos")]
+    pub fn live_cwd(&self) -> Option<PathBuf> {
+        if self.alive {
+            if let Some(pid) = self.child.process_id() {
+                // Use proc_pidinfo on macOS
+                let mut vinfo: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+                let ret = unsafe {
+                    libc::proc_pidinfo(
+                        pid as libc::c_int,
+                        libc::PROC_PIDVNODEPATHINFO,
+                        0,
+                        &mut vinfo as *mut _ as *mut libc::c_void,
+                        std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int,
+                    )
+                };
+                if ret > 0 {
+                    let cstr = unsafe {
+                        std::ffi::CStr::from_ptr(vinfo.pvi_cdir.vip_path.as_ptr() as *const i8)
+                    };
+                    if let Ok(s) = cstr.to_str() {
+                        if !s.is_empty() {
+                            return Some(PathBuf::from(s));
+                        }
+                    }
+                }
+            }
+        }
+        self.initial_cwd.clone()
+    }
+
+    /// Try to get the current working directory of the child process.
+    /// Falls back to the initial cwd if the child has exited.
+    #[cfg(not(target_os = "macos"))]
+    pub fn live_cwd(&self) -> Option<PathBuf> {
+        if self.alive {
+            if let Some(pid) = self.child.process_id() {
+                let link = format!("/proc/{}/cwd", pid);
+                if let Ok(cwd) = std::fs::read_link(&link) {
+                    return Some(cwd);
+                }
+            }
+        }
+        self.initial_cwd.clone()
     }
 }
 

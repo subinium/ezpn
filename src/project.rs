@@ -19,7 +19,7 @@
 //! cwd = "./frontend"
 //! ```
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -41,7 +41,7 @@ pub struct WorkspaceSection {
     pub cols: Option<usize>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RestartPolicy {
     #[default]
