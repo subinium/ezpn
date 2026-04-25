@@ -51,11 +51,26 @@ pub fn run_with_mode(
     // Start reader thread: server → client
     let (server_tx, server_rx) = mpsc::channel::<(u8, Vec<u8>)>();
     std::thread::spawn(move || {
-        let mut reader = BufReader::new(read_stream);
-        while let Ok(msg) = protocol::read_msg(&mut reader) {
-            if server_tx.send(msg).is_err() {
-                break;
+        // Isolate reader panics so the client UI shuts down cleanly instead of
+        // aborting (which would leave the host terminal in raw mode).
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut reader = BufReader::new(read_stream);
+            while let Ok(msg) = protocol::read_msg(&mut reader) {
+                if server_tx.send(msg).is_err() {
+                    break;
+                }
             }
+        }));
+        if let Err(payload) = result {
+            let reason = match payload.downcast_ref::<&'static str>() {
+                Some(s) => (*s).to_string(),
+                None => match payload.downcast_ref::<String>() {
+                    Some(s) => s.clone(),
+                    None => "unknown panic payload".to_string(),
+                },
+            };
+            eprintln!("ezpn: client reader thread panicked: {}", reason);
+            // server_tx drops here → main loop sees Disconnected and exits cleanly.
         }
     });
 

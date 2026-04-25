@@ -2360,7 +2360,21 @@ pub(crate) fn spawn_layout_panes(
             })
             .collect();
         for handle in handles {
-            results.push(handle.join().expect("pane spawn thread panicked"));
+            match handle.join() {
+                Ok(result) => results.push(result),
+                Err(payload) => {
+                    let reason = match payload.downcast_ref::<&'static str>() {
+                        Some(s) => (*s).to_string(),
+                        None => match payload.downcast_ref::<String>() {
+                            Some(s) => s.clone(),
+                            None => "unknown panic payload".to_string(),
+                        },
+                    };
+                    eprintln!("ezpn: pane spawn thread panicked: {}", reason);
+                    // Continue with the panes that did spawn — partial workspace
+                    // is preferable to aborting the entire session.
+                }
+            }
         }
     });
 

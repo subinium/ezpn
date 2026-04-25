@@ -153,19 +153,36 @@ impl Pane {
 
         let (tx, rx) = mpsc::sync_channel(32); // bounded: 32 * 4KB = 128KB max buffered
         std::thread::spawn(move || {
-            let mut reader = reader;
-            let mut buf = [0u8; 4096];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if tx.send(buf[..n].to_vec()).is_err() {
-                            break;
+            // Isolate PTY-reader panics: a bad ANSI sequence or vt100 bug must not
+            // take down the daemon. On unwind the channel drops, which causes
+            // `read_output()` to observe `TryRecvError::Disconnected` and mark the
+            // pane dead with exit_code=u32::MAX (see `read_output`).
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut reader = reader;
+                let mut buf = [0u8; 4096];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if tx.send(buf[..n].to_vec()).is_err() {
+                                break;
+                            }
+                            wake_main_loop();
                         }
-                        wake_main_loop();
+                        Err(_) => break,
                     }
-                    Err(_) => break,
                 }
+            }));
+            if let Err(payload) = result {
+                let reason = match payload.downcast_ref::<&'static str>() {
+                    Some(s) => (*s).to_string(),
+                    None => match payload.downcast_ref::<String>() {
+                        Some(s) => s.clone(),
+                        None => "unknown panic payload".to_string(),
+                    },
+                };
+                eprintln!("ezpn: PTY reader thread panicked: {}", reason);
+                wake_main_loop();
             }
         });
 
@@ -218,6 +235,13 @@ impl Pane {
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
+                    // Reader thread is gone (EOF, error, or panic).
+                    // If the child is still alive, the panic-isolation path may have
+                    // killed only the reader — record sentinel exit code so callers
+                    // can detect "abnormal" pane death distinct from clean exit.
+                    if self.alive && self.exit_code.is_none() {
+                        self.exit_code = Some(u32::MAX);
+                    }
                     self.alive = false;
                     break;
                 }

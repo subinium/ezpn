@@ -129,6 +129,9 @@ enum ClientMsg {
     Disconnected,
     /// Kill the server (from `ezpn kill`).
     Kill,
+    /// Reader thread panicked. Server treats this like Disconnected
+    /// after logging the payload to stderr.
+    Panicked(String),
 }
 
 /// Connected client with attach mode and per-client state.
@@ -626,6 +629,14 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                         break;
                     }
                     Ok(ClientMsg::Disconnected) => {
+                        disconnect_ids.push(client_id);
+                        break;
+                    }
+                    Ok(ClientMsg::Panicked(reason)) => {
+                        eprintln!(
+                            "ezpn: client reader thread panicked (id={}): {}",
+                            client_id, reason
+                        );
                         disconnect_ids.push(client_id);
                         break;
                     }
@@ -1157,6 +1168,17 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Convert a `catch_unwind` payload into a printable reason string.
+fn panic_payload_to_string(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "unknown panic payload".to_string()
+}
+
 /// Reader thread for client socket messages.
 fn client_reader(stream: UnixStream, tx: mpsc::Sender<ClientMsg>) {
     let mut reader = BufReader::new(stream);
@@ -1218,8 +1240,17 @@ fn accept_client(
     if let Ok(read_conn) = conn.try_clone() {
         conn.set_read_timeout(None).ok();
         let (msg_tx, msg_rx) = mpsc::channel();
+        let panic_tx = msg_tx.clone();
         std::thread::spawn(move || {
-            client_reader(read_conn, msg_tx);
+            // Isolate reader-thread panics so one bad client cannot kill the daemon.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                client_reader(read_conn, msg_tx);
+            }));
+            if let Err(payload) = result {
+                let reason = panic_payload_to_string(&payload);
+                let _ = panic_tx.send(ClientMsg::Panicked(reason));
+                crate::pane::wake_main_loop();
+            }
         });
         let client_id = NEXT_CLIENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         clients.push(ConnectedClient {
