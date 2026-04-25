@@ -9,7 +9,20 @@ Entries are written in **functional-only style**: every bullet describes an obse
 
 ## [Unreleased]
 
-## [0.6.0] — 2026-04-26 — Stability & Safety Net
+## [0.7.0] — 2026-04-26 — Native Feel & Perf
+
+### Added
+- `MIN_PANE_W`, `MIN_PANE_H`, `can_split()` in `layout` so callers can pre-check before invoking a split that would produce a sub-3-cell pane.
+- `EZPN_ALT_LEGACY=1` opt-out for users on legacy shells that still expect the ESC-prefix Alt encoding.
+
+### Changed
+- **Cold/warm attach is no longer polling-driven.** `spawn_server` hands the daemon an inherited pipe; the daemon writes one byte after `UnixListener::bind` succeeds and the parent `poll(2)`s for it. Eliminates the 50 ms wake quantum that capped warm attach latency.
+- **Alt+Char encodes as CSI u** (`\x1b[<code>;<mods>u`), matching the existing Alt+Arrow / Alt+Function encoding. Resolves bash / zsh / vim binding mismatches where Alt+letter and Alt+arrow used different protocols.
+- `clear_rect` / `clear_title` reuse a shared `BLANK_ROW_BUF` instead of `" ".repeat(width)` per call. Removes the dominant heap traffic during resize / scroll bursts.
+
+### Fixed
+- Search highlight no longer over-paints adjacent cells on emoji / wide-char queries — match length is now display width, not byte length.
+- `Layout::split_area` no longer collapses one child to 1 cell at extreme ratios.
 
 ### Added
 - **Wire-protocol versioning + handshake** (`C_HELLO` / `S_HELLO_OK` / `S_HELLO_ERR`). Mismatched majors are rejected with a clear "please upgrade" message instead of silent corruption. Backwards compatible — older clients without `C_HELLO` keep working.
