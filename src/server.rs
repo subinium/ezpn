@@ -24,6 +24,7 @@ use crate::protocol;
 use crate::render::{self, BorderCache};
 use crate::session;
 use crate::settings::{Settings, SettingsAction};
+use crate::signals::{Signal as Sig, SignalHandlers};
 use crate::workspace::{self, WorkspaceSnapshot};
 
 /// Input state machine for prefix key support.
@@ -129,6 +130,9 @@ enum ClientMsg {
     Disconnected,
     /// Kill the server (from `ezpn kill`).
     Kill,
+    /// Reader thread panicked. Server treats this like Disconnected
+    /// after logging the payload to stderr.
+    Panicked(String),
 }
 
 /// Connected client with attach mode and per-client state.
@@ -137,6 +141,11 @@ struct ConnectedClient {
     writer: std::io::BufWriter<UnixStream>,
     event_rx: mpsc::Receiver<ClientMsg>,
     mode: protocol::AttachMode,
+    /// Capability bits negotiated during the C_HELLO handshake. Zero for
+    /// legacy clients that connected without a Hello — those are treated
+    /// as having no extended capabilities.
+    #[allow(dead_code)]
+    caps: u32,
     tw: u16,
     th: u16,
 }
@@ -188,6 +197,17 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
     settings.show_status_bar = file_config.show_status_bar;
     settings.show_tab_bar = file_config.show_tab_bar;
     let prefix_key = file_config.prefix_key;
+
+    // Install POSIX signal handlers (issue #11). Failure to install is logged
+    // but non-fatal — the daemon still runs, just without graceful shutdown
+    // and zombie reaping. We never want a syscall failure to block startup.
+    let mut sig_handlers = match SignalHandlers::install() {
+        Ok(h) => Some(h),
+        Err(e) => {
+            eprintln!("ezpn: signal handlers unavailable, running without them: {e}");
+            None
+        }
+    };
 
     // Auto-restart state
     let mut restart_policies: HashMap<usize, project::RestartPolicy> = HashMap::new();
@@ -505,7 +525,50 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
             {
                 drop(conn);
             } else {
-                match protocol::read_msg(&mut &conn) {
+                // The first message may be C_HELLO; if so, negotiate and read again.
+                // This is the only place version negotiation happens — once accepted,
+                // the rest of the connection uses tags as defined in protocol.rs.
+                let mut negotiated_caps: u32 = 0;
+                let mut first_msg = protocol::read_msg(&mut &conn);
+                if let Ok((protocol::C_HELLO, ref payload)) = first_msg {
+                    match serde_json::from_slice::<protocol::HelloMessage>(payload) {
+                        Ok(hello) if hello.version == protocol::PROTOCOL_VERSION => {
+                            negotiated_caps = hello.capabilities & protocol::SERVER_CAPABILITIES;
+                            let ok = protocol::HelloOk {
+                                version: protocol::PROTOCOL_VERSION,
+                                capabilities: negotiated_caps,
+                                server: format!("ezpn {}", env!("CARGO_PKG_VERSION")),
+                            };
+                            let mut w = &conn;
+                            let _ = protocol::write_msg(
+                                &mut w,
+                                protocol::S_HELLO_OK,
+                                &serde_json::to_vec(&ok).unwrap_or_default(),
+                            );
+                            // Read the real first message (attach / ping / kill / …)
+                            first_msg = protocol::read_msg(&mut &conn);
+                        }
+                        _ => {
+                            // Mismatched major or malformed payload → reject + close.
+                            let err = protocol::HelloErr {
+                                reason:
+                                    "client/server protocol version mismatch — please upgrade ezpn"
+                                        .to_string(),
+                                server_version: protocol::PROTOCOL_VERSION,
+                            };
+                            let mut w = &conn;
+                            let _ = protocol::write_msg(
+                                &mut w,
+                                protocol::S_HELLO_ERR,
+                                &serde_json::to_vec(&err).unwrap_or_default(),
+                            );
+                            drop(conn);
+                            continue;
+                        }
+                    }
+                }
+
+                match first_msg {
                     Ok((protocol::C_PING, _)) => {
                         // Liveness probe — respond and close, no side effects
                         let mut w = &conn;
@@ -532,6 +595,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                                 req.cols,
                                 req.rows,
                                 req.mode,
+                                negotiated_caps,
                                 &mut clients,
                                 &mut panes,
                                 &layout,
@@ -552,6 +616,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                                 w,
                                 h,
                                 protocol::AttachMode::Steal,
+                                negotiated_caps,
                                 &mut clients,
                                 &mut panes,
                                 &layout,
@@ -626,6 +691,14 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                         break;
                     }
                     Ok(ClientMsg::Disconnected) => {
+                        disconnect_ids.push(client_id);
+                        break;
+                    }
+                    Ok(ClientMsg::Panicked(reason)) => {
+                        eprintln!(
+                            "ezpn: client reader thread panicked (id={}): {}",
+                            client_id, reason
+                        );
                         disconnect_ids.push(client_id);
                         break;
                     }
@@ -1136,6 +1209,57 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
             }
         }
 
+        // ── POSIX signal handling (issue #11) ──
+        if let Some(sh) = sig_handlers.as_mut() {
+            for sig in sh.drain() {
+                match sig {
+                    Sig::Child => {
+                        // Reap any pane whose child exited externally (e.g. user
+                        // killed it from another terminal). update_alive() is a
+                        // no-op for already-dead panes, so iterating all is cheap.
+                        let mut any_changed = false;
+                        for pane in panes.values_mut() {
+                            if pane.update_alive().is_some() {
+                                any_changed = true;
+                            }
+                        }
+                        if any_changed {
+                            update.full_redraw = true;
+                        }
+                    }
+                    Sig::Terminate => {
+                        // Graceful shutdown: persist the live workspace snapshot
+                        // before tearing down so reattach restores layout/commands.
+                        let snapshot = WorkspaceSnapshot::from_live(
+                            &tab_mgr,
+                            &tab_name,
+                            &layout,
+                            &panes,
+                            active,
+                            zoomed_pane,
+                            broadcast,
+                            &restart_policies,
+                            &default_shell,
+                            settings.border_style,
+                            settings.show_status_bar,
+                            settings.show_tab_bar,
+                            effective_scrollback,
+                        );
+                        workspace::auto_save(session_name, &snapshot);
+                        for pane in panes.values_mut() {
+                            pane.kill();
+                        }
+                        for c in &mut clients {
+                            let _ = protocol::write_msg(&mut c.writer, protocol::S_EXIT, &[]);
+                        }
+                        session::cleanup(session_name);
+                        ipc::cleanup();
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
         // Block until any event source wakes us, or timeout.
         // With clients: 2ms when we just rendered (active I/O), 8ms idle.
         // Headless: 20ms (responsive to PING probes for session discovery).
@@ -1155,6 +1279,17 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
     session::cleanup(session_name);
     ipc::cleanup();
     Ok(())
+}
+
+/// Convert a `catch_unwind` payload into a printable reason string.
+fn panic_payload_to_string(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "unknown panic payload".to_string()
 }
 
 /// Reader thread for client socket messages.
@@ -1196,6 +1331,7 @@ fn accept_client(
     new_w: u16,
     new_h: u16,
     mode: protocol::AttachMode,
+    caps: u32,
     clients: &mut Vec<ConnectedClient>,
     panes: &mut HashMap<usize, Pane>,
     layout: &Layout,
@@ -1218,8 +1354,17 @@ fn accept_client(
     if let Ok(read_conn) = conn.try_clone() {
         conn.set_read_timeout(None).ok();
         let (msg_tx, msg_rx) = mpsc::channel();
+        let panic_tx = msg_tx.clone();
         std::thread::spawn(move || {
-            client_reader(read_conn, msg_tx);
+            // Isolate reader-thread panics so one bad client cannot kill the daemon.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                client_reader(read_conn, msg_tx);
+            }));
+            if let Err(payload) = result {
+                let reason = panic_payload_to_string(&payload);
+                let _ = panic_tx.send(ClientMsg::Panicked(reason));
+                crate::pane::wake_main_loop();
+            }
         });
         let client_id = NEXT_CLIENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         clients.push(ConnectedClient {
@@ -1227,6 +1372,7 @@ fn accept_client(
             writer: std::io::BufWriter::new(conn),
             event_rx: msg_rx,
             mode,
+            caps,
             tw: new_w,
             th: new_h,
         });
@@ -1690,33 +1836,31 @@ fn process_key(
     // ── Resize mode ──
     if matches!(mode, InputMode::ResizeMode) {
         match key.code {
-            KeyCode::Left | KeyCode::Char('h') => {
-                if layout.resize_pane(*active, NavDir::Left, 0.05) {
-                    super::resize_all(panes, layout, tw, th, settings);
-                    update.mark_all(layout);
-                    update.border_dirty = true;
-                }
+            KeyCode::Left | KeyCode::Char('h')
+                if layout.resize_pane(*active, NavDir::Left, 0.05) =>
+            {
+                super::resize_all(panes, layout, tw, th, settings);
+                update.mark_all(layout);
+                update.border_dirty = true;
             }
-            KeyCode::Right | KeyCode::Char('l') => {
-                if layout.resize_pane(*active, NavDir::Right, 0.05) {
-                    super::resize_all(panes, layout, tw, th, settings);
-                    update.mark_all(layout);
-                    update.border_dirty = true;
-                }
+            KeyCode::Right | KeyCode::Char('l')
+                if layout.resize_pane(*active, NavDir::Right, 0.05) =>
+            {
+                super::resize_all(panes, layout, tw, th, settings);
+                update.mark_all(layout);
+                update.border_dirty = true;
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if layout.resize_pane(*active, NavDir::Up, 0.05) {
-                    super::resize_all(panes, layout, tw, th, settings);
-                    update.mark_all(layout);
-                    update.border_dirty = true;
-                }
+            KeyCode::Up | KeyCode::Char('k') if layout.resize_pane(*active, NavDir::Up, 0.05) => {
+                super::resize_all(panes, layout, tw, th, settings);
+                update.mark_all(layout);
+                update.border_dirty = true;
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if layout.resize_pane(*active, NavDir::Down, 0.05) {
-                    super::resize_all(panes, layout, tw, th, settings);
-                    update.mark_all(layout);
-                    update.border_dirty = true;
-                }
+            KeyCode::Down | KeyCode::Char('j')
+                if layout.resize_pane(*active, NavDir::Down, 0.05) =>
+            {
+                super::resize_all(panes, layout, tw, th, settings);
+                update.mark_all(layout);
+                update.border_dirty = true;
             }
             KeyCode::Char('q') | KeyCode::Esc => {
                 *mode = InputMode::Normal;
@@ -1935,11 +2079,9 @@ fn process_key(
                 update.full_redraw = true;
             }
             // Last pane
-            KeyCode::Char(';') => {
-                if panes.contains_key(last_active) {
-                    *active = *last_active;
-                    update.full_redraw = true;
-                }
+            KeyCode::Char(';') if panes.contains_key(last_active) => {
+                *active = *last_active;
+                update.full_redraw = true;
             }
             // Equalize (space)
             KeyCode::Char(' ') => {

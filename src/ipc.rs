@@ -120,18 +120,42 @@ pub fn start_listener() -> anyhow::Result<mpsc::Receiver<(IpcRequest, ResponseSe
     let (tx, rx) = mpsc::channel();
 
     std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            match stream {
-                Ok(stream) => {
-                    let tx = tx.clone();
-                    std::thread::spawn(move || handle_client(stream, tx));
+        // Outer accept loop must survive any per-client panic; otherwise the
+        // ezpn-ctl IPC interface dies after one malformed request.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(stream) => {
+                        let tx = tx.clone();
+                        std::thread::spawn(move || {
+                            // Per-client panics never propagate.
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    handle_client(stream, tx);
+                                }));
+                            if let Err(payload) = result {
+                                let reason = panic_payload_to_string(&payload);
+                                eprintln!("ezpn-ctl: handler thread panicked: {}", reason);
+                            }
+                        });
+                    }
+                    Err(_) => break,
                 }
-                Err(_) => break,
             }
-        }
+        }));
     });
 
     Ok(rx)
+}
+
+fn panic_payload_to_string(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "unknown panic payload".to_string()
 }
 
 pub fn cleanup() {

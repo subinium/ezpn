@@ -22,6 +22,7 @@ mod render;
 mod server;
 mod session;
 mod settings;
+mod signals;
 mod tab;
 mod workspace;
 
@@ -1081,33 +1082,33 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                     // ── Resize mode: arrows resize, q/Esc exits ──
                     else if matches!(mode, InputMode::ResizeMode) {
                         match key.code {
-                            KeyCode::Left | KeyCode::Char('h') => {
-                                if layout.resize_pane(active, NavDir::Left, 0.05) {
-                                    resize_all(&mut panes, &layout, tw, th, &settings);
-                                    update.mark_all(&layout);
-                                    update.border_dirty = true;
-                                }
+                            KeyCode::Left | KeyCode::Char('h')
+                                if layout.resize_pane(active, NavDir::Left, 0.05) =>
+                            {
+                                resize_all(&mut panes, &layout, tw, th, &settings);
+                                update.mark_all(&layout);
+                                update.border_dirty = true;
                             }
-                            KeyCode::Right | KeyCode::Char('l') => {
-                                if layout.resize_pane(active, NavDir::Right, 0.05) {
-                                    resize_all(&mut panes, &layout, tw, th, &settings);
-                                    update.mark_all(&layout);
-                                    update.border_dirty = true;
-                                }
+                            KeyCode::Right | KeyCode::Char('l')
+                                if layout.resize_pane(active, NavDir::Right, 0.05) =>
+                            {
+                                resize_all(&mut panes, &layout, tw, th, &settings);
+                                update.mark_all(&layout);
+                                update.border_dirty = true;
                             }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                if layout.resize_pane(active, NavDir::Up, 0.05) {
-                                    resize_all(&mut panes, &layout, tw, th, &settings);
-                                    update.mark_all(&layout);
-                                    update.border_dirty = true;
-                                }
+                            KeyCode::Up | KeyCode::Char('k')
+                                if layout.resize_pane(active, NavDir::Up, 0.05) =>
+                            {
+                                resize_all(&mut panes, &layout, tw, th, &settings);
+                                update.mark_all(&layout);
+                                update.border_dirty = true;
                             }
-                            KeyCode::Down | KeyCode::Char('j') => {
-                                if layout.resize_pane(active, NavDir::Down, 0.05) {
-                                    resize_all(&mut panes, &layout, tw, th, &settings);
-                                    update.mark_all(&layout);
-                                    update.border_dirty = true;
-                                }
+                            KeyCode::Down | KeyCode::Char('j')
+                                if layout.resize_pane(active, NavDir::Down, 0.05) =>
+                            {
+                                resize_all(&mut panes, &layout, tw, th, &settings);
+                                update.mark_all(&layout);
+                                update.border_dirty = true;
                             }
                             KeyCode::Char('q') | KeyCode::Esc => {
                                 mode = InputMode::Normal;
@@ -1328,11 +1329,9 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                                 update.full_redraw = true;
                             }
                             // Last pane (tmux ;)
-                            KeyCode::Char(';') => {
-                                if panes.contains_key(&last_active) {
-                                    active = last_active;
-                                    update.full_redraw = true;
-                                }
+                            KeyCode::Char(';') if panes.contains_key(&last_active) => {
+                                active = last_active;
+                                update.full_redraw = true;
                             }
                             // Cycle layout (tmux Space)
                             KeyCode::Char(' ') => {
@@ -2362,7 +2361,21 @@ pub(crate) fn spawn_layout_panes(
             })
             .collect();
         for handle in handles {
-            results.push(handle.join().expect("pane spawn thread panicked"));
+            match handle.join() {
+                Ok(result) => results.push(result),
+                Err(payload) => {
+                    let reason = match payload.downcast_ref::<&'static str>() {
+                        Some(s) => (*s).to_string(),
+                        None => match payload.downcast_ref::<String>() {
+                            Some(s) => s.clone(),
+                            None => "unknown panic payload".to_string(),
+                        },
+                    };
+                    eprintln!("ezpn: pane spawn thread panicked: {}", reason);
+                    // Continue with the panes that did spawn — partial workspace
+                    // is preferable to aborting the entire session.
+                }
+            }
         }
     });
 
