@@ -31,14 +31,16 @@ fn hello_handshake_succeeds_for_v1() {
     let (_stream, caps) = connect_and_hello(&daemon.sock);
     // Server caps include kitty kbd + focus events + true color = 0x07.
     // Client requested 0x07 too, so intersection should be 0x07.
-    assert_eq!(caps, 0x07, "negotiated caps should be 0x07, got 0x{caps:02x}");
+    assert_eq!(
+        caps, 0x07,
+        "negotiated caps should be 0x07, got 0x{caps:02x}"
+    );
 }
 
 #[test]
 fn hello_handshake_rejects_wrong_major() {
     let daemon = spawn_test_daemon("hello-bad-version");
-    let mut stream =
-        std::os::unix::net::UnixStream::connect(&daemon.sock).expect("connect");
+    let mut stream = std::os::unix::net::UnixStream::connect(&daemon.sock).expect("connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
@@ -62,8 +64,7 @@ fn sigterm_triggers_graceful_shutdown() {
     let mut daemon = spawn_test_daemon("sigterm");
     // Confirm daemon is alive via ping first
     {
-        let mut stream =
-            std::os::unix::net::UnixStream::connect(&daemon.sock).expect("connect");
+        let mut stream = std::os::unix::net::UnixStream::connect(&daemon.sock).expect("connect");
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();

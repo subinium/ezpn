@@ -1,0 +1,9 @@
+[toolchain]
+# Pin the Rust toolchain so `cargo fmt --check` produces the same diff
+# locally and in CI. dtolnay/rust-toolchain@stable resolves this file
+# instead of grabbing whatever is freshest on the runner; without it
+# rustfmt can disagree across rustup snapshots and turn into an unfixable
+# CI loop where one side keeps re-formatting the other's output.
+channel = "1.95.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"
