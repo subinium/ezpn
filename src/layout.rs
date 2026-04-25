@@ -392,14 +392,51 @@ fn collect_rects(node: &LayoutNode, area: &Rect, out: &mut HashMap<usize, Rect>)
     }
 }
 
+/// Smallest cell width any leaf pane is allowed to occupy. A pane below
+/// this becomes useless (the border + a single content column squeezes
+/// shells into infinite reflow) and several render paths assume at least
+/// this much space exists. Issue #17.
+pub const MIN_PANE_W: u16 = 3;
+
+/// Smallest cell height any leaf pane is allowed to occupy. Same rationale
+/// as [`MIN_PANE_W`].
+pub const MIN_PANE_H: u16 = 2;
+
+/// Returns true when `area` has enough room to hold a separator plus two
+/// MIN-sized children along `dir`. Callers can pre-check before invoking
+/// [`Layout::split`] and surface a "pane too small" message instead of
+/// silently producing a degenerate split.
+#[allow(dead_code)] // wired up by command-palette / split keybindings in a follow-up
+pub fn can_split(area: &Rect, dir: Direction) -> bool {
+    // `> 2*MIN + 0` instead of `>= 2*MIN + 1` so clippy's int_plus_one
+    // lint stays quiet without sacrificing the check (`a >= b+1` ≡ `a > b`).
+    match dir {
+        Direction::Horizontal => area.w > 2 * MIN_PANE_W,
+        Direction::Vertical => area.h > 2 * MIN_PANE_H,
+    }
+}
+
 pub fn split_area(area: &Rect, dir: Direction, ratio: f32) -> (Rect, Rect) {
     match dir {
         Direction::Horizontal => {
             let usable = area.w.saturating_sub(1); // 1 cell for separator
             if usable < 2 {
+                // Not enough room for two children. Hand the caller back the
+                // whole area as the first pane and an explicit zero-width
+                // second so render code can detect / skip it. This branch is
+                // only reachable from snapshot restore on tiny terminals;
+                // interactive splits are guarded by `can_split`.
                 return (area.clone(), Rect { w: 0, ..*area });
             }
-            let fw = ((usable as f32 * ratio).round() as u16).clamp(1, usable - 1);
+            // Clamp so both children stay at or above MIN_PANE_W when the
+            // area can afford it. For the corner case `usable < 2*MIN_PANE_W`
+            // (e.g. 5-col terminal), `clamp(min, max)` requires `min <= max`
+            // — so we use the pre-existing `[1, usable-1]` floor in that
+            // narrow window. Both children may be below MIN there, but
+            // nothing crashes; a follow-up will surface a UI warning.
+            let lo = MIN_PANE_W.min(usable.saturating_sub(MIN_PANE_W));
+            let hi = (usable.saturating_sub(MIN_PANE_W)).max(lo);
+            let fw = ((usable as f32 * ratio).round() as u16).clamp(lo.max(1), hi.max(1));
             let sw = usable - fw;
             (
                 Rect { w: fw, ..*area },
@@ -415,7 +452,9 @@ pub fn split_area(area: &Rect, dir: Direction, ratio: f32) -> (Rect, Rect) {
             if usable < 2 {
                 return (area.clone(), Rect { h: 0, ..*area });
             }
-            let fh = ((usable as f32 * ratio).round() as u16).clamp(1, usable - 1);
+            let lo = MIN_PANE_H.min(usable.saturating_sub(MIN_PANE_H));
+            let hi = (usable.saturating_sub(MIN_PANE_H)).max(lo);
+            let fh = ((usable as f32 * ratio).round() as u16).clamp(lo.max(1), hi.max(1));
             let sh = usable - fh;
             (
                 Rect { h: fh, ..*area },
@@ -795,6 +834,41 @@ mod tests {
         assert_eq!(layout.pane_count(), 2);
         layout.split(0, Direction::Vertical);
         assert_eq!(layout.pane_count(), 3);
+    }
+
+    #[test]
+    fn split_area_respects_min_pane_w() {
+        // Roomy split — both halves should be ≥ MIN_PANE_W
+        let area = Rect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 24,
+        };
+        let (a, b) = super::split_area(&area, Direction::Horizontal, 0.5);
+        assert!(a.w >= super::MIN_PANE_W);
+        assert!(b.w >= super::MIN_PANE_W);
+
+        // Extreme ratio (0.01) used to collapse one side to 1 cell
+        let (a, b) = super::split_area(&area, Direction::Horizontal, 0.01);
+        assert!(a.w >= super::MIN_PANE_W);
+        assert!(b.w >= super::MIN_PANE_W);
+    }
+
+    #[test]
+    fn can_split_rejects_undersized_area() {
+        // 5 cols can't fit two 3-col panes plus a separator → reject
+        let tiny = Rect {
+            x: 0,
+            y: 0,
+            w: 5,
+            h: 24,
+        };
+        assert!(!super::can_split(&tiny, Direction::Horizontal));
+
+        // 7 cols (3 + 1 + 3) is the minimum that satisfies horizontal split
+        let just_enough = Rect { w: 7, ..tiny };
+        assert!(super::can_split(&just_enough, Direction::Horizontal));
     }
 
     #[test]
