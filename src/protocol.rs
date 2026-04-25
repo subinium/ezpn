@@ -18,6 +18,11 @@ pub const C_KILL: u8 = 0x04;
 pub const C_PING: u8 = 0x05;
 /// Client attach with mode. Payload = JSON `AttachRequest`.
 pub const C_ATTACH: u8 = 0x06;
+/// Client capability/version handshake. Payload = JSON `HelloMessage`.
+/// Optional but strongly recommended — without it the server assumes a
+/// "v0" capability-less client (legacy behaviour). On unknown major
+/// version, the server replies `S_HELLO_ERR` and closes.
+pub const C_HELLO: u8 = 0x07;
 
 // ── Server → Client tags ──
 
@@ -29,6 +34,31 @@ pub const S_DETACHED: u8 = 0x82;
 pub const S_EXIT: u8 = 0x83;
 /// Pong response to C_PING.
 pub const S_PONG: u8 = 0x84;
+/// Server accepts the handshake. Payload = JSON `HelloOk`.
+pub const S_HELLO_OK: u8 = 0x85;
+/// Server rejects the handshake (version mismatch, malformed payload).
+/// Payload = JSON `HelloErr`. Connection is closed after sending.
+pub const S_HELLO_ERR: u8 = 0x86;
+
+/// Wire-protocol major version. Bump on any backwards-incompatible
+/// change to message tags or framing semantics. `S_HELLO_OK` carries
+/// the server's version so the client can refuse a mismatch up-front
+/// rather than silently misparsing later messages.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Capability bits the daemon currently supports. Sent in `S_HELLO_OK`
+/// and intersected with the client's bits to determine what features
+/// the rest of the session may use (true-color sequences, focus events,
+/// etc.). New bits MUST keep their meaning forever — once shipped the
+/// bit number is load-bearing.
+pub const SERVER_CAPABILITIES: u32 = CAP_KITTY_KEYBOARD | CAP_FOCUS_EVENTS | CAP_TRUE_COLOR;
+
+pub const CAP_KITTY_KEYBOARD: u32 = 0x0001;
+pub const CAP_FOCUS_EVENTS: u32 = 0x0002;
+pub const CAP_TRUE_COLOR: u32 = 0x0004;
+/// Reserved for #14 (scrollback persistence). Not yet emitted by the daemon.
+#[allow(dead_code)]
+pub const CAP_SCROLLBACK_PERSIST: u32 = 0x0008;
 
 /// Maximum message payload size (16 MB).
 const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
@@ -108,6 +138,38 @@ pub struct AttachRequest {
     pub mode: AttachMode,
 }
 
+/// First message a v0.6+ client sends. Everything else (C_ATTACH /
+/// C_RESIZE) follows after the server confirms with `S_HELLO_OK`.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct HelloMessage {
+    /// Major protocol version. Mismatch with `PROTOCOL_VERSION` is
+    /// fatal — the server rejects with `S_HELLO_ERR`.
+    pub version: u32,
+    /// Bitfield of `CAP_*` constants the client supports / wants enabled.
+    pub capabilities: u32,
+    /// Free-form client identifier ("ezpn 0.6.0", "ezpn-ctl 0.6.0"…).
+    /// Used for logging only — never load-bearing.
+    pub client: String,
+}
+
+/// Response payload for `S_HELLO_OK`.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct HelloOk {
+    pub version: u32,
+    /// Intersection of client + server caps. Both sides agree to use
+    /// only these features for the rest of the session.
+    pub capabilities: u32,
+    pub server: String,
+}
+
+/// Response payload for `S_HELLO_ERR` — connection is closed after this.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct HelloErr {
+    pub reason: String,
+    /// Server's preferred version, so the client can hint at the upgrade.
+    pub server_version: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,5 +208,69 @@ mod tests {
         let (tag, payload) = read_msg(&mut buf.as_slice()).unwrap();
         assert_eq!(tag, C_EVENT);
         assert_eq!(payload, b"hello");
+    }
+
+    #[test]
+    fn hello_message_round_trip() {
+        let hello = HelloMessage {
+            version: PROTOCOL_VERSION,
+            capabilities: CAP_KITTY_KEYBOARD | CAP_TRUE_COLOR,
+            client: "ezpn-test".to_string(),
+        };
+        let json = serde_json::to_vec(&hello).unwrap();
+        let decoded: HelloMessage = serde_json::from_slice(&json).unwrap();
+        assert_eq!(decoded.version, PROTOCOL_VERSION);
+        assert_eq!(
+            decoded.capabilities & CAP_KITTY_KEYBOARD,
+            CAP_KITTY_KEYBOARD
+        );
+        assert_eq!(decoded.client, "ezpn-test");
+    }
+
+    #[test]
+    fn hello_ok_carries_intersection() {
+        let server_caps = SERVER_CAPABILITIES;
+        let client_caps = CAP_KITTY_KEYBOARD | CAP_SCROLLBACK_PERSIST; // unknown bit set
+        let agreed = server_caps & client_caps;
+        // We agree on what BOTH sides know. Client requesting a future bit
+        // (SCROLLBACK_PERSIST) must not magically enable it server-side.
+        assert_eq!(agreed, CAP_KITTY_KEYBOARD);
+    }
+
+    #[test]
+    fn hello_err_includes_server_version() {
+        let err = HelloErr {
+            reason: "client/server major mismatch".to_string(),
+            server_version: PROTOCOL_VERSION,
+        };
+        let json = serde_json::to_vec(&err).unwrap();
+        let decoded: HelloErr = serde_json::from_slice(&json).unwrap();
+        assert_eq!(decoded.server_version, PROTOCOL_VERSION);
+        assert!(decoded.reason.contains("mismatch"));
+    }
+
+    #[test]
+    fn hello_tags_distinct_from_existing() {
+        // Defensive: catch accidental tag collisions when constants are added.
+        let tags = [
+            C_EVENT, C_DETACH, C_RESIZE, C_KILL, C_PING, C_ATTACH, C_HELLO,
+        ];
+        let mut sorted = tags.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), tags.len(), "client tag collision");
+
+        let stags = [
+            S_OUTPUT,
+            S_DETACHED,
+            S_EXIT,
+            S_PONG,
+            S_HELLO_OK,
+            S_HELLO_ERR,
+        ];
+        let mut sorted_s = stags.to_vec();
+        sorted_s.sort_unstable();
+        sorted_s.dedup();
+        assert_eq!(sorted_s.len(), stags.len(), "server tag collision");
     }
 }

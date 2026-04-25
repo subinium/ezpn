@@ -140,6 +140,11 @@ struct ConnectedClient {
     writer: std::io::BufWriter<UnixStream>,
     event_rx: mpsc::Receiver<ClientMsg>,
     mode: protocol::AttachMode,
+    /// Capability bits negotiated during the C_HELLO handshake. Zero for
+    /// legacy clients that connected without a Hello — those are treated
+    /// as having no extended capabilities.
+    #[allow(dead_code)]
+    caps: u32,
     tw: u16,
     th: u16,
 }
@@ -508,7 +513,50 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
             {
                 drop(conn);
             } else {
-                match protocol::read_msg(&mut &conn) {
+                // The first message may be C_HELLO; if so, negotiate and read again.
+                // This is the only place version negotiation happens — once accepted,
+                // the rest of the connection uses tags as defined in protocol.rs.
+                let mut negotiated_caps: u32 = 0;
+                let mut first_msg = protocol::read_msg(&mut &conn);
+                if let Ok((protocol::C_HELLO, ref payload)) = first_msg {
+                    match serde_json::from_slice::<protocol::HelloMessage>(payload) {
+                        Ok(hello) if hello.version == protocol::PROTOCOL_VERSION => {
+                            negotiated_caps = hello.capabilities & protocol::SERVER_CAPABILITIES;
+                            let ok = protocol::HelloOk {
+                                version: protocol::PROTOCOL_VERSION,
+                                capabilities: negotiated_caps,
+                                server: format!("ezpn {}", env!("CARGO_PKG_VERSION")),
+                            };
+                            let mut w = &conn;
+                            let _ = protocol::write_msg(
+                                &mut w,
+                                protocol::S_HELLO_OK,
+                                &serde_json::to_vec(&ok).unwrap_or_default(),
+                            );
+                            // Read the real first message (attach / ping / kill / …)
+                            first_msg = protocol::read_msg(&mut &conn);
+                        }
+                        _ => {
+                            // Mismatched major or malformed payload → reject + close.
+                            let err = protocol::HelloErr {
+                                reason:
+                                    "client/server protocol version mismatch — please upgrade ezpn"
+                                        .to_string(),
+                                server_version: protocol::PROTOCOL_VERSION,
+                            };
+                            let mut w = &conn;
+                            let _ = protocol::write_msg(
+                                &mut w,
+                                protocol::S_HELLO_ERR,
+                                &serde_json::to_vec(&err).unwrap_or_default(),
+                            );
+                            drop(conn);
+                            continue;
+                        }
+                    }
+                }
+
+                match first_msg {
                     Ok((protocol::C_PING, _)) => {
                         // Liveness probe — respond and close, no side effects
                         let mut w = &conn;
@@ -535,6 +583,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                                 req.cols,
                                 req.rows,
                                 req.mode,
+                                negotiated_caps,
                                 &mut clients,
                                 &mut panes,
                                 &layout,
@@ -555,6 +604,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                                 w,
                                 h,
                                 protocol::AttachMode::Steal,
+                                negotiated_caps,
                                 &mut clients,
                                 &mut panes,
                                 &layout,
@@ -1218,6 +1268,7 @@ fn accept_client(
     new_w: u16,
     new_h: u16,
     mode: protocol::AttachMode,
+    caps: u32,
     clients: &mut Vec<ConnectedClient>,
     panes: &mut HashMap<usize, Pane>,
     layout: &Layout,
@@ -1258,6 +1309,7 @@ fn accept_client(
             writer: std::io::BufWriter::new(conn),
             event_rx: msg_rx,
             mode,
+            caps,
             tw: new_w,
             th: new_h,
         });
