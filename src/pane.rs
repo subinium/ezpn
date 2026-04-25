@@ -316,6 +316,18 @@ impl Pane {
         self.parser.screen()
     }
 
+    /// Borrow the underlying vt100 parser. Used by snapshot serialization to
+    /// encode the visible scrollback into a portable blob.
+    pub fn parser(&self) -> &vt100::Parser {
+        &self.parser
+    }
+
+    /// Mutable parser access for replaying a serialized scrollback blob into
+    /// a freshly spawned pane during snapshot restore.
+    pub fn parser_mut(&mut self) -> &mut vt100::Parser {
+        &mut self.parser
+    }
+
     /// Sync the vt100 scrollback offset with our tracked scroll_offset.
     /// Call this before drawing pane content so cell() returns scrollback.
     pub fn sync_scrollback(&mut self) {

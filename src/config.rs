@@ -10,6 +10,11 @@ pub struct EzpnConfig {
     pub show_tab_bar: bool,
     /// Prefix key character (default: 'b' for Ctrl+B).
     pub prefix_key: char,
+    /// Whether to persist pane scrollback into auto-saved snapshots.
+    /// Off by default (snapshots stay small); enable to restore terminal
+    /// contents on reattach. May be overridden per-project via `.ezpn.toml`'s
+    /// `[workspace] persist_scrollback`.
+    pub persist_scrollback: bool,
 }
 
 impl Default for EzpnConfig {
@@ -21,6 +26,7 @@ impl Default for EzpnConfig {
             show_status_bar: true,
             show_tab_bar: true,
             prefix_key: 'b',
+            persist_scrollback: false,
         }
     }
 }
@@ -58,6 +64,9 @@ pub fn load_config() -> EzpnConfig {
                         }
                         "status_bar" => config.show_status_bar = value == "true",
                         "tab_bar" => config.show_tab_bar = value == "true",
+                        "persist_scrollback" => {
+                            config.persist_scrollback = value == "true";
+                        }
                         "prefix" => {
                             // Accept single char like "a" or "b"
                             let ch = value.to_lowercase();

@@ -23,6 +23,7 @@ mod server;
 mod session;
 mod settings;
 mod signals;
+mod snapshot_blob;
 mod tab;
 mod workspace;
 
@@ -2246,6 +2247,7 @@ pub(crate) fn build_initial_state(
     settings: &mut Settings,
     restart_policies: &mut HashMap<usize, project::RestartPolicy>,
     scrollback: usize,
+    persist_scrollback: &mut bool,
 ) -> anyhow::Result<(Layout, HashMap<usize, Pane>, usize, Option<SnapshotExtra>)> {
     // Use a default terminal size for initial spawn (server doesn't have a terminal yet).
     // Panes will be resized when a client connects.
@@ -2297,6 +2299,10 @@ pub(crate) fn build_initial_state(
             let proj = result.map_err(|e| anyhow::anyhow!("{e}"))?;
             let panes = spawn_project_panes(&proj, default_shell, tw, th, settings, scrollback)?;
             *restart_policies = proj.restarts.clone();
+            // Per-project override for persist_scrollback (falls back to global).
+            if let Some(override_value) = proj.persist_scrollback {
+                *persist_scrollback = override_value;
+            }
             let active = *proj.layout.pane_ids().first().unwrap_or(&0);
             return Ok((proj.layout, panes, active, None));
         } else if let Some((layout, launches)) = try_load_procfile() {
@@ -2543,6 +2549,13 @@ pub(crate) fn spawn_snapshot_panes(
         }
         if ps.shell.is_some() {
             pane.set_initial_shell(ps.shell.clone());
+        }
+        // Replay v3 scrollback blob if present. On error, warn and continue
+        // with an empty scrollback — never fail the whole restore.
+        if let Some(blob) = &ps.scrollback_blob {
+            if let Err(e) = crate::snapshot_blob::decode_scrollback(blob, pane.parser_mut()) {
+                eprintln!("ezpn: scrollback restore failed for pane {}: {}", ps.id, e);
+            }
         }
         panes.insert(ps.id, pane);
     }
@@ -3029,12 +3042,13 @@ pub(crate) fn handle_ipc_command(
                             env: pane.map(|p| p.initial_env().clone()).unwrap_or_default(),
                             restart: project::RestartPolicy::default(),
                             shell: pane.and_then(|p| p.initial_shell().map(|s| s.to_string())),
+                            scrollback_blob: None,
                         }
                     })
                     .collect(),
             };
             let snapshot = WorkspaceSnapshot {
-                version: 2,
+                version: workspace::SNAPSHOT_VERSION,
                 shell: shell.clone(),
                 border_style: settings.border_style,
                 show_status_bar: settings.show_status_bar,

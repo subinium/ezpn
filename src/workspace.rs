@@ -7,9 +7,10 @@ use crate::layout::Layout;
 use crate::pane::{Pane, PaneLaunch};
 use crate::project::RestartPolicy;
 use crate::render::BorderStyle;
+use crate::snapshot_blob;
 use crate::tab::TabManager;
 
-const SNAPSHOT_VERSION: u32 = 2;
+pub const SNAPSHOT_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkspaceSnapshot {
@@ -59,6 +60,11 @@ pub struct PaneSnapshot {
     pub restart: RestartPolicy,
     #[serde(default)]
     pub shell: Option<String>,
+    /// Opt-in v3 scrollback blob: base64(gzip(bincode(Vec<Vec<u8>>))).
+    /// `None` (and omitted in JSON) when scrollback persistence is disabled
+    /// or the blob would exceed the per-pane size cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrollback_blob: Option<String>,
 }
 
 impl WorkspaceSnapshot {
@@ -81,6 +87,7 @@ impl WorkspaceSnapshot {
         show_status_bar: bool,
         show_tab_bar: bool,
         scrollback: usize,
+        persist_scrollback: bool,
     ) -> Self {
         let mut tabs = Vec::with_capacity(tab_mgr.count);
 
@@ -93,7 +100,7 @@ impl WorkspaceSnapshot {
                     active_pane,
                     zoomed_pane,
                     broadcast,
-                    panes: snapshot_panes(layout, panes, restart_policies),
+                    panes: snapshot_panes(layout, panes, restart_policies, persist_scrollback),
                 });
             } else if let Some(tab) = tab_mgr.get_inactive(i) {
                 tabs.push(TabSnapshot {
@@ -102,7 +109,12 @@ impl WorkspaceSnapshot {
                     active_pane: tab.active_pane,
                     zoomed_pane: tab.zoomed_pane,
                     broadcast: tab.broadcast,
-                    panes: snapshot_panes(&tab.layout, &tab.panes, &tab.restart_policies),
+                    panes: snapshot_panes(
+                        &tab.layout,
+                        &tab.panes,
+                        &tab.restart_policies,
+                        persist_scrollback,
+                    ),
                 });
             }
         }
@@ -120,9 +132,9 @@ impl WorkspaceSnapshot {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.version != SNAPSHOT_VERSION && self.version != 1 {
+        if self.version != SNAPSHOT_VERSION && self.version != 1 && self.version != 2 {
             anyhow::bail!(
-                "unsupported snapshot version: {} (expected {} or 1)",
+                "unsupported snapshot version: {} (expected {}, 2, or 1)",
                 self.version,
                 SNAPSHOT_VERSION
             );
@@ -165,12 +177,19 @@ fn snapshot_panes(
     layout: &Layout,
     panes: &HashMap<usize, Pane>,
     restart_policies: &HashMap<usize, RestartPolicy>,
+    persist_scrollback: bool,
 ) -> Vec<PaneSnapshot> {
     layout
         .pane_ids()
         .into_iter()
         .map(|id| {
             let pane = panes.get(&id);
+            let scrollback_blob = if persist_scrollback {
+                pane.map(|p| snapshot_blob::encode_scrollback(p.parser()))
+                    .filter(|s| !s.is_empty())
+            } else {
+                None
+            };
             PaneSnapshot {
                 id,
                 launch: pane
@@ -183,6 +202,7 @@ fn snapshot_panes(
                 env: pane.map(|p| p.initial_env().clone()).unwrap_or_default(),
                 restart: restart_policies.get(&id).cloned().unwrap_or_default(),
                 shell: pane.and_then(|p| p.initial_shell().map(|s| s.to_string())),
+                scrollback_blob,
             }
         })
         .collect()
@@ -209,6 +229,7 @@ fn migrate_v1(v1_json: &serde_json::Value) -> anyhow::Result<WorkspaceSnapshot> 
             env: HashMap::new(),
             restart: RestartPolicy::default(),
             shell: None,
+            scrollback_blob: None,
         })
         .collect();
 
@@ -233,6 +254,16 @@ fn migrate_v1(v1_json: &serde_json::Value) -> anyhow::Result<WorkspaceSnapshot> 
     })
 }
 
+/// Migrate a v2 snapshot to v3 format.
+///
+/// V2 had no scrollback persistence, so the migration is a pure version bump:
+/// `scrollback_blob: None` falls out of the `#[serde(default)]` on the field
+/// when v2 JSON is parsed as v3, and we just stamp the version.
+fn migrate_v2(mut snap: WorkspaceSnapshot) -> WorkspaceSnapshot {
+    snap.version = SNAPSHOT_VERSION;
+    snap
+}
+
 pub fn load_snapshot(path: impl AsRef<Path>) -> anyhow::Result<WorkspaceSnapshot> {
     validate_path(path.as_ref())?;
     let content = std::fs::read_to_string(path)?;
@@ -241,6 +272,10 @@ pub fn load_snapshot(path: impl AsRef<Path>) -> anyhow::Result<WorkspaceSnapshot
     let version = raw["version"].as_u64().unwrap_or(0) as u32;
     let snapshot = if version == 1 {
         migrate_v1(&raw)?
+    } else if version == 2 {
+        // V2 JSON deserializes cleanly into v3 structs (new field defaults to None).
+        let v2_as_v3: WorkspaceSnapshot = serde_json::from_value(raw)?;
+        migrate_v2(v2_as_v3)
     } else {
         serde_json::from_value::<WorkspaceSnapshot>(raw)?
     };
@@ -316,6 +351,9 @@ pub fn auto_load(session_name: &str) -> Option<WorkspaceSnapshot> {
     let version = raw["version"].as_u64().unwrap_or(0) as u32;
     let snapshot = if version == 1 {
         migrate_v1(&raw).ok()?
+    } else if version == 2 {
+        let v2_as_v3: WorkspaceSnapshot = serde_json::from_value(raw).ok()?;
+        migrate_v2(v2_as_v3)
     } else {
         serde_json::from_value::<WorkspaceSnapshot>(raw).ok()?
     };
@@ -371,6 +409,7 @@ mod tests {
                         env: HashMap::new(),
                         restart: RestartPolicy::Never,
                         shell: None,
+                        scrollback_blob: None,
                     },
                     PaneSnapshot {
                         id: 1,
@@ -380,6 +419,7 @@ mod tests {
                         env: HashMap::new(),
                         restart: RestartPolicy::OnFailure,
                         shell: None,
+                        scrollback_blob: None,
                     },
                 ],
             }],
@@ -472,6 +512,7 @@ mod tests {
                         env: HashMap::new(),
                         restart: RestartPolicy::Never,
                         shell: None,
+                        scrollback_blob: None,
                     }],
                 },
                 TabSnapshot {
@@ -489,6 +530,7 @@ mod tests {
                             env: [("PORT".to_string(), "3000".to_string())].into(),
                             restart: RestartPolicy::OnFailure,
                             shell: Some("/bin/bash".to_string()),
+                            scrollback_blob: None,
                         },
                         PaneSnapshot {
                             id: 1,
@@ -498,6 +540,7 @@ mod tests {
                             env: HashMap::new(),
                             restart: RestartPolicy::Never,
                             shell: None,
+                            scrollback_blob: None,
                         },
                     ],
                 },
@@ -537,6 +580,87 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_version_is_three() {
+        assert_eq!(SNAPSHOT_VERSION, 3);
+    }
+
+    #[test]
+    fn v2_snapshot_loads_as_v3_with_no_scrollback() {
+        // A real v2 JSON written by an older binary — no `scrollback_blob` field
+        // anywhere. Must load cleanly and produce v3 PaneSnapshots with `None`.
+        let layout_json = serde_json::to_value(Layout::from_grid(1, 1)).unwrap();
+        let v2_json = serde_json::json!({
+            "version": 2,
+            "shell": "/bin/zsh",
+            "border_style": "rounded",
+            "show_status_bar": true,
+            "show_tab_bar": true,
+            "scrollback": 10000,
+            "active_tab": 0,
+            "tabs": [{
+                "name": "1",
+                "layout": layout_json,
+                "active_pane": 0,
+                "panes": [{
+                    "id": 0,
+                    "launch": "shell",
+                    "name": null,
+                    "cwd": "/home/user",
+                    "env": {},
+                    "restart": "never",
+                    "shell": null
+                }]
+            }]
+        });
+
+        let snapshot: WorkspaceSnapshot = serde_json::from_value(v2_json.clone()).unwrap();
+        let migrated = migrate_v2(snapshot);
+        migrated.validate().expect("v2-as-v3 should validate");
+        assert_eq!(migrated.version, SNAPSHOT_VERSION);
+        assert_eq!(migrated.tabs[0].panes[0].scrollback_blob, None);
+        assert_eq!(migrated.tabs[0].panes[0].cwd.as_deref(), Some("/home/user"));
+    }
+
+    #[test]
+    fn v3_pane_serializes_without_blob_field_when_none() {
+        // `skip_serializing_if = "Option::is_none"` keeps v3 JSON byte-compat
+        // with v2 readers when scrollback persistence is off.
+        let pane = PaneSnapshot {
+            id: 0,
+            launch: PaneLaunch::Shell,
+            name: None,
+            cwd: None,
+            env: HashMap::new(),
+            restart: RestartPolicy::Never,
+            shell: None,
+            scrollback_blob: None,
+        };
+        let json = serde_json::to_string(&pane).unwrap();
+        assert!(
+            !json.contains("scrollback_blob"),
+            "None blob should be omitted: {json}"
+        );
+    }
+
+    #[test]
+    fn v3_pane_with_blob_round_trips() {
+        let pane = PaneSnapshot {
+            id: 7,
+            launch: PaneLaunch::Shell,
+            name: None,
+            cwd: None,
+            env: HashMap::new(),
+            restart: RestartPolicy::Never,
+            shell: None,
+            scrollback_blob: Some("ZmFrZS1ibG9i".to_string()),
+        };
+        let json = serde_json::to_string(&pane).unwrap();
+        assert!(json.contains("scrollback_blob"));
+        let decoded: PaneSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.scrollback_blob.as_deref(), Some("ZmFrZS1ibG9i"));
+    }
+
+    #[test]
     fn pane_metadata_defaults_on_missing_fields() {
         // Simulate a v2 snapshot with minimal pane fields (serde defaults kick in)
         let json = serde_json::json!({
@@ -564,6 +688,7 @@ mod tests {
         assert!(pane.env.is_empty());
         assert_eq!(pane.restart, RestartPolicy::Never);
         assert_eq!(pane.shell, None);
+        assert_eq!(pane.scrollback_blob, None);
         assert_eq!(snapshot.scrollback, 10_000); // default_scrollback()
         assert!(snapshot.show_tab_bar); // default_true()
     }

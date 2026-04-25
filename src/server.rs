@@ -212,6 +212,10 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
     // Auto-restart state
     let mut restart_policies: HashMap<usize, project::RestartPolicy> = HashMap::new();
 
+    // Scrollback persistence opt-in: starts from the global config and may be
+    // overridden by `.ezpn.toml`'s `[workspace] persist_scrollback`.
+    let mut persist_scrollback = file_config.persist_scrollback;
+
     // Build layout and spawn panes (same logic as direct mode)
     let (mut layout, mut panes, mut active, snapshot_extra) = super::build_initial_state(
         &config,
@@ -219,6 +223,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
         &mut settings,
         &mut restart_policies,
         effective_scrollback,
+        &mut persist_scrollback,
     )?;
 
     let mut drag: Option<DragState> = None;
@@ -851,6 +856,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                 settings.show_status_bar,
                 settings.show_tab_bar,
                 effective_scrollback,
+                persist_scrollback,
             );
             workspace::auto_save(session_name, &snapshot);
             mode = InputMode::Normal;
@@ -1060,6 +1066,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                         settings.show_status_bar,
                         settings.show_tab_bar,
                         effective_scrollback,
+                        persist_scrollback,
                     );
                     let response = match workspace::save_snapshot(path, &snapshot) {
                         Ok(()) => ipc::IpcResponse::success(format!("saved {}", path)),
@@ -1282,6 +1289,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                             settings.show_status_bar,
                             settings.show_tab_bar,
                             effective_scrollback,
+                            persist_scrollback,
                         );
                         workspace::auto_save(session_name, &snapshot);
                         for pane in panes.values_mut() {

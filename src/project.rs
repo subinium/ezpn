@@ -44,6 +44,9 @@ pub struct WorkspaceSection {
     pub layout: Option<String>,
     pub rows: Option<usize>,
     pub cols: Option<usize>,
+    /// Per-project override for the global `persist_scrollback` setting.
+    /// `Some(true|false)` overrides; `None` falls back to the global value.
+    pub persist_scrollback: Option<bool>,
 }
 
 /// Optional `[session]` section pinning a deterministic session name.
@@ -101,6 +104,9 @@ pub struct ResolvedProject {
     /// Empty when every reference in every pane resolved successfully.
     #[allow(dead_code)]
     pub env_errors: HashMap<usize, Vec<String>>,
+    /// Per-project override for `persist_scrollback`. `None` means defer to
+    /// the global `EzpnConfig.persist_scrollback`.
+    pub persist_scrollback: Option<bool>,
 }
 
 /// Errors returned by [`resolve_env`].
@@ -222,6 +228,11 @@ fn load_project_from(path: &Path) -> Result<ResolvedProject, String> {
         }
     }
 
+    let persist_scrollback = config
+        .workspace
+        .as_ref()
+        .and_then(|ws| ws.persist_scrollback);
+
     Ok(ResolvedProject {
         layout,
         launches,
@@ -232,6 +243,7 @@ fn load_project_from(path: &Path) -> Result<ResolvedProject, String> {
         shells,
         base_dir,
         env_errors,
+        persist_scrollback,
     })
 }
 
