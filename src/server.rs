@@ -323,6 +323,23 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
         let _ = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600));
     }
 
+    // Issue #13: signal the parent (`session::spawn_server`) that the
+    // socket is bound and accepting connections. The parent blocks on
+    // `poll(2)` for this byte instead of polling the socket every 50 ms,
+    // dropping warm-attach latency to a few ms. If the env var isn't set
+    // (e.g. the daemon was launched manually for tests), this is a no-op.
+    if let Ok(fd_str) = std::env::var(session::READY_FD_ENV) {
+        if let Ok(fd) = fd_str.parse::<i32>() {
+            unsafe {
+                let _ = libc::write(fd, b"1".as_ptr() as *const _, 1);
+                libc::close(fd);
+            }
+        }
+        // Don't leave the env around — child PTYs would inherit it,
+        // which is meaningless to them and could mask debugging.
+        std::env::remove_var(session::READY_FD_ENV);
+    }
+
     let mut clients: Vec<ConnectedClient> = Vec::new();
     let mut border_cache: Option<BorderCache> = None;
     let mut render_buf: Vec<u8> = Vec::with_capacity(64 * 1024); // Reusable render buffer

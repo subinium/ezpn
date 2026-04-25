@@ -129,11 +129,42 @@ pub fn find(name: Option<&str>) -> Option<(String, PathBuf)> {
     list().into_iter().next()
 }
 
+/// Environment variable used to hand the daemon the write end of a
+/// parent-owned pipe. The daemon writes one byte after `UnixListener::bind`
+/// succeeds; the parent `poll(2)`s for that byte instead of polling the
+/// socket every 50 ms. See [`spawn_server`].
+pub const READY_FD_ENV: &str = "EZPN_READY_FD";
+
 /// Spawn the server as a detached daemon process.
 /// Returns the socket path once the server is ready.
+///
+/// Uses an inherited pipe ([`READY_FD_ENV`]) for the ready signal, so warm
+/// attach completes within a few milliseconds instead of waking up every
+/// 50 ms to probe for a socket file (issue #13). The 3 s ceiling is kept as
+/// a hard upper bound — if the daemon panics before binding, `poll(2)`
+/// times out and we surface a clear error.
 pub fn spawn_server(session_name: &str, original_args: &[String]) -> anyhow::Result<PathBuf> {
     let exe = std::env::current_exe()?;
     let sock = socket_path(session_name);
+
+    // Create a pipe(2). Parent keeps `read_fd`, hands `write_fd` to the
+    // child via env. We deliberately do NOT mark `write_fd` CLOEXEC because
+    // it must survive the child's exec — the child needs to inherit it,
+    // close it after the bind succeeds, and that close on the write end is
+    // what wakes the parent's poll().
+    let mut fds = [0i32; 2];
+    let pipe_ok = unsafe { libc::pipe(fds.as_mut_ptr()) } == 0;
+    let (read_fd, write_fd) = if pipe_ok { (fds[0], fds[1]) } else { (-1, -1) };
+    if pipe_ok {
+        // FD_CLOEXEC on the read end so it doesn't leak into other children
+        // we spawn later in this process.
+        unsafe {
+            let flags = libc::fcntl(read_fd, libc::F_GETFD);
+            if flags >= 0 {
+                libc::fcntl(read_fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+    }
 
     let mut cmd = Command::new(exe);
     cmd.arg("--server").arg(session_name);
@@ -147,19 +178,69 @@ pub fn spawn_server(session_name: &str, original_args: &[String]) -> anyhow::Res
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
 
+    if pipe_ok {
+        cmd.env(READY_FD_ENV, write_fd.to_string());
+    }
+
+    let captured_write_fd = if pipe_ok { write_fd } else { -1 };
     unsafe {
-        cmd.pre_exec(|| {
+        cmd.pre_exec(move || {
             if libc::setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
+            }
+            // Strip CLOEXEC from the write end so it survives `exec(2)`.
+            // Std `Command` sets CLOEXEC on every parent fd by default.
+            if captured_write_fd >= 0 {
+                let flags = libc::fcntl(captured_write_fd, libc::F_GETFD);
+                if flags >= 0 {
+                    libc::fcntl(captured_write_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+                }
             }
             Ok(())
         });
     }
 
-    cmd.spawn()?;
+    let _child = cmd.spawn()?;
 
-    // Wait for the server to create its socket (up to 3 seconds)
-    // Use is_alive() to confirm via C_PING without side effects
+    // Parent no longer needs the write end — closing it means an early
+    // crash in the child (before bind) collapses the pipe and `poll`
+    // returns POLLHUP immediately rather than blocking the full 3 s.
+    if pipe_ok {
+        unsafe {
+            libc::close(write_fd);
+        }
+    }
+
+    if pipe_ok {
+        // Block until the daemon signals "bind succeeded" or 3 s elapses.
+        let mut pfd = libc::pollfd {
+            fd: read_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd, 1, 3000) };
+        // Drain whatever byte is there; we don't care about its value, only
+        // about the readiness edge.
+        if rc > 0 && (pfd.revents & libc::POLLIN) != 0 {
+            let mut buf = [0u8; 8];
+            unsafe {
+                libc::read(read_fd, buf.as_mut_ptr() as *mut _, buf.len());
+                libc::close(read_fd);
+            }
+            if is_alive(&sock) {
+                return Ok(sock);
+            }
+        } else {
+            unsafe { libc::close(read_fd) };
+        }
+        // Pipe path failed (POLLHUP without write, or timeout). Fall through
+        // to the legacy polling loop so we never leave the user without an
+        // error message.
+    }
+
+    // Fallback: the legacy 50 ms polling loop. Triggered only when the pipe
+    // pre-exec dance fails (rare — locked-down sandboxes that block fcntl)
+    // or when the daemon crashed before binding.
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     while std::time::Instant::now() < deadline {
         if is_alive(&sock) {
