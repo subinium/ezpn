@@ -4,6 +4,7 @@
 //! visual selection (v/V), search (//?), and yank (y) to OSC 52 clipboard.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use unicode_width::UnicodeWidthStr;
 
 /// Copy mode sub-phase.
 pub enum Phase {
@@ -531,7 +532,13 @@ fn execute_search(state: &mut CopyModeState, screen: &vt100::Screen) {
             let byte_pos = start + pos;
             if byte_pos < col_map.len() {
                 let col = col_map[byte_pos];
-                let display_len = lower_query.len().min(col_map.len() - byte_pos) as u16;
+                // Issue #15: highlight length must be display width (cells),
+                // not byte length. "🔍" is 4 bytes but 2 cells; "café" is
+                // 5 bytes but 4 cells. The previous `lower_query.len()`
+                // over-highlighted by 50–200% on emoji / wide-char queries
+                // and bled into adjacent cells.
+                let match_end = (byte_pos + lower_query.len()).min(row_text.len());
+                let display_len = row_text[byte_pos..match_end].width() as u16;
                 matches.push((r, col, display_len));
             }
             start = byte_pos + 1;
