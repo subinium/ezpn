@@ -1,6 +1,45 @@
+# Build artifacts
 /target
-*.swp
-*.swo
+*.profraw
+flamegraph.svg
+/criterion
+/tarpaulin-report.html
+*.lcov
+
+# OS
 .DS_Store
+Thumbs.db
+
+# Editors / IDEs
 .idea/
 .vscode/
+*.swp
+*.swo
+*~
+
+# Local scratch / env
+.env
+.env.*
+!.env.example
+*.local
+.local/
+tmp/
+scratch/
+
+# AI session / agent local state — never commit
+.claude/
+.cursor/
+.aider*
+.omx/
+CLAUDE.md
+AGENTS.md
+
+# Secrets — keep ignored regardless of location
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+*credentials*
+secrets/
+*.pfx
+*.p12

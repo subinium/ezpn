@@ -1,0 +1,38 @@
+name: Feature request
+description: Propose a new capability
+title: "feat: <short description>"
+labels: ["type:feat"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What can't you do today, and why does that matter?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: Concrete shape of the feature — flag, command, config field, keybind.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches and why they fall short.
+
+  - type: textarea
+    id: tmux-parity
+    attributes:
+      label: tmux parity
+      description: How does tmux solve this today (if at all)? Should ezpn match the keybinding/command name?
+
+  - type: textarea
+    id: out-of-scope
+    attributes:
+      label: Out of scope
+      description: What this feature explicitly does NOT do.

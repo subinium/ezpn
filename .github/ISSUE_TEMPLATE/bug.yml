@@ -1,0 +1,71 @@
+name: Bug report
+description: Something doesn't work as documented
+title: "fix: <short description>"
+labels: ["type:fix"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: A concise description of the bug.
+      placeholder: |
+        I ran `ezpn 2 3` in iTerm2, then resized the window to 80×24, and the bottom-right pane drew over the status bar.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Repro steps
+      description: Minimal steps. If possible include a tiny `.ezpn.toml`.
+      placeholder: |
+        1. `ezpn 2 3`
+        2. Press Ctrl+B z to zoom
+        3. Resize terminal
+        4. See artifact
+    validations:
+      required: true
+
+  - type: input
+    id: ezpn-version
+    attributes:
+      label: ezpn version
+      description: "`ezpn --version` output"
+      placeholder: "ezpn 0.5.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: terminal
+    attributes:
+      label: Terminal
+      multiple: false
+      options:
+        - macOS Terminal.app
+        - iTerm2
+        - Alacritty
+        - Kitty
+        - WezTerm
+        - Ghostty
+        - Windows Terminal
+        - GNOME Terminal
+        - Konsole
+        - tmux (nested)
+        - Other (specify in "What happened")
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS / arch
+      placeholder: "macOS 14.5 arm64 / Ubuntu 22.04 x86_64"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / output
+      description: Daemon logs (if any), stack traces, screen recordings.
+      render: shell

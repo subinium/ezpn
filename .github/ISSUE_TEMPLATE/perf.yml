@@ -1,0 +1,39 @@
+name: Performance issue
+description: Latency, memory, or CPU regression
+title: "perf: <short description>"
+labels: ["type:perf"]
+body:
+  - type: textarea
+    id: symptom
+    attributes:
+      label: Symptom
+      description: Slow attach? Render flicker? RSS growth? Be specific.
+    validations:
+      required: true
+
+  - type: textarea
+    id: measurement
+    attributes:
+      label: Measurement
+      description: |
+        How did you measure? Include numbers.
+        Examples: `time ezpn a` (5 runs), `cargo bench --bench render_hotpaths`, `ps -o rss= -p $(pgrep ezpn)` over time.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: workload
+    attributes:
+      label: Workload
+      description: How many panes? Scrollback size? Output rate? Number of attached clients?
+    validations:
+      required: true
+
+  - type: input
+    id: ezpn-version
+    attributes:
+      label: ezpn version
+      placeholder: "ezpn 0.5.0"
+    validations:
+      required: true

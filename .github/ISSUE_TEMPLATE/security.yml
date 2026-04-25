@@ -1,0 +1,30 @@
+name: Security report (non-sensitive)
+description: For sensitive issues, email the maintainer instead of opening publicly
+title: "security: <short description>"
+labels: ["severity:critical"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > **Sensitive vulnerability?** Do NOT open this issue publicly.
+        > Email the maintainer (see profile) with details, repro, and impact.
+        > Use this template only for non-sensitive issues (e.g., hardening suggestions, missing best practice).
+
+  - type: textarea
+    id: issue
+    attributes:
+      label: Description
+      description: What is the issue and what is the impact?
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Repro / proof
+      render: shell
+
+  - type: textarea
+    id: mitigation
+    attributes:
+      label: Suggested mitigation

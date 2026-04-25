@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Sensitive security issue
+    url: https://github.com/subinium
+    about: For sensitive vulnerabilities, contact the maintainer privately instead of opening a public issue.
+  - name: Question / discussion
+    url: https://github.com/subinium/ezpn/discussions
+    about: Usage questions, design discussion, or "is this the right tool?" — use Discussions.
