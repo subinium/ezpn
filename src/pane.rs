@@ -47,7 +47,14 @@ pub struct Pane {
     name: Option<String>,
     exit_code: Option<u32>,
     /// Pending OSC 52 clipboard sequences from child to forward to the terminal.
+    /// Capped at OSC52_MAX_ENTRIES entries / OSC52_MAX_BYTES total — drops oldest on overflow
+    /// to prevent a malicious or buggy child from exhausting memory via clipboard spam.
     pub osc52_pending: Vec<Vec<u8>>,
+    /// Running byte count of `osc52_pending` (sum of inner Vec lengths).
+    osc52_bytes: usize,
+    /// Set when `scan_osc52` had to drop a sequence due to a cap. Used by the status bar
+    /// (and tests) to signal "clipboard truncated"; reset on `take_osc52`.
+    osc52_truncated: bool,
     /// Whether the child has enabled bracketed paste mode (\x1b[?2004h).
     bracketed_paste: bool,
     /// Whether the child has requested focus events (\x1b[?1004h).
@@ -200,6 +207,8 @@ impl Pane {
             name: None,
             exit_code: None,
             osc52_pending: Vec::new(),
+            osc52_bytes: 0,
+            osc52_truncated: false,
             bracketed_paste: false,
             focus_events: false,
             initial_cwd: cwd.map(|p| p.to_path_buf()),
@@ -222,7 +231,12 @@ impl Pane {
             match self.reader_rx.try_recv() {
                 Ok(data) => {
                     // Intercept OSC 52 clipboard sequences before vt100 processing
-                    scan_osc52(&data, &mut self.osc52_pending);
+                    scan_osc52(
+                        &data,
+                        &mut self.osc52_pending,
+                        &mut self.osc52_bytes,
+                        &mut self.osc52_truncated,
+                    );
                     // Track DEC private modes from child output
                     track_dec_modes(&data, &mut self.bracketed_paste, &mut self.focus_events);
                     self.parser.process(&data);
@@ -419,7 +433,27 @@ impl Pane {
 
     /// Take pending OSC 52 clipboard sequences (clears the queue).
     pub fn take_osc52(&mut self) -> Vec<Vec<u8>> {
+        self.osc52_bytes = 0;
+        self.osc52_truncated = false;
         std::mem::take(&mut self.osc52_pending)
+    }
+
+    /// True if `scan_osc52` had to drop sequences since the last `take_osc52` call.
+    /// Surfaced for diagnostics; not currently rendered in the status bar.
+    #[allow(dead_code)]
+    pub fn osc52_was_truncated(&self) -> bool {
+        self.osc52_truncated
+    }
+
+    /// Estimated bytes the pane's vt100 ringbuffer holds. Used by the workspace-level
+    /// memory budget to pick the largest pane to warn about. The estimate is intentionally
+    /// coarse — vt100 doesn't expose precise sizing.
+    #[allow(dead_code)] // wired up by workspace budget in a follow-up; keep API stable now
+    pub fn estimated_scrollback_bytes(&self) -> usize {
+        let screen = self.parser.screen();
+        let (rows, cols) = screen.size();
+        let scrollback = screen.scrollback() + rows as usize;
+        scrollback.saturating_mul(cols as usize).saturating_mul(32)
     }
 
     /// Whether the child has bracketed paste enabled.
@@ -500,8 +534,22 @@ impl Pane {
     }
 }
 
-/// Scan raw PTY output for OSC 52 clipboard sequences and collect them.
-fn scan_osc52(data: &[u8], out: &mut Vec<Vec<u8>>) {
+/// Maximum number of pending OSC 52 sequences per pane. Beyond this, the oldest
+/// sequence is dropped (FIFO) to bound memory under hostile / buggy children.
+pub const OSC52_MAX_ENTRIES: usize = 16;
+
+/// Maximum total bytes of pending OSC 52 sequences per pane. Together with
+/// OSC52_MAX_ENTRIES this guarantees `osc52_pending` never exceeds ~256 KiB.
+pub const OSC52_MAX_BYTES: usize = 256 * 1024;
+
+/// Single-sequence cap: any individual OSC 52 longer than this is rejected
+/// outright (still increments `truncated` for diagnostics). Matches xterm's
+/// historical 100 KiB practical limit; we round up.
+pub const OSC52_MAX_SEQUENCE_BYTES: usize = 128 * 1024;
+
+/// Scan raw PTY output for OSC 52 clipboard sequences and collect them, enforcing
+/// per-pane caps so a runaway child cannot exhaust memory.
+fn scan_osc52(data: &[u8], out: &mut Vec<Vec<u8>>, out_bytes: &mut usize, truncated: &mut bool) {
     const PREFIX: &[u8] = b"\x1b]52;";
     let mut i = 0;
     while i + PREFIX.len() < data.len() {
@@ -511,11 +559,11 @@ fn scan_osc52(data: &[u8], out: &mut Vec<Vec<u8>>) {
             // Find terminator: BEL (\x07) or ST (\x1b\\)
             while i < data.len() {
                 if data[i] == 0x07 {
-                    out.push(data[start..=i].to_vec());
+                    push_osc52_capped(out, out_bytes, truncated, &data[start..=i]);
                     break;
                 }
                 if i + 1 < data.len() && data[i] == 0x1b && data[i + 1] == b'\\' {
-                    out.push(data[start..i + 2].to_vec());
+                    push_osc52_capped(out, out_bytes, truncated, &data[start..i + 2]);
                     i += 1;
                     break;
                 }
@@ -524,6 +572,30 @@ fn scan_osc52(data: &[u8], out: &mut Vec<Vec<u8>>) {
         }
         i += 1;
     }
+}
+
+fn push_osc52_capped(
+    out: &mut Vec<Vec<u8>>,
+    out_bytes: &mut usize,
+    truncated: &mut bool,
+    seq: &[u8],
+) {
+    if seq.len() > OSC52_MAX_SEQUENCE_BYTES {
+        // Single sequence too large — drop it entirely; never half-truncate (terminals
+        // treat partial OSC 52 as protocol error).
+        *truncated = true;
+        return;
+    }
+    // Drop oldest entries until both caps fit.
+    while !out.is_empty()
+        && (out.len() >= OSC52_MAX_ENTRIES || *out_bytes + seq.len() > OSC52_MAX_BYTES)
+    {
+        let dropped = out.remove(0);
+        *out_bytes -= dropped.len();
+        *truncated = true;
+    }
+    *out_bytes += seq.len();
+    out.push(seq.to_vec());
 }
 
 /// Track DEC private mode changes in raw PTY output.
@@ -722,5 +794,72 @@ fn encode_f_key_with_mods(n: u8, has_mods: bool, mods_param: u8) -> Vec<u8> {
             12 => b"\x1b[24~".to_vec(),
             _ => vec![],
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(unused_imports)] // benches/render_hotpaths.rs include pane.rs via #[path];
+                        // when those build under non-test profiles the imports are
+                        // flagged though the mod itself is gated by cfg(test).
+mod osc52_tests {
+    use super::{push_osc52_capped, OSC52_MAX_BYTES, OSC52_MAX_ENTRIES, OSC52_MAX_SEQUENCE_BYTES};
+
+    fn fake_seq(payload_len: usize) -> Vec<u8> {
+        let mut v = b"\x1b]52;c;".to_vec();
+        v.extend(std::iter::repeat_n(b'A', payload_len));
+        v.push(0x07);
+        v
+    }
+
+    #[test]
+    fn entry_cap_drops_oldest() {
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        let mut bytes = 0usize;
+        let mut truncated = false;
+        for _ in 0..(OSC52_MAX_ENTRIES + 4) {
+            let seq = fake_seq(8);
+            push_osc52_capped(&mut out, &mut bytes, &mut truncated, &seq);
+        }
+        assert_eq!(out.len(), OSC52_MAX_ENTRIES);
+        assert!(truncated);
+        assert!(bytes <= OSC52_MAX_BYTES);
+    }
+
+    #[test]
+    fn byte_cap_drops_oldest() {
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        let mut bytes = 0usize;
+        let mut truncated = false;
+        // Each ~32 KiB; should plateau around OSC52_MAX_BYTES / 32 KiB.
+        let big = fake_seq(32 * 1024);
+        for _ in 0..16 {
+            push_osc52_capped(&mut out, &mut bytes, &mut truncated, &big);
+        }
+        assert!(bytes <= OSC52_MAX_BYTES, "bytes={bytes}");
+        assert!(truncated);
+    }
+
+    #[test]
+    fn oversize_sequence_dropped() {
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        let mut bytes = 0usize;
+        let mut truncated = false;
+        let huge = fake_seq(OSC52_MAX_SEQUENCE_BYTES + 1);
+        push_osc52_capped(&mut out, &mut bytes, &mut truncated, &huge);
+        assert!(out.is_empty());
+        assert_eq!(bytes, 0);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn under_caps_keeps_all() {
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        let mut bytes = 0usize;
+        let mut truncated = false;
+        for _ in 0..4 {
+            push_osc52_capped(&mut out, &mut bytes, &mut truncated, &fake_seq(64));
+        }
+        assert_eq!(out.len(), 4);
+        assert!(!truncated);
     }
 }
