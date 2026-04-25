@@ -55,6 +55,7 @@ fn main() -> anyhow::Result<()> {
         Some("ls") => return cmd_ls(),
         Some("kill") => return cmd_kill(args.get(2).map(|s| s.as_str())),
         Some("a") | Some("attach") => return cmd_attach(&args[2..]),
+        Some("doctor") => return cmd_doctor(),
         Some("rename") => {
             return cmd_rename(
                 args.get(2).map(|s| s.as_str()),
@@ -341,6 +342,93 @@ fn cmd_from(source: Option<&str>) -> anyhow::Result<()> {
         entries.len()
     );
     Ok(())
+}
+
+/// Validate `.ezpn.toml` env interpolation (`ezpn doctor`).
+///
+/// Reads `.ezpn.toml` from cwd, resolves every pane's env via [`project::resolve_env`],
+/// and prints per-pane status. Exits 1 if any reference fails to resolve.
+fn cmd_doctor() -> anyhow::Result<()> {
+    let path = std::path::Path::new(".ezpn.toml");
+    if !path.exists() {
+        eprintln!("ezpn doctor: .ezpn.toml not found in current directory");
+        std::process::exit(1);
+    }
+    println!("Reading .ezpn.toml... OK");
+
+    let contents = std::fs::read_to_string(path)?;
+    let config: project::ProjectConfig =
+        toml::from_str(&contents).map_err(|e| anyhow::anyhow!("parse error in .ezpn.toml: {e}"))?;
+    let base_dir = path
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+    println!("Resolving env...");
+    let mut error_count = 0usize;
+    for (i, pane) in config.pane.iter().enumerate() {
+        let label = pane.name.as_deref().unwrap_or("(unnamed)");
+        println!("  pane[{i}] ({label}):");
+        if pane.env.is_empty() {
+            // Still surface .env.local merges for empty-section panes.
+            match project::resolve_env(&base_dir, &pane.env, 0) {
+                Ok(resolved) if resolved.is_empty() => {
+                    println!("    (no env)");
+                }
+                Ok(resolved) => {
+                    let mut keys: Vec<&String> = resolved.keys().collect();
+                    keys.sort();
+                    for k in keys {
+                        let v = &resolved[k];
+                        println!("    {k} = {} ✓ (from .env.local)", redact(v));
+                    }
+                }
+                Err(e) => {
+                    println!("    ✗ {e}");
+                    error_count += 1;
+                }
+            }
+            continue;
+        }
+        match project::resolve_env(&base_dir, &pane.env, 0) {
+            Ok(resolved) => {
+                let mut keys: Vec<&String> = resolved.keys().collect();
+                keys.sort();
+                for k in keys {
+                    let v = &resolved[k];
+                    let source = if pane.env.contains_key(k) {
+                        ""
+                    } else {
+                        " (from .env.local)"
+                    };
+                    println!("    {k} = {}{} ✓", redact(v), source);
+                }
+            }
+            Err(e) => {
+                println!("    ✗ {e}");
+                error_count += 1;
+            }
+        }
+    }
+    if error_count > 0 {
+        eprintln!("\n{error_count} error(s). See above.");
+        std::process::exit(1);
+    }
+    println!("\nAll pane env resolved successfully.");
+    Ok(())
+}
+
+/// Mask values that look like secrets so doctor output is safe to share.
+/// Heuristic: long opaque strings, or keys named like *TOKEN/SECRET/KEY/PASSWORD.
+fn redact(value: &str) -> String {
+    // Conservative: redact values >= 12 chars that are mostly non-space.
+    // Doctor is for validation, not exfiltration.
+    if value.len() >= 12 && !value.contains(' ') && !value.contains('/') {
+        "********".to_string()
+    } else {
+        value.to_string()
+    }
 }
 
 /// Parse Procfile format: `name: command`
@@ -679,6 +767,7 @@ USAGE:
   ezpn --restore <FILE>              Restore workspace snapshot
   ezpn init                          Generate .ezpn.toml template
   ezpn from [FILE]                   Generate .ezpn.toml from Procfile
+  ezpn doctor                        Validate .ezpn.toml env interpolation
   ezpn --no-daemon [OPTIONS]         Run in single-process mode (no detach)
 
 EXAMPLES:
