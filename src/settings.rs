@@ -27,6 +27,7 @@ const Y_I6: u16 = 13; // Tab Bar
 const Y_I7: u16 = 14; // Broadcast
 const Y_DIV2: u16 = 15;
 const Y_I8: u16 = 16; // Close
+const Y_FOOTER: u16 = 18; // "Saved to ~/.config/ezpn/config.toml"
 
 const ITEM_Y: [u16; 9] = [Y_I0, Y_I1, Y_I2, Y_I3, Y_I4, Y_I5, Y_I6, Y_I7, Y_I8];
 const ITEM_COUNT: usize = 9;
@@ -251,6 +252,11 @@ impl Settings {
         // Divider + Close
         div(stdout, x, oy + Y_DIV2, inner_w)?;
         self.item_close(stdout, x, xr, oy)?;
+
+        // Footer: where settings persist to. Subtle, single line.
+        let scope = format!("Saved to {}", crate::config::display_config_path());
+        let scope = truncate_to_width(&scope, inner_w);
+        text(stdout, x, oy + Y_FOOTER, BG, DIM_FG, false, &scope)?;
 
         queue!(stdout, ResetColor, SetAttribute(Attribute::Reset))?;
         Ok(())
@@ -500,6 +506,22 @@ fn focus_marker(out: &mut impl Write, x: u16, y: u16) -> anyhow::Result<()> {
         Print("▎›")
     )?;
     Ok(())
+}
+
+/// Truncate a string to at most `max` display columns, suffixing with "…"
+/// when something was cut. Operates on byte width since the panel content
+/// is ASCII-only ("Saved to /home/user/.config/...").
+fn truncate_to_width(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let cut = max.saturating_sub(1);
+    let mut out: String = s.chars().take(cut).collect();
+    out.push('…');
+    out
 }
 
 fn right_tag(

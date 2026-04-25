@@ -2078,6 +2078,23 @@ fn process_key(
                 update.mark_all(layout);
                 update.border_dirty = true;
             }
+            // Hot-reload config from ~/.config/ezpn/config.toml.
+            // Picks up edits made externally (or by another ezpn instance) without
+            // restarting the daemon. Does NOT touch shell/scrollback/prefix at runtime
+            // since those are sampled at startup.
+            KeyCode::Char('r') => {
+                let cfg = config::load_config();
+                let prev_status = settings.show_status_bar;
+                let prev_tab_bar = settings.show_tab_bar;
+                config::apply_config_to_settings(&cfg, settings);
+                if settings.show_status_bar != prev_status || settings.show_tab_bar != prev_tab_bar
+                {
+                    super::resize_all(panes, layout, tw, th, settings);
+                    update.mark_all(layout);
+                    update.border_dirty = true;
+                }
+                update.full_redraw = true;
+            }
             // Zoom toggle
             KeyCode::Char('z') => {
                 if zoomed_pane.is_some() {
@@ -2213,6 +2230,11 @@ fn process_key(
             super::resize_all(panes, layout, tw, th, settings);
             update.border_dirty = true;
             update.mark_all(layout);
+        }
+        if action == SettingsAction::Changed {
+            if let Err(e) = config::save_settings(settings) {
+                eprintln!("warning: failed to save settings: {e}");
+            }
         }
         update.full_redraw = true;
     } else if key.code == KeyCode::Char('d') && ctrl {
@@ -2506,6 +2528,11 @@ fn process_mouse(
                     super::resize_all(panes, layout, tw, th, settings);
                     update.border_dirty = true;
                     update.mark_all(layout);
+                }
+                if action == SettingsAction::Changed {
+                    if let Err(e) = config::save_settings(settings) {
+                        eprintln!("warning: failed to save settings: {e}");
+                    }
                 }
                 if action == SettingsAction::Changed
                     || action == SettingsAction::Close
