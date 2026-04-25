@@ -639,6 +639,19 @@ fn track_dec_modes(data: &[u8], bracketed_paste: &mut bool, focus_events: &mut b
     }
 }
 
+/// Cached `EZPN_ALT_LEGACY=1` flag — read once at process start so every
+/// keystroke avoids a syscall. Setting this in the parent shell before
+/// `ezpn a` restores the pre-0.7 ESC-prefix encoding for Alt+Char, useful
+/// for very old shells that only understand the legacy form.
+fn alt_legacy_mode() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("EZPN_ALT_LEGACY")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
 fn encode_key(key: KeyEvent) -> Vec<u8> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -682,9 +695,19 @@ fn encode_key(key: KeyEvent) -> Vec<u8> {
             let mut buf = [0u8; 4];
             let s = c.encode_utf8(&mut buf);
             if alt && !shift {
-                let mut v = vec![0x1b];
-                v.extend_from_slice(s.as_bytes());
-                v
+                // Issue #16: Alt+Char now matches Alt+Arrow / Alt+Function-key
+                // encoding (CSI u, RFC 3665), so shells that bind on
+                // \x1b[<code>;3u (zsh / bash with bind, vim, helix) see Alt
+                // input the same way for letters and arrows. Older shells
+                // that only understand the legacy ESC-prefix form can opt
+                // in via `EZPN_ALT_LEGACY=1`.
+                if alt_legacy_mode() {
+                    let mut v = vec![0x1b];
+                    v.extend_from_slice(s.as_bytes());
+                    v
+                } else {
+                    format!("\x1b[{};{}u", c as u32, mods_param).into_bytes()
+                }
             } else if shift && (alt || ctrl) {
                 format!("\x1b[{};{}u", c as u32, mods_param).into_bytes()
             } else {
