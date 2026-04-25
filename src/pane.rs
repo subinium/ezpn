@@ -445,6 +445,25 @@ impl Pane {
         self.osc52_truncated
     }
 
+    /// Reap a finished child without blocking. If the child has exited and
+    /// hadn't been observed yet, sets `alive=false` + `exit_code=Some(...)`
+    /// and returns the exit code. SIGCHLD handler in the daemon iterates
+    /// every pane and calls this so zombies don't accumulate.
+    pub fn update_alive(&mut self) -> Option<u32> {
+        if !self.alive {
+            return None;
+        }
+        match self.child.try_wait() {
+            Ok(Some(status)) => {
+                let code = status.exit_code();
+                self.exit_code = Some(code);
+                self.alive = false;
+                Some(code)
+            }
+            _ => None,
+        }
+    }
+
     /// Estimated bytes the pane's vt100 ringbuffer holds. Used by the workspace-level
     /// memory budget to pick the largest pane to warn about. The estimate is intentionally
     /// coarse — vt100 doesn't expose precise sizing.
@@ -799,8 +818,8 @@ fn encode_f_key_with_mods(n: u8, has_mods: bool, mods_param: u8) -> Vec<u8> {
 
 #[cfg(test)]
 #[allow(unused_imports)] // benches/render_hotpaths.rs include pane.rs via #[path];
-                        // when those build under non-test profiles the imports are
-                        // flagged though the mod itself is gated by cfg(test).
+                         // when those build under non-test profiles the imports are
+                         // flagged though the mod itself is gated by cfg(test).
 mod osc52_tests {
     use super::{push_osc52_capped, OSC52_MAX_BYTES, OSC52_MAX_ENTRIES, OSC52_MAX_SEQUENCE_BYTES};
 

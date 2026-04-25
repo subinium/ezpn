@@ -24,6 +24,7 @@ use crate::protocol;
 use crate::render::{self, BorderCache};
 use crate::session;
 use crate::settings::{Settings, SettingsAction};
+use crate::signals::{Signal as Sig, SignalHandlers};
 use crate::workspace::{self, WorkspaceSnapshot};
 
 /// Input state machine for prefix key support.
@@ -196,6 +197,17 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
     settings.show_status_bar = file_config.show_status_bar;
     settings.show_tab_bar = file_config.show_tab_bar;
     let prefix_key = file_config.prefix_key;
+
+    // Install POSIX signal handlers (issue #11). Failure to install is logged
+    // but non-fatal — the daemon still runs, just without graceful shutdown
+    // and zombie reaping. We never want a syscall failure to block startup.
+    let mut sig_handlers = match SignalHandlers::install() {
+        Ok(h) => Some(h),
+        Err(e) => {
+            eprintln!("ezpn: signal handlers unavailable, running without them: {e}");
+            None
+        }
+    };
 
     // Auto-restart state
     let mut restart_policies: HashMap<usize, project::RestartPolicy> = HashMap::new();
@@ -1193,6 +1205,57 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                             true
                         }
                     });
+                }
+            }
+        }
+
+        // ── POSIX signal handling (issue #11) ──
+        if let Some(sh) = sig_handlers.as_mut() {
+            for sig in sh.drain() {
+                match sig {
+                    Sig::Child => {
+                        // Reap any pane whose child exited externally (e.g. user
+                        // killed it from another terminal). update_alive() is a
+                        // no-op for already-dead panes, so iterating all is cheap.
+                        let mut any_changed = false;
+                        for pane in panes.values_mut() {
+                            if pane.update_alive().is_some() {
+                                any_changed = true;
+                            }
+                        }
+                        if any_changed {
+                            update.full_redraw = true;
+                        }
+                    }
+                    Sig::Terminate => {
+                        // Graceful shutdown: persist the live workspace snapshot
+                        // before tearing down so reattach restores layout/commands.
+                        let snapshot = WorkspaceSnapshot::from_live(
+                            &tab_mgr,
+                            &tab_name,
+                            &layout,
+                            &panes,
+                            active,
+                            zoomed_pane,
+                            broadcast,
+                            &restart_policies,
+                            &default_shell,
+                            settings.border_style,
+                            settings.show_status_bar,
+                            settings.show_tab_bar,
+                            effective_scrollback,
+                        );
+                        workspace::auto_save(session_name, &snapshot);
+                        for pane in panes.values_mut() {
+                            pane.kill();
+                        }
+                        for c in &mut clients {
+                            let _ = protocol::write_msg(&mut c.writer, protocol::S_EXIT, &[]);
+                        }
+                        session::cleanup(session_name);
+                        ipc::cleanup();
+                        return Ok(());
+                    }
                 }
             }
         }

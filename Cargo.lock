@@ -225,6 +225,7 @@ dependencies = [
  "portable-pty",
  "serde",
  "serde_json",
+ "signal-hook",
  "toml",
  "unicode-width 0.2.2",
  "vt100",

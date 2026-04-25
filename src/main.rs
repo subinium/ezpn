@@ -22,6 +22,7 @@ mod render;
 mod server;
 mod session;
 mod settings;
+mod signals;
 mod tab;
 mod workspace;
 
