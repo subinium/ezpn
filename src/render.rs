@@ -1,7 +1,31 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
+use std::sync::OnceLock;
 
 use unicode_width::UnicodeWidthStr;
+
+/// Pre-allocated blank string used by `clear_rect` / `clear_title`. Sized
+/// large enough to cover any sane terminal width (4K terminal screen ≈ 1000
+/// cols at very tiny fonts; we round up). One allocation per process; every
+/// frame's clear path borrows a slice of it.
+///
+/// Lazy `OnceLock` instead of a `const` because `String::from(" ".repeat(N))`
+/// isn't a const fn yet on stable.
+static BLANK_ROW_BUF: OnceLock<String> = OnceLock::new();
+
+const BLANK_ROW_CAP: usize = 1024;
+
+/// Borrow `width` bytes of the shared blank-row buffer. Falls back to a
+/// fresh allocation in the unlikely case `width > BLANK_ROW_CAP` so a
+/// pathological terminal still renders correctly (just slightly slower).
+fn blank_row(width: usize) -> std::borrow::Cow<'static, str> {
+    let buf = BLANK_ROW_BUF.get_or_init(|| " ".repeat(BLANK_ROW_CAP));
+    if width <= buf.len() {
+        std::borrow::Cow::Borrowed(&buf[..width])
+    } else {
+        std::borrow::Cow::Owned(" ".repeat(width))
+    }
+}
 
 use crossterm::{
     cursor, queue,
@@ -476,13 +500,16 @@ fn clear_rect(stdout: &mut impl Write, rect: &Rect) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let blanks = " ".repeat(rect.w as usize);
+    // Reuse the global BLANK_ROW_BUF — issue #14. Avoids one
+    // `" ".repeat(width)` per pane wipe per frame; previously this was the
+    // dominant heap traffic during resize / scroll bursts.
+    let blanks = blank_row(rect.w as usize);
     for row in 0..rect.h {
         queue!(
             stdout,
             cursor::MoveTo(rect.x, rect.y + row),
             ResetColor,
-            Print(&blanks)
+            Print(blanks.as_ref())
         )?;
     }
 
@@ -496,8 +523,13 @@ fn clear_title(stdout: &mut impl Write, rect: &Rect) -> anyhow::Result<()> {
 
     let y = rect.y.saturating_sub(1);
     let x = rect.x;
-    let blanks = " ".repeat(rect.w as usize);
-    queue!(stdout, cursor::MoveTo(x, y), ResetColor, Print(&blanks))?;
+    let blanks = blank_row(rect.w as usize);
+    queue!(
+        stdout,
+        cursor::MoveTo(x, y),
+        ResetColor,
+        Print(blanks.as_ref())
+    )?;
     Ok(())
 }
 
