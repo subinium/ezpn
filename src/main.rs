@@ -96,35 +96,62 @@ fn main() -> anyhow::Result<()> {
         return run_direct(&config);
     }
 
-    // Create a new session and attach
-    // Check for -S/--session flag to set custom session name
-    let session_name = {
-        let mut custom = None;
+    // Resolve session name with precedence:
+    //   1. CLI `-S/--session NAME` (highest)
+    //   2. `.ezpn.toml [session].name` pin
+    //   3. Auto: sanitized basename of cwd
+    //
+    // Then run the chosen "preferred" name through `resolve_session_name`,
+    // which handles atomic collision counters and dead-socket cleanup. The
+    // `force_new` flag (`--new` / `--force-new`) disables the auto-attach
+    // shortcut so users can deterministically spawn a fresh session even when
+    // a live one already owns the preferred slot.
+    let mut cli_session: Option<String> = None;
+    let mut force_new = false;
+    {
         let mut i = 1;
         while i < args.len() {
-            if (args[i] == "-S" || args[i] == "--session") && i + 1 < args.len() {
-                custom = Some(args[i + 1].clone());
-                break;
+            match args[i].as_str() {
+                "-S" | "--session" if i + 1 < args.len() => {
+                    cli_session = Some(args[i + 1].clone());
+                    i += 1;
+                }
+                "--new" | "--force-new" => {
+                    force_new = true;
+                }
+                _ => {}
             }
             i += 1;
         }
-        custom.unwrap_or_else(session::auto_name)
-    };
-
-    // Auto-attach: if a session with this name already exists, attach to it
-    // instead of creating a new one. (Like `cd` into a tmux project.)
-    if let Some((existing_name, existing_path)) = session::find(Some(&session_name)) {
-        match client::run(&existing_path, &existing_name) {
-            Ok(()) => return Ok(()),
-            Err(_) => {
-                // Session was stale — clean up and fall through to create new
-                session::cleanup(&existing_name);
-            }
-        }
     }
 
-    let sock_path = session::spawn_server(&session_name, &original_args)?;
-    client::run(&sock_path, &session_name)
+    let preferred = cli_session
+        .or_else(project::pinned_session_name)
+        .unwrap_or_else(session::auto_base_name);
+
+    match session::resolve_session_name(&preferred, !force_new) {
+        session::SessionResolution::AttachExisting(name) => {
+            // Live session under the preferred name — attach instead of
+            // spawning a duplicate. Matches the historical `cd repo && ezpn`
+            // behavior so existing scripts keep working.
+            let path = session::socket_path(&name);
+            match client::run(&path, &name) {
+                Ok(()) => Ok(()),
+                Err(_) => {
+                    // Connection died mid-attach (server crashed between
+                    // is_alive probe and our connect). Clean up and spawn
+                    // fresh under the same name.
+                    session::cleanup(&name);
+                    let sock_path = session::spawn_server(&name, &original_args)?;
+                    client::run(&sock_path, &name)
+                }
+            }
+        }
+        session::SessionResolution::New(name) => {
+            let sock_path = session::spawn_server(&name, &original_args)?;
+            client::run(&sock_path, &name)
+        }
+    }
 }
 
 fn run_direct(config: &Config) -> anyhow::Result<()> {
@@ -545,6 +572,7 @@ fn parse_args() -> anyhow::Result<Config> {
             "-S" | "--session" => {
                 i += 1; // Skip value — handled in main()
             }
+            "--new" | "--force-new" => {} // Handled in main()
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -790,6 +818,7 @@ OPTIONS:
   -d, --direction <DIR> h (horizontal, default) or v (vertical)
   -s, --shell <SHELL>   Default shell path (default: $SHELL)
   -S, --session <NAME>  Custom session name (default: auto from directory)
+  --new, --force-new    Always spawn a new session (skip auto-attach to live one)
   -h, --help            Show this help
   -V, --version         Show version
 

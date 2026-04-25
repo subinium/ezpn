@@ -34,6 +34,7 @@ pub const ENV_RESOLVE_MAX_DEPTH: u32 = 8;
 #[derive(Deserialize)]
 pub struct ProjectConfig {
     pub workspace: Option<WorkspaceSection>,
+    pub session: Option<SessionSection>,
     #[serde(default)]
     pub pane: Vec<PaneSection>,
 }
@@ -43,6 +44,20 @@ pub struct WorkspaceSection {
     pub layout: Option<String>,
     pub rows: Option<usize>,
     pub cols: Option<usize>,
+}
+
+/// Optional `[session]` section pinning a deterministic session name.
+///
+/// ```toml
+/// [session]
+/// name = "myproject"
+/// ```
+///
+/// When present, this name is preferred over the auto-derived basename.
+/// CLI `-S/--session` still wins over the pin (see `main::main`).
+#[derive(Deserialize)]
+pub struct SessionSection {
+    pub name: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -120,6 +135,27 @@ pub fn load_project() -> Option<Result<ResolvedProject, String>> {
         return None;
     }
     Some(load_project_from(path))
+}
+
+/// Read the pinned `[session].name` from `.ezpn.toml` in cwd, if any.
+///
+/// Returns `None` when:
+/// - `.ezpn.toml` does not exist,
+/// - the file cannot be read or parsed,
+/// - the `[session]` section is absent,
+/// - or `name` is unset.
+///
+/// This is intentionally lenient — a malformed toml should not block the user
+/// from running `ezpn`; the regular `load_project()` path will surface the
+/// parse error later when layout resolution runs.
+pub fn pinned_session_name() -> Option<String> {
+    let path = Path::new(".ezpn.toml");
+    if !path.exists() {
+        return None;
+    }
+    let contents = std::fs::read_to_string(path).ok()?;
+    let config: ProjectConfig = toml::from_str(&contents).ok()?;
+    config.session.and_then(|s| s.name)
 }
 
 fn load_project_from(path: &Path) -> Result<ResolvedProject, String> {

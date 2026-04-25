@@ -311,10 +311,31 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
         .map_err(|e| eprintln!("ezpn-server: IPC unavailable ({e})"))
         .ok();
 
-    // Create session socket and listen for client connections
+    // Create session socket and listen for client connections.
+    //
+    // Bind safety (issue #22): the higher-level `resolve_session_name` in
+    // `main` already arbitrates collisions, but a narrow race remains
+    // between resolve and bind when two `ezpn` processes target the same
+    // free slot in the same millisecond. If the first bind fails with
+    // `EADDRINUSE`, we re-probe the existing socket: if it's a stale file
+    // (no live server answering C_PING), unlink and retry once. If the
+    // sibling is genuinely live we propagate the error rather than
+    // silently renaming, since the parent (`spawn_server`) is polling the
+    // original `session_name` and a rename would break its readiness probe.
     let sock_path = session::socket_path(session_name);
     let _ = std::fs::remove_file(&sock_path);
-    let listener = UnixListener::bind(&sock_path)?;
+    let listener = match UnixListener::bind(&sock_path) {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            if !session::is_alive(&sock_path) {
+                let _ = std::fs::remove_file(&sock_path);
+                UnixListener::bind(&sock_path)?
+            } else {
+                return Err(e.into());
+            }
+        }
+        Err(e) => return Err(e.into()),
+    };
     listener.set_nonblocking(true)?;
 
     #[cfg(unix)]
