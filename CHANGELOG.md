@@ -9,11 +9,23 @@ Entries are written in **functional-only style**: every bullet describes an obse
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-04-26 — Stability & Safety Net
+
 ### Added
+- **Wire-protocol versioning + handshake** (`C_HELLO` / `S_HELLO_OK` / `S_HELLO_ERR`). Mismatched majors are rejected with a clear "please upgrade" message instead of silent corruption. Backwards compatible — older clients without `C_HELLO` keep working.
+- **POSIX signal handling**: `SIGTERM` / `SIGHUP` snapshot the workspace before clean exit; `SIGCHLD` reaps zombie panes.
+- **Per-pane OSC 52 caps** (16 entries / 256 KiB total / 128 KiB single-sequence) — runaway children can no longer exhaust memory via clipboard spam.
+- **Daemon integration test harness**: spawns real `ezpn --server`, asserts handshake + ping + signal lifecycle. Wire-protocol regressions now caught in CI.
 - Repository conventions: `CONTRIBUTING.md`, `MAINTENANCE.md`, GitHub issue/PR templates, label taxonomy, `CODEOWNERS`.
+
+### Fixed
+- **Worker thread panic isolation**: PTY reader, client reader, IPC accept loop and per-client handler are now wrapped with `catch_unwind`. A bad ANSI sequence or malformed message no longer kills the daemon — only the affected pane / client is dropped.
+- Pane spawn thread panics are surfaced gracefully: partial workspace continues instead of aborting the whole session.
+- Clippy `collapsible_match` warnings (10) that broke CI on Rust 1.95.
 
 ### Changed
 - `.gitignore` hardened: secrets, AI-session files, profiling artifacts.
+- CI splits unit and integration test runs for clearer failure rows.
 
 ## [0.5.0] — 2026-04-26
 

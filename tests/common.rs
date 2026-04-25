@@ -55,7 +55,7 @@ pub fn spawn_test_daemon(prefix: &str) -> DaemonHandle {
     // `ezpn --server <name>` is the daemon entrypoint used internally by
     // `session::spawn_server`. It binds the per-session socket and runs the
     // event loop without ever needing a TTY (so it's safe for CI).
-    let child = Command::new(ezpn_bin())
+    let mut child = Command::new(ezpn_bin())
         .args(["--server", &session])
         .env("XDG_RUNTIME_DIR", &runtime)
         .stdin(Stdio::null())
@@ -78,6 +78,11 @@ pub fn spawn_test_daemon(prefix: &str) -> DaemonHandle {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+    // Daemon never bound — make sure the child gets reaped before we panic
+    // so clippy's "spawned process must be wait()ed" lint stays satisfied
+    // and we don't leak a process via an aborted test.
+    let _ = child.kill();
+    let _ = child.wait();
     panic!("daemon socket {} never appeared within 3s", sock.display());
 }
 
@@ -175,15 +180,14 @@ pub fn connect_and_hello(sock: &Path) -> (UnixStream, u32) {
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("set timeout");
 
-    let hello = format!(
-        r#"{{"version":1,"capabilities":7,"client":"integration-test"}}"#,
-    );
+    let hello = r#"{"version":1,"capabilities":7,"client":"integration-test"}"#;
     write_msg(&mut stream, C_HELLO, hello.as_bytes()).expect("send C_HELLO");
 
     let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
     let (tag, body) = read_msg(&mut reader).expect("read hello reply");
     assert_eq!(
-        tag, S_HELLO_OK,
+        tag,
+        S_HELLO_OK,
         "expected S_HELLO_OK, got 0x{tag:02x} body={}",
         String::from_utf8_lossy(&body)
     );
