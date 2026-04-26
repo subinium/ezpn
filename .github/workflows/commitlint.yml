@@ -1,0 +1,30 @@
+name: Commit Lint
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  pr-title:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate PR title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          if ! echo "$TITLE" | grep -qE '^(feat|fix|perf|refactor|chore|docs|test|ci|style|release)(\([a-z][a-z0-9_-]*\))?!?: .{1,72}$'; then
+            echo "PR title must follow Conventional Commits."
+            echo "Allowed types: feat, fix, perf, refactor, chore, docs, test, ci, style, release"
+            echo "Example: feat(daemon): graceful shutdown on SIGTERM"
+            echo "Got: $TITLE"
+            exit 1
+          fi
+
+  commits:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: wagoid/commitlint-github-action@v6
+        with:
+          configFile: .commitlintrc.json

@@ -110,6 +110,24 @@ If any of these regress, a higher-level guarantee breaks.
 
 ---
 
+## Performance profiling
+
+The daemon's hot paths are the per-frame render and the per-event
+dispatch tree. To investigate a regression or validate an Arc/clone
+change, capture a flamegraph against a small but representative
+workload:
+
+- Install: `cargo install flamegraph`
+- Measure: `cargo flamegraph --bin ezpn -- 2 2 -d`
+- Compare baselines before/after a refactor.
+
+The `2 2 -d` invocation spawns a 2x2 grid in direct (single-process)
+mode so the flamegraph captures the live render loop without server
+IPC noise. Pair with `cargo bench --bench render_hotpaths` for
+microbenchmark deltas — keep both numbers in any perf-tagged PR.
+
+---
+
 ## 🎭 Recently decided (don't re-argue)
 
 - **GitHub Flow only — no `develop` branch.** Decided 2026-04 (commit `6560e42`).

@@ -1,0 +1,61 @@
+name: CHANGELOG
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled, edited]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check CHANGELOG entry
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_LABELS: ${{ toJson(github.event.pull_request.labels.*.name) }}
+        run: |
+          set -euo pipefail
+
+          # Skip: dependabot branches
+          if [[ "$PR_HEAD_REF" == dependabot/* ]]; then
+            echo "Skipped: dependabot PR ($PR_HEAD_REF)"
+            exit 0
+          fi
+
+          # Skip: release PRs (release commit IS the changelog update)
+          if [[ "$PR_TITLE" =~ ^chore\(release\): ]] || [[ "$PR_TITLE" =~ ^release: ]]; then
+            echo "Skipped: release PR ($PR_TITLE)"
+            exit 0
+          fi
+
+          # Skip: skip-changelog label
+          if echo "$PR_LABELS" | grep -q '"skip-changelog"'; then
+            echo "Skipped: skip-changelog label present"
+            exit 0
+          fi
+
+          # Inspect changed files
+          files=$(gh pr diff "$PR_NUMBER" --name-only)
+
+          touches_code=false
+          if echo "$files" | grep -qE '^(src/|Cargo\.toml$)'; then
+            touches_code=true
+          fi
+
+          touches_changelog=false
+          if echo "$files" | grep -qx 'CHANGELOG.md'; then
+            touches_changelog=true
+          fi
+
+          if [[ "$touches_code" == true && "$touches_changelog" == false ]]; then
+            echo "::error::PR touches src/** or Cargo.toml but does not update CHANGELOG.md."
+            echo "Add an entry under [Unreleased] in functional-only style."
+            echo "Bypass: add the 'skip-changelog' label, or use a 'chore(release):' / 'release:' title."
+            exit 1
+          fi
+
+          echo "OK: changelog requirement satisfied (touches_code=$touches_code, touches_changelog=$touches_changelog)"
