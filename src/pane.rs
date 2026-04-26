@@ -7,13 +7,23 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// Global wake channel: PTY reader threads send () to wake the server main loop.
-/// Set once by the server with `set_wake_channel()`.
-static WAKE_TX: OnceLock<mpsc::Sender<()>> = OnceLock::new();
+/// Set once by the server with `init_wake_channel()`.
+///
+/// Per SPEC 05 `docs/spec/v0.10.0/05-render-loop-micro-perf.md` §4.2: this is a
+/// **bounded** channel because wake messages are idempotent — the receiver
+/// drains all pending wakes per tick (`event_loop.rs`), so dropping overflow
+/// only loses a redundant signal, never a unique state transition.
+static WAKE_TX: OnceLock<mpsc::SyncSender<()>> = OnceLock::new();
+
+/// Wake-channel capacity. 64 is large enough for steady-state bursts at
+/// 60 fps × handful of panes; overflow only happens when the main loop has
+/// genuinely stalled, in which case extra wakes are noise.
+const WAKE_CHANNEL_CAPACITY: usize = 64;
 
 /// Initialize the global wake channel. Call once from server startup.
 /// Returns the Receiver that the main loop should use.
 pub fn init_wake_channel() -> mpsc::Receiver<()> {
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel::<()>(WAKE_CHANNEL_CAPACITY);
     let _ = WAKE_TX.set(tx);
     rx
 }
@@ -21,7 +31,8 @@ pub fn init_wake_channel() -> mpsc::Receiver<()> {
 /// Send a wake signal to the main loop (used by reader threads and client reader).
 pub fn wake_main_loop() {
     if let Some(tx) = WAKE_TX.get() {
-        let _ = tx.send(());
+        // Wake messages are idempotent — drop on overflow.
+        let _ = tx.try_send(());
     }
 }
 use std::path::PathBuf;
@@ -275,9 +286,17 @@ impl Pane {
                         &mut self.osc52_bytes,
                         &mut self.osc52_truncated,
                     );
-                    // Track DEC private modes from child output
-                    track_dec_modes(&data, &mut self.bracketed_paste, &mut self.focus_events);
+                    // Focus events still need a manual scan because vt100 0.15
+                    // does not expose `?1004h`/`l` state via its public API.
+                    // Bracketed paste (`?2004h`/`l`) is read from the vt100
+                    // screen below — see SPEC 05 §4.1.
+                    track_focus_events(&data, &mut self.focus_events);
                     self.parser.process(&data);
+                    // Cache `bracketed_paste` from vt100 after `process()` so
+                    // the per-keystroke encoder reads a single bool field
+                    // instead of walking the screen state. Updated exactly
+                    // here, the only place where `?2004` state can change.
+                    self.bracketed_paste = self.parser.screen().bracketed_paste();
                     // New output snaps scroll to bottom
                     if self.scroll_offset > 0 {
                         self.scroll_offset = 0;
@@ -753,23 +772,21 @@ fn push_osc52_capped(
     out.push(seq.to_vec());
 }
 
-/// Track DEC private mode changes in raw PTY output.
-fn track_dec_modes(data: &[u8], bracketed_paste: &mut bool, focus_events: &mut bool) {
-    // \x1b[?2004h = enable bracketed paste, \x1b[?2004l = disable
-    // \x1b[?1004h = enable focus events, \x1b[?1004l = disable
-    const BP_ON: &[u8] = b"\x1b[?2004h";
-    const BP_OFF: &[u8] = b"\x1b[?2004l";
+/// Track focus-event mode changes in raw PTY output.
+///
+/// vt100 0.15 does not expose `?1004h`/`l` state via its public API, so we
+/// still scan for it — but only for this single mode pair, halving the
+/// constant cost vs the previous `track_dec_modes`. Bracketed paste
+/// (`?2004`) is read from `vt100::Screen::bracketed_paste()` directly.
+/// See SPEC 05 §4.1.
+fn track_focus_events(data: &[u8], focus_events: &mut bool) {
     const FE_ON: &[u8] = b"\x1b[?1004h";
     const FE_OFF: &[u8] = b"\x1b[?1004l";
-
-    for window in data.windows(BP_ON.len().max(FE_ON.len())) {
-        if window.starts_with(BP_ON) {
-            *bracketed_paste = true;
-        } else if window.starts_with(BP_OFF) {
-            *bracketed_paste = false;
-        } else if window.starts_with(FE_ON) {
+    // FE_ON.len() == FE_OFF.len() == 8; one window size suffices.
+    for window in data.windows(FE_ON.len()) {
+        if window == FE_ON {
             *focus_events = true;
-        } else if window.starts_with(FE_OFF) {
+        } else if window == FE_OFF {
             *focus_events = false;
         }
     }
@@ -1152,6 +1169,114 @@ mod drop_tests {
         assert!(
             elapsed < Duration::from_millis(500),
             "Pane::drop must complete within 500ms (got {elapsed:?})"
+        );
+    }
+}
+
+/// SPEC 05 §4.1 / §4.2 — render-loop micro-perf:
+/// * `track_focus_events` only handles `?1004h`/`l` (no longer scans `?2004`).
+/// * `bracketed_paste` is read from `vt100::Screen::bracketed_paste()` so the
+///   raw-byte scan and vt100 stay in sync without duplicate work.
+/// * The wake channel is bounded (`sync_channel(64)`) and `try_send` drops
+///   overflow, since wake messages are idempotent.
+#[cfg(test)]
+#[allow(unused_imports)]
+mod render_micro_perf_tests {
+    use super::*;
+
+    #[test]
+    fn focus_events_set_via_scan() {
+        let mut fe = false;
+        track_focus_events(b"\x1b[?1004h", &mut fe);
+        assert!(fe, "?1004h must enable focus events");
+        track_focus_events(b"\x1b[?1004l", &mut fe);
+        assert!(!fe, "?1004l must disable focus events");
+    }
+
+    #[test]
+    fn focus_events_scanner_ignores_bracketed_paste() {
+        // Previous track_dec_modes also toggled bracketed_paste; the new
+        // focus-only scanner must NOT touch any other flag.
+        let mut fe = false;
+        track_focus_events(b"\x1b[?2004h", &mut fe);
+        assert!(!fe, "?2004h must not affect focus events");
+        track_focus_events(b"\x1b[?2004l", &mut fe);
+        assert!(!fe, "?2004l must not affect focus events");
+    }
+
+    #[test]
+    fn focus_events_scan_finds_sequence_mid_buffer() {
+        // The scanner walks an 8-byte sliding window; a sequence anywhere in
+        // the chunk must be detected, not only at the start.
+        let mut fe = false;
+        track_focus_events(b"prefix bytes \x1b[?1004h trailing", &mut fe);
+        assert!(fe);
+    }
+
+    #[test]
+    fn bracketed_paste_state_matches_screen() {
+        // Drive a vt100 parser with mode toggles and verify the screen flag
+        // matches the cached value `read_output` would compute. This is the
+        // contract that lets us drop the raw-byte scan for `?2004`.
+        let mut parser = vt100::Parser::new(5, 20, 100);
+        assert!(!parser.screen().bracketed_paste());
+
+        parser.process(b"\x1b[?2004h");
+        assert!(parser.screen().bracketed_paste(), "vt100 must track ?2004h");
+
+        parser.process(b"some output\r\n");
+        assert!(
+            parser.screen().bracketed_paste(),
+            "intermediate output must not flip the flag"
+        );
+
+        parser.process(b"\x1b[?2004l");
+        assert!(
+            !parser.screen().bracketed_paste(),
+            "vt100 must track ?2004l"
+        );
+    }
+
+    #[test]
+    fn bracketed_paste_set_across_split_chunks() {
+        // The mode sequence may arrive split across read() boundaries — vt100
+        // still reassembles correctly. Documents the contract our caller
+        // relies on (cache from screen, not raw scan).
+        let mut parser = vt100::Parser::new(5, 20, 100);
+        parser.process(b"\x1b[?20");
+        parser.process(b"04h");
+        assert!(parser.screen().bracketed_paste());
+    }
+
+    #[test]
+    fn wake_channel_is_bounded_and_drops_on_overflow() {
+        // Use a fresh local channel that mirrors WAKE_TX's shape — the global
+        // is initialised once per process by the daemon, so unit tests can't
+        // re-init it. Verifies the contract: try_send never blocks and never
+        // grows beyond capacity.
+        let (tx, rx) = mpsc::sync_channel::<()>(WAKE_CHANNEL_CAPACITY);
+        for _ in 0..(WAKE_CHANNEL_CAPACITY * 4) {
+            // Mirrors `wake_main_loop`: drop on full, don't block.
+            let _ = tx.try_send(());
+        }
+        let mut drained = 0;
+        while rx.try_recv().is_ok() {
+            drained += 1;
+        }
+        assert_eq!(
+            drained, WAKE_CHANNEL_CAPACITY,
+            "bounded channel must hold exactly capacity entries on overflow"
+        );
+    }
+
+    #[test]
+    fn wake_channel_capacity_is_sane() {
+        // Sanity check on the chosen capacity — large enough to absorb one
+        // tick at 60 fps with a handful of panes (~10s of wakes), small
+        // enough to be O(byte) memory.
+        const _: () = assert!(
+            WAKE_CHANNEL_CAPACITY >= 32 && WAKE_CHANNEL_CAPACITY <= 256,
+            "WAKE_CHANNEL_CAPACITY outside expected range"
         );
     }
 }
