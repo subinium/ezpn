@@ -9,6 +9,8 @@ Entries are written in **functional-only style**: every bullet describes an obse
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-04-26 — Automation, UX & parity foundations
+
 ### Added
 - **Layout primitives for `break-pane` / `join-pane`** (#44, partial): `Layout::detach(id)` extracts a leaf and collapses the parent split into the surviving sibling (returns `None` on the only-leaf case); `Layout::insert_pane(new_id, target, dir, place_after, ratio)` inserts a new leaf next to `target` with caller-chosen direction, slot, and ratio (clamped to `[0.1, 0.9]`). Pane identity is preserved by value: the orchestrating layer moves the `Pane` struct between tabs without touching the PTY, vt100 parser, or child process. 8 unit tests cover SPEC 12 §4.2 cases A/B/C plus the round-trip. IPC variants, CLI subcommands (`ezpn-ctl break-pane` etc.), `TabManager::extract_pane_from_inactive`, and the `prefix !` / `prefix m` / `prefix J` keybindings land in a follow-up.
 - **Regex search in copy mode** (#45, partial): `CopyModeState` gains `search_engine: SearchEngine` (Substring | Regex; default Substring). `find_regex` uses the `regex` crate with smart-case (lowercase-only query gets `(?i)`); invalid patterns return zero matches without panicking. The display-width fix from issue #15 (UnicodeWidthStr for highlight length vs byte length) carries over to both backends. New `CopyModeState::new_with_engine(rows, cols, engine)` constructor lets the daemon read `[copy_mode] search` from config and pick the backend at copy-mode entry. Config wiring, `Ctrl+R` toggle binding, named buffer registry, emacs key table all deferred to a follow-up.
@@ -22,7 +24,8 @@ Entries are written in **functional-only style**: every bullet describes an obse
 - **Wire protocol**: unchanged (still v1).
 - **JSON IPC**: additive variants only (`SendKeys`, `PaneTarget`); old daemons reject the new variant with the existing `invalid request: …` path.
 - **Binary protocol**: additive tags only (`C_SUBSCRIBE`, `S_SUBSCRIBE_OK`, `S_EVENT`, `S_EVENT_OVERFLOW`); `CAP_EVENT_STREAM` bit advertised in `S_HELLO_OK`.
-- **New deps**: `wait-timeout 0.2` (runtime, hooks worker pool).
+- **New runtime deps**: `wait-timeout 0.2` (hooks worker pool), `nucleo-matcher 0.3` (palette foundation, not yet wired), `regex 1` (copy-mode search; previously a transitive via criterion, now an explicit prod dep with `default-features = false` + `["std", "unicode"]`).
+- **Partial scopes**: SPEC 09–13 each ship a foundation in v0.11.0 but defer the user-facing surface (TOML loaders, render paths, IPC variants, CLI subcommands, additional event hooks). Tracked as follow-up PRs against the same SPEC numbers.
 
 ## [0.10.0] — 2026-04-26 — Daemon stability & perf hygiene
 
