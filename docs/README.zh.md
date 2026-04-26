@@ -141,6 +141,11 @@ Ctrl+B 0-9             # 按编号跳转标签页
 | **Kitty 键盘** | `Shift+Enter`、`Ctrl+Arrow`、Alt+Char（CSI u / RFC 3665）— 修饰键正确工作。 |
 | **CJK/Unicode** | 中文、日文、韩文和 emoji 的精确宽度计算。 |
 | **崩溃隔离** | 单个面板崩溃不会拖垮守护进程（信号安全的 SIGTERM/SIGCHLD 处理）。 |
+| **可脚本化输入** | `ezpn-ctl send-keys --pane N -- 'cmd' Enter` — 适用于编辑器、AI 代理、CI 脚本。 |
+| **事件流** | 二进制协议之上的长连接 `S_EVENT` 订阅（`-CC` 风格集成）。 |
+| **钩子** | 声明式 `[[hooks]]` 配置：守护进程事件触发 shell，自带工作线程池和单钩超时。 |
+| **正则搜索** | `[copy_mode] search = "regex"` 将复制模式搜索切换到 POSIX 模式 + smart-case。 |
+| **每面板历史** | `ezpn-ctl clear-history --pane N` / `set-scrollback --pane N --lines L` 运行时控制。 |
 
 ## 布局预设
 
@@ -167,6 +172,26 @@ ezpn init              # 生成 .ezpn.toml 模板
 ezpn from Procfile     # 从 Procfile 导入
 ezpn doctor            # 校验配置 + 环境变量插值，缺失引用时以非零退出
 ```
+
+### 钩子
+
+在守护进程事件上运行 shell 命令。4 线程工作池，每钩独立 `timeout_ms`；每个子进程在自己的进程组中 spawn，使 SIGTERM → SIGKILL 升级能覆盖整棵进程树。
+
+```toml
+# ~/.config/ezpn/config.toml 或 .ezpn.toml
+
+[[hooks]]
+event = "client-attached"
+command = "notify-send 'pane {client_id} attached'"
+shell = true
+timeout_ms = 2000
+
+[[hooks]]
+event = "tab-created"
+command = ["/usr/local/bin/ezpn-tab-init", "{name}", "{tab_index}"]
+```
+
+v0.11 接入了 `client-attached`、`client-detached`、`tab-created`、`tab-closed`、`session-renamed` 5 个事件。变量替换（`{session}`、`{client_id}`、`{pane_id}` 等）会在 exec 之前将每个事件的值代入 `command` 字符串。
 
 ### 环境变量插值
 
@@ -328,9 +353,9 @@ broadcast                    广播切换
 | 插件 | — | WASM | — |
 | 生态系统 | 庞大（30年） | 成长中 | 新兴 |
 
-**ezpn** — 零配置即用的终端分屏。
-**tmux** — 需要深度脚本和插件生态系统时。
-**Zellij** — 想要现代 UI 和 WASM 插件时。
+**ezpn** — 零配置即用的终端分屏 + `ezpn-ctl send-keys` / 事件流 / 钩子的脚本接口。
+**tmux** — 需要深度插件生态系统（TPM 等）时。
+**Zellij** — 想要 WASM 插件时。
 
 ## CLI 参考
 
@@ -348,6 +373,28 @@ ezpn rename OLD NEW      重命名会话
 ezpn init                生成 .ezpn.toml 模板
 ezpn from <FILE>         从 Procfile 导入
 ezpn doctor              校验 .ezpn.toml + 环境变量插值
+```
+
+### `ezpn-ctl`（脚本化）
+
+```
+ezpn-ctl list                                列出面板
+ezpn-ctl split [horizontal|vertical] [PANE]  分割面板
+ezpn-ctl close PANE                          关闭面板
+ezpn-ctl focus PANE                          聚焦面板
+ezpn-ctl save <PATH>                         保存工作区快照
+ezpn-ctl load <PATH>                         恢复工作区
+ezpn-ctl exec PANE <CMD>                     用新命令替换面板
+
+ezpn-ctl send-keys [--pane N | --target current] [--literal] -- <key>...
+                                             向面板 PTY 发送和弦标记或原始字节。
+                                             示例:
+                                               ezpn-ctl send-keys --pane 0 -- 'echo hi' Enter
+                                               ezpn-ctl send-keys --target current -- C-c
+                                               ezpn-ctl send-keys --pane 0 --literal -- $'#!/bin/sh\nexit 0\n'
+
+ezpn-ctl clear-history --pane N              丢弃可见屏幕之上的滚屏内容
+ezpn-ctl set-scrollback --pane N --lines L   调整滚屏环大小（受 scrollback_max_lines 限制）
 ```
 
 ## 许可证

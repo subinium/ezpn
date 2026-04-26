@@ -141,6 +141,11 @@ Ctrl+B 0-9             # 번호로 탭 이동
 | **Kitty 키보드** | `Shift+Enter`, `Ctrl+Arrow`, Alt+Char (CSI u / RFC 3665) — 수정 키 정상 동작. |
 | **CJK/유니코드** | 한국어, 중국어, 일본어, 이모지 정확한 폭 계산. |
 | **크래시 격리** | 패닉이 발생한 패널 하나가 데몬을 죽이지 못함 (시그널 안전한 SIGTERM/SIGCHLD 처리). |
+| **스크립트 가능 입력** | `ezpn-ctl send-keys --pane N -- 'cmd' Enter` — 에디터, AI 에이전트, CI 스크립트용. |
+| **이벤트 스트림** | 바이너리 프로토콜 위 장수명 `S_EVENT` 구독 (`-CC` 스타일 통합용). |
+| **훅** | 선언적 `[[hooks]]` 설정: 데몬 이벤트마다 셸 실행, 워커 풀 + 훅별 타임아웃. |
+| **정규식 검색** | `[copy_mode] search = "regex"` — 복사 모드 검색을 POSIX 패턴 + 스마트 케이스로. |
+| **패널별 히스토리** | `ezpn-ctl clear-history --pane N` / `set-scrollback --pane N --lines L` 런타임 제어. |
 
 ## 레이아웃 프리셋
 
@@ -167,6 +172,26 @@ ezpn init              # .ezpn.toml 템플릿 생성
 ezpn from Procfile     # Procfile에서 가져오기
 ezpn doctor            # 설정 + 환경 변수 보간 검증, 참조 누락 시 비-0 종료
 ```
+
+### 훅
+
+데몬 이벤트마다 셸 명령을 실행. 4-스레드 워커 풀에 훅별 `timeout_ms`; 각 자식 프로세스는 자체 그룹에서 spawn되어 SIGTERM → SIGKILL 단계적 종료가 트리 전체에 도달합니다.
+
+```toml
+# ~/.config/ezpn/config.toml 또는 .ezpn.toml
+
+[[hooks]]
+event = "client-attached"
+command = "notify-send 'pane {client_id} attached'"
+shell = true
+timeout_ms = 2000
+
+[[hooks]]
+event = "tab-created"
+command = ["/usr/local/bin/ezpn-tab-init", "{name}", "{tab_index}"]
+```
+
+v0.11에서 `client-attached`, `client-detached`, `tab-created`, `tab-closed`, `session-renamed` 5개 이벤트를 와이어. 변수 치환(`{session}`, `{client_id}`, `{pane_id}`, …)은 exec 전 `command` 문자열에 이벤트별 값을 삽입.
 
 ### 환경 변수 보간
 
@@ -328,9 +353,9 @@ broadcast                    브로드캐스트 토글
 | 플러그인 | — | WASM | — |
 | 생태계 | 거대 (30년) | 성장중 | 신규 |
 
-**ezpn** — 설정 없이 바로 쓰는 터미널 분할.
-**tmux** — 깊은 스크립팅과 플러그인 생태계가 필요할 때.
-**Zellij** — 모던 UI와 WASM 플러그인을 원할 때.
+**ezpn** — 설정 없이 바로 쓰는 터미널 분할 + `ezpn-ctl send-keys` / 이벤트 스트림 / 훅 스크립팅 표면.
+**tmux** — 깊은 플러그인 생태계(TPM 등)가 필요할 때.
+**Zellij** — WASM 플러그인을 원할 때.
 
 ## CLI 레퍼런스
 
@@ -348,6 +373,28 @@ ezpn rename OLD NEW      세션 이름 변경
 ezpn init                .ezpn.toml 템플릿 생성
 ezpn from <FILE>         Procfile에서 가져오기
 ezpn doctor              .ezpn.toml + 환경 변수 보간 검증
+```
+
+### `ezpn-ctl` (스크립팅)
+
+```
+ezpn-ctl list                                패널 목록
+ezpn-ctl split [horizontal|vertical] [PANE]  패널 분할
+ezpn-ctl close PANE                          패널 닫기
+ezpn-ctl focus PANE                          패널 포커스
+ezpn-ctl save <PATH>                         워크스페이스 스냅샷 저장
+ezpn-ctl load <PATH>                         워크스페이스 복원
+ezpn-ctl exec PANE <CMD>                     패널을 새 명령으로 교체
+
+ezpn-ctl send-keys [--pane N | --target current] [--literal] -- <key>...
+                                             코드 토큰 또는 raw 바이트를 패널 PTY로 전송.
+                                             예시:
+                                               ezpn-ctl send-keys --pane 0 -- 'echo hi' Enter
+                                               ezpn-ctl send-keys --target current -- C-c
+                                               ezpn-ctl send-keys --pane 0 --literal -- $'#!/bin/sh\nexit 0\n'
+
+ezpn-ctl clear-history --pane N              화면 위 스크롤백 제거
+ezpn-ctl set-scrollback --pane N --lines L   스크롤백 링 크기 변경 (scrollback_max_lines로 제한)
 ```
 
 ## 라이선스

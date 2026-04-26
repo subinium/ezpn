@@ -141,6 +141,11 @@ Ctrl+B 0-9             # 番号でタブに移動
 | **Kittyキーボード** | `Shift+Enter`、`Ctrl+Arrow`、Alt+Char（CSI u / RFC 3665）— 修飾キーが正常動作。 |
 | **CJK/Unicode** | 日本語、中国語、韓国語、絵文字の正確な幅計算。 |
 | **クラッシュ分離** | パニックを起こしたペイン1つでデーモン全体は落ちない（シグナルセーフな SIGTERM/SIGCHLD 処理）。 |
+| **スクリプト可能な入力** | `ezpn-ctl send-keys --pane N -- 'cmd' Enter` — エディタ、AIエージェント、CIスクリプト向け。 |
+| **イベントストリーム** | バイナリプロトコル上の長寿命 `S_EVENT` サブスクリプション（`-CC` スタイル統合）。 |
+| **フック** | 宣言的 `[[hooks]]` 設定：デーモンイベントごとにシェル実行、ワーカープール + フックごとのタイムアウト。 |
+| **正規表現検索** | `[copy_mode] search = "regex"` で copy モード検索を POSIX パターン + smart-case に切り替え。 |
+| **ペインごとの履歴** | `ezpn-ctl clear-history --pane N` / `set-scrollback --pane N --lines L` で実行時制御。 |
 
 ## レイアウトプリセット
 
@@ -167,6 +172,26 @@ ezpn init              # .ezpn.toml テンプレート生成
 ezpn from Procfile     # Procfileからインポート
 ezpn doctor            # 設定 + 環境変数の補間を検証、参照が欠けていれば非ゼロで終了
 ```
+
+### フック
+
+デーモンイベントごとにシェルコマンドを実行。4スレッドのワーカープール、フックごとの `timeout_ms` あり。各子プロセスは独自のプロセスグループで spawn されるので、SIGTERM → SIGKILL のエスカレーションがツリー全体に届きます。
+
+```toml
+# ~/.config/ezpn/config.toml または .ezpn.toml
+
+[[hooks]]
+event = "client-attached"
+command = "notify-send 'pane {client_id} attached'"
+shell = true
+timeout_ms = 2000
+
+[[hooks]]
+event = "tab-created"
+command = ["/usr/local/bin/ezpn-tab-init", "{name}", "{tab_index}"]
+```
+
+v0.11 では `client-attached`、`client-detached`、`tab-created`、`tab-closed`、`session-renamed` の 5 イベントを配線。変数展開（`{session}`、`{client_id}`、`{pane_id}`、…）は exec 前に `command` 文字列へイベントごとの値を差し込みます。
 
 ### 環境変数の補間
 
@@ -328,9 +353,9 @@ broadcast                    ブロードキャスト切替
 | プラグイン | — | WASM | — |
 | エコシステム | 巨大（30年） | 成長中 | 新規 |
 
-**ezpn** — 設定不要で即使えるターミナル分割。
-**tmux** — 深いスクリプティングとプラグインエコシステムが必要な場合。
-**Zellij** — モダンUIとWASMプラグインが欲しい場合。
+**ezpn** — 設定不要で即使えるターミナル分割 + `ezpn-ctl send-keys` / イベントストリーム / フックのスクリプト面。
+**tmux** — 深いプラグインエコシステム（TPM など）が必要な場合。
+**Zellij** — WASMプラグインが欲しい場合。
 
 ## CLIリファレンス
 
@@ -348,6 +373,28 @@ ezpn rename OLD NEW      セッション名変更
 ezpn init                .ezpn.toml テンプレート生成
 ezpn from <FILE>         Procfileからインポート
 ezpn doctor              .ezpn.toml と環境変数の補間を検証
+```
+
+### `ezpn-ctl`（スクリプティング）
+
+```
+ezpn-ctl list                                ペイン一覧
+ezpn-ctl split [horizontal|vertical] [PANE]  ペイン分割
+ezpn-ctl close PANE                          ペインを閉じる
+ezpn-ctl focus PANE                          ペインにフォーカス
+ezpn-ctl save <PATH>                         ワークスペーススナップショット保存
+ezpn-ctl load <PATH>                         ワークスペース復元
+ezpn-ctl exec PANE <CMD>                     ペインを新しいコマンドで置き換え
+
+ezpn-ctl send-keys [--pane N | --target current] [--literal] -- <key>...
+                                             コードトークンまたは生バイトをペインの PTY へ送信。
+                                             例:
+                                               ezpn-ctl send-keys --pane 0 -- 'echo hi' Enter
+                                               ezpn-ctl send-keys --target current -- C-c
+                                               ezpn-ctl send-keys --pane 0 --literal -- $'#!/bin/sh\nexit 0\n'
+
+ezpn-ctl clear-history --pane N              可視画面より上のスクロールバックを破棄
+ezpn-ctl set-scrollback --pane N --lines L   スクロールバックのリングサイズ変更（scrollback_max_lines が上限）
 ```
 
 ## ライセンス
