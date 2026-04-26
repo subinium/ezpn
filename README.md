@@ -141,6 +141,11 @@ All tmux keys work — `Ctrl+B %` to split, `Ctrl+B x` to close, `Ctrl+B [` for 
 | **Kitty keyboard**       | `Shift+Enter`, `Ctrl+Arrow`, Alt+Char (CSI u / RFC 3665) — modified keys work correctly.   |
 | **CJK/Unicode**          | Proper width calculation for Korean, Chinese, Japanese, and emoji.                         |
 | **Crash isolation**      | One panicking pane can't take down the daemon (signal-safe SIGTERM/SIGCHLD handling).      |
+| **Scriptable input**     | `ezpn-ctl send-keys --pane N -- 'cmd' Enter` for editors, AI agents, CI scripts.           |
+| **Event stream**         | Long-lived `S_EVENT` subscriptions over the binary protocol (`-CC`-style integrations).    |
+| **Hooks**                | Declarative `[[hooks]]` config: shell out on daemon events with worker pool + per-hook timeouts. |
+| **Regex search**         | `[copy_mode] search = "regex"` opts copy-mode search into POSIX patterns with smart-case.  |
+| **Per-pane history**     | `ezpn-ctl clear-history --pane N` / `set-scrollback --pane N --lines L` for runtime control. |
 
 ## Layout Presets
 
@@ -167,6 +172,26 @@ ezpn init              # Generate .ezpn.toml template
 ezpn from Procfile     # Import from Procfile
 ezpn doctor            # Validate config + env interpolation, exit non-zero on missing refs
 ```
+
+### Hooks
+
+Run a shell command on daemon events. Bounded worker pool (4 threads) with per-hook `timeout_ms`; processes are spawned in their own group so SIGTERM → SIGKILL escalation cleans up the whole tree.
+
+```toml
+# ~/.config/ezpn/config.toml or .ezpn.toml
+
+[[hooks]]
+event = "client-attached"
+command = "notify-send 'pane {client_id} attached'"
+shell = true
+timeout_ms = 2000
+
+[[hooks]]
+event = "tab-created"
+command = ["/usr/local/bin/ezpn-tab-init", "{name}", "{tab_index}"]
+```
+
+v0.11 wires `client-attached`, `client-detached`, `tab-created`, `tab-closed`, `session-renamed`. Variable expansion (`{session}`, `{client_id}`, `{pane_id}`, …) substitutes per-event values into the `command` string before exec.
 
 ### Env interpolation
 
@@ -328,9 +353,9 @@ broadcast                    Toggle broadcast mode
 | Plugin system  | —                         | WASM          | —                         |
 | Ecosystem      | Massive (30 years)        | Growing       | New                       |
 
-**Choose ezpn** if you want terminal splits that just work.
-**Choose tmux** if you need deep scripting and plugin ecosystem.
-**Choose Zellij** if you want a modern UI with WASM plugins.
+**Choose ezpn** if you want terminal splits that just work — plus an `ezpn-ctl send-keys` / event-stream / hooks surface for scripting.
+**Choose tmux** if you need a deep plugin ecosystem (TPM, etc.).
+**Choose Zellij** if you want WASM plugins.
 
 ## CLI Reference
 
@@ -348,6 +373,28 @@ ezpn rename OLD NEW      Rename session
 ezpn init                Generate .ezpn.toml template
 ezpn from <FILE>         Import from Procfile
 ezpn doctor              Validate .ezpn.toml + env interpolation
+```
+
+### `ezpn-ctl` (scripting)
+
+```
+ezpn-ctl list                                List panes
+ezpn-ctl split [horizontal|vertical] [PANE]  Split a pane
+ezpn-ctl close PANE                          Close a pane
+ezpn-ctl focus PANE                          Focus a pane
+ezpn-ctl save <PATH>                         Save workspace snapshot
+ezpn-ctl load <PATH>                         Restore workspace
+ezpn-ctl exec PANE <CMD>                     Replace a pane with a new command
+
+ezpn-ctl send-keys [--pane N | --target current] [--literal] -- <key>...
+                                             Deliver chord-tokens or raw bytes to a pane PTY.
+                                             Examples:
+                                               ezpn-ctl send-keys --pane 0 -- 'echo hi' Enter
+                                               ezpn-ctl send-keys --target current -- C-c
+                                               ezpn-ctl send-keys --pane 0 --literal -- $'#!/bin/sh\nexit 0\n'
+
+ezpn-ctl clear-history --pane N              Drop scrollback above the visible screen
+ezpn-ctl set-scrollback --pane N --lines L   Resize the scrollback ring (capped at scrollback_max_lines)
 ```
 
 ## License
