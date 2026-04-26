@@ -1,3 +1,4 @@
+use crate::daemon::hooks::HookDef;
 use crate::render::BorderStyle;
 use crate::settings::Settings;
 use std::path::PathBuf;
@@ -28,6 +29,10 @@ pub struct EzpnConfig {
     /// Theme name (resolved against `~/.config/ezpn/themes/<name>.toml`
     /// then the embedded built-in palettes).  Defaults to `"default"`.
     pub theme: String,
+    /// SPEC 08 hooks. Loaded from `[[hooks]]` blocks via the real `toml`
+    /// crate (the legacy hand-rolled parser cannot handle TOML arrays).
+    /// Empty vec when no hooks block is present.
+    pub hooks: Vec<HookDef>,
 }
 
 impl Default for EzpnConfig {
@@ -43,8 +48,41 @@ impl Default for EzpnConfig {
             prefix_key: 'b',
             persist_scrollback: false,
             theme: "default".to_string(),
+            hooks: Vec::new(),
         }
     }
+}
+
+/// Helper — `toml`-deserialize just the `[[hooks]]` blocks out of a
+/// config file. Anything unknown to this view is silently ignored, so it
+/// coexists with the legacy hand-rolled key=value parser.
+#[derive(serde::Deserialize, Default)]
+struct HooksOnlyView {
+    #[serde(default)]
+    hooks: Vec<HookDef>,
+}
+
+/// Parse SPEC 08 `[[hooks]]` blocks from a config file's full text,
+/// validate each, and drop invalid entries with a warn line. Returns
+/// only the well-formed hooks so daemon startup never aborts on a bad
+/// hook definition (matches the existing tolerance for malformed
+/// optional sections).
+pub fn parse_hooks_section(contents: &str) -> Vec<HookDef> {
+    let view: HooksOnlyView = match toml::from_str(contents) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("ezpn: hooks parse failed, ignoring: {e}");
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::with_capacity(view.hooks.len());
+    for (i, def) in view.hooks.into_iter().enumerate() {
+        match crate::daemon::hooks::validate(&def, i) {
+            Ok(()) => out.push(def),
+            Err(e) => eprintln!("ezpn: {e}; skipping"),
+        }
+    }
+    out
 }
 
 /// Load config from ~/.config/ezpn/config.toml (simple key=value, no toml dep).
@@ -62,6 +100,9 @@ pub fn load_config() -> EzpnConfig {
     if let Some(path) = existing_config_path() {
         if let Ok(contents) = std::fs::read_to_string(&path) {
             parse_config_into(&contents, &mut config);
+            // SPEC 08: parse the `[[hooks]]` array via the real toml crate;
+            // the hand-rolled parser above can't handle TOML tables/arrays.
+            config.hooks = parse_hooks_section(&contents);
         }
     }
     config
@@ -346,6 +387,66 @@ mod tests {
             Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
             None => std::env::remove_var("XDG_CONFIG_HOME"),
         }
+    }
+
+    #[test]
+    fn parse_hooks_section_round_trip() {
+        let toml_src = r#"
+[[hooks]]
+event = "pane-died"
+command = "notify-send 'pane died'"
+shell = true
+timeout_ms = 2000
+
+[[hooks]]
+event = "client-attached"
+command = ["echo", "hi"]
+"#;
+        let hooks = parse_hooks_section(toml_src);
+        assert_eq!(hooks.len(), 2);
+        assert_eq!(hooks[0].event, crate::daemon::hooks::HookEvent::PaneDied);
+        assert!(hooks[0].shell);
+        assert_eq!(hooks[0].timeout_ms, 2000);
+        assert_eq!(
+            hooks[1].event,
+            crate::daemon::hooks::HookEvent::ClientAttached
+        );
+        // Default timeout when omitted.
+        assert_eq!(
+            hooks[1].timeout_ms,
+            crate::daemon::hooks::HOOK_DEFAULT_TIMEOUT_MS
+        );
+    }
+
+    #[test]
+    fn parse_hooks_section_drops_invalid_entries() {
+        // Entry 0 is valid; entry 1 has out-of-range timeout; entry 2 has
+        // shell metachars without shell=true. Loader should keep entry 0
+        // and drop the rest with warn lines.
+        let toml_src = r#"
+[[hooks]]
+event = "pane-died"
+command = ["true"]
+
+[[hooks]]
+event = "pane-exited"
+command = ["true"]
+timeout_ms = 999999
+
+[[hooks]]
+event = "tab-created"
+command = "echo hi | tee out"
+shell = false
+"#;
+        let hooks = parse_hooks_section(toml_src);
+        assert_eq!(hooks.len(), 1, "only the first valid hook should survive");
+        assert_eq!(hooks[0].event, crate::daemon::hooks::HookEvent::PaneDied);
+    }
+
+    #[test]
+    fn parse_hooks_section_empty_when_no_blocks() {
+        let hooks = parse_hooks_section("shell = \"/bin/zsh\"\nscrollback = 1000\n");
+        assert!(hooks.is_empty());
     }
 
     #[test]
