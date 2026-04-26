@@ -5,4 +5,5 @@
 //! grammar — keep the parser self-contained so both consumers route
 //! through one canonical implementation.
 
+pub mod action;
 pub mod keyspec;

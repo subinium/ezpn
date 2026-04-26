@@ -36,6 +36,14 @@ crossbeam-channel = "0.5"
 # SPEC 08 hooks system: bounded `Child::wait_timeout` so a slow user shell-out
 # cannot exhaust a worker thread. Dual-licensed MIT/Apache, ~200 LoC.
 wait-timeout = "0.2"
+# SPEC 10 fuzzy command palette. Audited (used by Helix, Zed, Yazi).
+# Single-thread API; no async surface. Allowlisted in deny.toml.
+nucleo-matcher = "0.3"
+# SPEC 13 — regex search in copy mode. Already a transitive dep via
+# criterion (dev-only); adding it explicitly puts it in the prod tree.
+# `default-features = false` + ["std", "unicode"] keeps the build size
+# modest by dropping perf-dfa-full / perf-onepass / perf-backtrack.
+regex = { version = "1", default-features = false, features = ["std", "unicode"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
