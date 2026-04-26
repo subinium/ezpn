@@ -99,6 +99,50 @@ Body explains *why*. The diff explains *what*.
 - Releases are cut from `main` via annotated tags (`vX.Y.Z`) + `gh release create` + `cargo publish`.
 - See [`MAINTENANCE.md`](MAINTENANCE.md) for the full release pipeline.
 
+## Module anatomy
+
+The `src/` tree is grouped by concern, not by layer. Start at `main.rs` and follow the dispatch arrows.
+
+```
+src/
+├── main.rs                # ~140 lines, dispatcher only
+├── direct.rs              # `--no-daemon` entry: terminal setup → app::event_loop::run
+├── cli/
+│   ├── mod.rs
+│   ├── parse.rs           # parse_args, parse_args_from, parse_procfile, Config, LayoutSpec
+│   └── help.rs            # --help text (verbatim)
+├── app/                   # foreground (`--no-daemon`) runtime
+│   ├── mod.rs
+│   ├── state.rs           # InputMode, TextSelection, DragState, RenderUpdate, SnapshotExtra
+│   ├── render_ctl.rs      # frame composition, dirty-set helpers, geometry math
+│   ├── lifecycle.rs       # spawn/split/replace/resize/snapshot/clipboard helpers
+│   ├── bootstrap.rs       # build_initial_state + Procfile + command_launches
+│   ├── attach.rs          # cmd_ls/kill/rename/attach/init/from/doctor handlers
+│   ├── input_dispatch.rs  # handle_ipc_command (out-of-band command dispatch)
+│   └── event_loop.rs      # run() — main input → render loop
+├── server.rs              # daemon runtime (#17 will split this further)
+├── client.rs              # attach client
+├── layout.rs              # layout tree, navigation, separator hit-testing
+├── pane.rs                # PTY-backed pane
+├── render.rs              # crossterm render passes + border cache
+├── settings.rs            # in-app settings panel
+├── theme.rs               # TOML theme + truecolor/256/16 downgrade
+├── workspace.rs           # snapshot save/load, TabSnapshot, PaneSnapshot
+├── tab.rs                 # multi-tab manager
+├── project.rs             # .ezpn.toml loader + env interpolation
+├── session.rs             # session naming, socket paths, auto-attach
+├── ipc.rs                 # ezpn-ctl IPC channel
+├── protocol.rs            # wire protocol (client ↔ daemon)
+├── signals.rs             # SIGINT / SIGTERM handling
+├── snapshot_blob.rs       # v3 scrollback codec
+├── copy_mode.rs           # tmux-style copy mode
+├── config.rs              # ~/.config/ezpn/config.toml loader
+└── bin/
+    └── ezpn-ctl.rs        # `ezpn-ctl` companion binary
+```
+
+When adding a helper, ask: does it mutate `(Layout, panes)`? Goes in `app/lifecycle.rs`. Is it render orchestration? `app/render_ctl.rs`. Is it a CLI subcommand handler? `app/attach.rs`. Otherwise pick the smallest existing module that already imports the same dependencies — don't create a new file for one function.
+
 ## Code of conduct
 
 Be direct. Be technical. Don't be a jerk. That's the whole rule.

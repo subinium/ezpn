@@ -120,7 +120,18 @@ impl DragState {
     }
 }
 
-use super::RenderUpdate;
+use crate::app::bootstrap::build_initial_state;
+use crate::app::input_dispatch::handle_ipc_command;
+use crate::app::lifecycle::{
+    base64_encode, close_pane, do_split, extract_selected_text, kill_all_panes, replace_pane,
+    resize_all, spawn_layout_panes, spawn_pane, spawn_snapshot_panes,
+};
+use crate::app::render_ctl::{
+    collect_render_targets, make_inner, reset_render_targets, resize_zoomed_pane,
+    selection_char_count_from_synced, sync_render_targets,
+};
+use crate::app::state::RenderUpdate;
+use crate::cli::parse::parse_args_from;
 
 /// Client message from the reader thread.
 enum ClientMsg {
@@ -178,7 +189,7 @@ static NEXT_CLIENT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 /// Run the server daemon. This function does not return until all panes die
 /// or the server is killed.
 pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
-    let config = super::parse_args_from(args)?;
+    let config = parse_args_from(args)?;
 
     // Load config file defaults
     let file_config = config::load_config();
@@ -218,7 +229,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
     let mut persist_scrollback = file_config.persist_scrollback;
 
     // Build layout and spawn panes (same logic as direct mode)
-    let (mut layout, mut panes, mut active, snapshot_extra) = super::build_initial_state(
+    let (mut layout, mut panes, mut active, snapshot_extra) = build_initial_state(
         &config,
         &mut default_shell,
         &mut settings,
@@ -252,7 +263,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
             let snap_scrollback = extra.scrollback;
 
             for tab_snap in &extra.all_tabs {
-                let tab_panes = super::spawn_snapshot_panes(
+                let tab_panes = spawn_snapshot_panes(
                     &tab_snap.layout,
                     tab_snap,
                     &default_shell,
@@ -280,7 +291,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
             }
 
             // Kill the panes from build_initial_state (we re-spawned everything)
-            super::kill_all_panes(&mut panes);
+            kill_all_panes(&mut panes);
 
             // Build TabManager with correct order; active tab is unpacked
             let (new_mgr, active_tab) = TabManager::from_tabs(all_spawned, extra.active_tab_idx);
@@ -454,7 +465,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                     })
                     .unwrap_or((PaneLaunch::Shell, None, None));
                 let effective_shell = pane_shell.as_deref().unwrap_or(&default_shell);
-                if super::replace_pane(
+                if replace_pane(
                     &mut panes,
                     &layout,
                     pid,
@@ -499,7 +510,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
         if active_tab_dead {
             if tab_mgr.count > 1 {
                 // Other tabs still alive — auto-close this dead tab and switch
-                super::kill_all_panes(&mut panes);
+                kill_all_panes(&mut panes);
                 if let Some(new_tab) = tab_mgr.close_active() {
                     tab_name = new_tab.name;
                     layout = new_tab.layout;
@@ -516,7 +527,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                     last_active = active;
                     prev_active = active;
                     mode = InputMode::Normal;
-                    super::resize_all(&mut panes, &layout, tw, th, &settings);
+                    resize_all(&mut panes, &layout, tw, th, &settings);
                     border_cache = Some(render::build_border_cache_with_style(
                         &layout,
                         settings.show_status_bar,
@@ -540,7 +551,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
         if let Some(zpid) = zoomed_pane {
             if !panes.contains_key(&zpid) {
                 zoomed_pane = None;
-                super::resize_all(&mut panes, &layout, tw, th, &settings);
+                resize_all(&mut panes, &layout, tw, th, &settings);
                 update.mark_all(&layout);
                 update.border_dirty = true;
             }
@@ -781,9 +792,9 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                 tw = ew;
                 th = eh;
                 drag = None;
-                super::resize_all(&mut panes, &layout, tw, th, &settings);
+                resize_all(&mut panes, &layout, tw, th, &settings);
                 if let Some(zpid) = zoomed_pane {
-                    super::resize_zoomed_pane(&mut panes, zpid, tw, th, &settings);
+                    resize_zoomed_pane(&mut panes, zpid, tw, th, &settings);
                 }
                 update.mark_all(&layout);
                 update.border_dirty = true;
@@ -829,9 +840,9 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                 tw = ew;
                 th = eh;
                 drag = None;
-                super::resize_all(&mut panes, &layout, tw, th, &settings);
+                resize_all(&mut panes, &layout, tw, th, &settings);
                 if let Some(zpid) = zoomed_pane {
-                    super::resize_zoomed_pane(&mut panes, zpid, tw, th, &settings);
+                    resize_zoomed_pane(&mut panes, zpid, tw, th, &settings);
                 }
                 update.mark_all(&layout);
                 update.border_dirty = true;
@@ -887,10 +898,10 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                 tab_name = tab_mgr.create_tab(saved);
                 // Create new tab with a single shell pane
                 layout = Layout::from_grid(1, 1);
-                let inner = super::make_inner(tw, th, settings.show_status_bar);
+                let inner = make_inner(tw, th, settings.show_status_bar);
                 let rects = layout.pane_rects(&inner);
                 let (&pid, rect) = rects.iter().next().unwrap();
-                match super::spawn_pane(
+                match spawn_pane(
                     &default_shell,
                     &PaneLaunch::Shell,
                     rect.w.max(1),
@@ -932,7 +943,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                             restart_state = restored.restart_state;
                             zoomed_pane = restored.zoomed_pane;
                             broadcast = restored.broadcast;
-                            super::resize_all(&mut panes, &layout, tw, th, &settings);
+                            resize_all(&mut panes, &layout, tw, th, &settings);
                             border_cache = Some(render::build_border_cache_with_style(
                                 &layout,
                                 settings.show_status_bar,
@@ -982,7 +993,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                         last_active = active;
                         prev_active = active;
                         mode = InputMode::Normal;
-                        super::resize_all(&mut panes, &layout, tw, th, &settings);
+                        resize_all(&mut panes, &layout, tw, th, &settings);
                         border_cache = Some(render::build_border_cache_with_style(
                             &layout,
                             settings.show_status_bar,
@@ -998,7 +1009,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
             }
             TabAction::CloseTab => {
                 if tab_mgr.count > 1 {
-                    super::kill_all_panes(&mut panes);
+                    kill_all_panes(&mut panes);
                     if let Some(new_tab) = tab_mgr.close_active() {
                         tab_name = new_tab.name;
                         layout = new_tab.layout;
@@ -1015,7 +1026,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                         last_active = active;
                         prev_active = active;
                         mode = InputMode::Normal;
-                        super::resize_all(&mut panes, &layout, tw, th, &settings);
+                        resize_all(&mut panes, &layout, tw, th, &settings);
                         border_cache = Some(render::build_border_cache_with_style(
                             &layout,
                             settings.show_status_bar,
@@ -1036,7 +1047,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
             }
             TabAction::KillSession => {
                 // Kill all panes in all tabs
-                super::kill_all_panes(&mut panes);
+                kill_all_panes(&mut panes);
                 tab_mgr.kill_all_inactive();
                 for c in &mut clients {
                     let _ = protocol::write_msg(&mut c.writer, protocol::S_EXIT, &[]);
@@ -1084,7 +1095,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                         let snap_scrollback = snapshot.scrollback;
 
                         // Kill current session
-                        super::kill_all_panes(&mut panes);
+                        kill_all_panes(&mut panes);
                         tab_mgr.kill_all_inactive();
 
                         default_shell = snapshot.shell.clone();
@@ -1096,7 +1107,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                         // Spawn all tabs in order
                         let mut all_tabs: Vec<Tab> = Vec::new();
                         for tab_snap in &snapshot.tabs {
-                            let tp = super::spawn_snapshot_panes(
+                            let tp = spawn_snapshot_panes(
                                 &tab_snap.layout,
                                 tab_snap,
                                 &default_shell,
@@ -1152,7 +1163,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                     continue;
                 }
 
-                let (response, mut ipc_update) = super::handle_ipc_command(
+                let (response, mut ipc_update) = handle_ipc_command(
                     cmd,
                     &mut layout,
                     &mut panes,
@@ -1181,7 +1192,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
 
         if zoomed_pane.is_some() {
             zoomed_pane = Some(active);
-            super::resize_zoomed_pane(&mut panes, active, tw, th, &settings);
+            resize_zoomed_pane(&mut panes, active, tw, th, &settings);
         }
 
         let render_needed = update.needs_render();
@@ -1198,7 +1209,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                 });
                 let needs_selection_chars =
                     zoomed_pane.is_none() && settings.show_status_bar && text_selection.is_some();
-                let render_targets = super::collect_render_targets(
+                let render_targets = collect_render_targets(
                     &panes,
                     &update.dirty_panes,
                     update.full_redraw,
@@ -1207,9 +1218,9 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                         .then(|| text_selection.as_ref().map(|s| s.pane_id))
                         .flatten(),
                 );
-                super::sync_render_targets(&mut panes, &render_targets);
+                sync_render_targets(&mut panes, &render_targets);
                 let selection_chars = if needs_selection_chars {
-                    super::selection_char_count_from_synced(&panes, sel_for_render)
+                    selection_char_count_from_synced(&panes, sel_for_render)
                 } else {
                     0
                 };
@@ -1237,7 +1248,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                     &tab_names_cache,
                 );
 
-                super::reset_render_targets(&mut panes, &render_targets);
+                reset_render_targets(&mut panes, &render_targets);
 
                 // Broadcast frame to all clients; remove failed ones
                 if render_result.is_ok() && !render_buf.is_empty() {
@@ -1432,9 +1443,9 @@ fn accept_client(
         *tw = ew;
         *th = eh;
         *drag = None;
-        super::resize_all(panes, layout, *tw, *th, settings);
+        resize_all(panes, layout, *tw, *th, settings);
         if let Some(zpid) = zoomed_pane {
-            super::resize_zoomed_pane(panes, zpid, *tw, *th, settings);
+            resize_zoomed_pane(panes, zpid, *tw, *th, settings);
         }
     }
 
@@ -1588,7 +1599,7 @@ fn render_frame_to_buf(
         render::draw_help_overlay(buf, tw, th, &settings.theme)?;
     }
     if matches!(mode, InputMode::PaneSelect) {
-        let inner = super::make_inner(tw, th, settings.show_status_bar);
+        let inner = make_inner(tw, th, settings.show_status_bar);
         render::draw_pane_numbers(buf, layout, &inner, &settings.theme)?;
     }
 
@@ -1784,8 +1795,8 @@ fn process_key(
         match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {
                 let target = *active;
-                super::close_pane(layout, panes, active, target);
-                super::resize_all(panes, layout, tw, th, settings);
+                close_pane(layout, panes, active, target);
+                resize_all(panes, layout, tw, th, settings);
                 update.mark_all(layout);
                 update.border_dirty = true;
                 *mode = InputMode::Normal;
@@ -1898,26 +1909,26 @@ fn process_key(
             KeyCode::Left | KeyCode::Char('h')
                 if layout.resize_pane(*active, NavDir::Left, 0.05) =>
             {
-                super::resize_all(panes, layout, tw, th, settings);
+                resize_all(panes, layout, tw, th, settings);
                 update.mark_all(layout);
                 update.border_dirty = true;
             }
             KeyCode::Right | KeyCode::Char('l')
                 if layout.resize_pane(*active, NavDir::Right, 0.05) =>
             {
-                super::resize_all(panes, layout, tw, th, settings);
+                resize_all(panes, layout, tw, th, settings);
                 update.mark_all(layout);
                 update.border_dirty = true;
             }
             KeyCode::Up | KeyCode::Char('k') if layout.resize_pane(*active, NavDir::Up, 0.05) => {
-                super::resize_all(panes, layout, tw, th, settings);
+                resize_all(panes, layout, tw, th, settings);
                 update.mark_all(layout);
                 update.border_dirty = true;
             }
             KeyCode::Down | KeyCode::Char('j')
                 if layout.resize_pane(*active, NavDir::Down, 0.05) =>
             {
-                super::resize_all(panes, layout, tw, th, settings);
+                resize_all(panes, layout, tw, th, settings);
                 update.mark_all(layout);
                 update.border_dirty = true;
             }
@@ -1978,7 +1989,7 @@ fn process_key(
             match action {
                 crate::copy_mode::CopyAction::CopyAndExit(text) => {
                     // OSC 52 clipboard copy
-                    let encoded = super::base64_encode(text.as_bytes());
+                    let encoded = base64_encode(text.as_bytes());
                     let osc = format!("\x1b]52;c;{}\x07", encoded);
                     pane.osc52_pending.push(osc.into_bytes());
                     pane.snap_to_bottom();
@@ -2002,7 +2013,7 @@ fn process_key(
         match key.code {
             // Split
             KeyCode::Char('%') => {
-                let _ = super::do_split(
+                let _ = do_split(
                     layout,
                     panes,
                     *active,
@@ -2017,7 +2028,7 @@ fn process_key(
                 update.border_dirty = true;
             }
             KeyCode::Char('"') => {
-                let _ = super::do_split(
+                let _ = do_split(
                     layout,
                     panes,
                     *active,
@@ -2036,25 +2047,25 @@ fn process_key(
                 *active = layout.next_pane(*active);
             }
             KeyCode::Left => {
-                let i = super::make_inner(tw, th, settings.show_status_bar);
+                let i = make_inner(tw, th, settings.show_status_bar);
                 if let Some(n) = layout.navigate(*active, NavDir::Left, &i) {
                     *active = n;
                 }
             }
             KeyCode::Right => {
-                let i = super::make_inner(tw, th, settings.show_status_bar);
+                let i = make_inner(tw, th, settings.show_status_bar);
                 if let Some(n) = layout.navigate(*active, NavDir::Right, &i) {
                     *active = n;
                 }
             }
             KeyCode::Up => {
-                let i = super::make_inner(tw, th, settings.show_status_bar);
+                let i = make_inner(tw, th, settings.show_status_bar);
                 if let Some(n) = layout.navigate(*active, NavDir::Up, &i) {
                     *active = n;
                 }
             }
             KeyCode::Down => {
-                let i = super::make_inner(tw, th, settings.show_status_bar);
+                let i = make_inner(tw, th, settings.show_status_bar);
                 if let Some(n) = layout.navigate(*active, NavDir::Down, &i) {
                     *active = n;
                 }
@@ -2066,7 +2077,7 @@ fn process_key(
             // Equalize
             KeyCode::Char('E') => {
                 layout.equalize();
-                super::resize_all(panes, layout, tw, th, settings);
+                resize_all(panes, layout, tw, th, settings);
                 update.mark_all(layout);
                 update.border_dirty = true;
             }
@@ -2087,7 +2098,7 @@ fn process_key(
             // Toggle status bar
             KeyCode::Char('s') => {
                 settings.show_status_bar = !settings.show_status_bar;
-                super::resize_all(panes, layout, tw, th, settings);
+                resize_all(panes, layout, tw, th, settings);
                 update.mark_all(layout);
                 update.border_dirty = true;
             }
@@ -2102,7 +2113,7 @@ fn process_key(
                 config::apply_config_to_settings(&cfg, settings);
                 if settings.show_status_bar != prev_status || settings.show_tab_bar != prev_tab_bar
                 {
-                    super::resize_all(panes, layout, tw, th, settings);
+                    resize_all(panes, layout, tw, th, settings);
                     update.mark_all(layout);
                     update.border_dirty = true;
                 }
@@ -2112,12 +2123,12 @@ fn process_key(
             KeyCode::Char('z') => {
                 if zoomed_pane.is_some() {
                     *zoomed_pane = None;
-                    super::resize_all(panes, layout, tw, th, settings);
+                    resize_all(panes, layout, tw, th, settings);
                     update.mark_all(layout);
                     update.border_dirty = true;
                 } else {
                     *zoomed_pane = Some(*active);
-                    super::resize_zoomed_pane(panes, *active, tw, th, settings);
+                    resize_zoomed_pane(panes, *active, tw, th, settings);
                 }
             }
             // Resize mode
@@ -2162,7 +2173,7 @@ fn process_key(
             // Equalize (space)
             KeyCode::Char(' ') => {
                 layout.equalize();
-                super::resize_all(panes, layout, tw, th, settings);
+                resize_all(panes, layout, tw, th, settings);
                 update.mark_all(layout);
                 update.border_dirty = true;
             }
@@ -2240,7 +2251,7 @@ fn process_key(
             update.full_redraw = true;
         }
         if settings.show_status_bar != prev_status || settings.show_tab_bar != prev_tab_bar {
-            super::resize_all(panes, layout, tw, th, settings);
+            resize_all(panes, layout, tw, th, settings);
             update.border_dirty = true;
             update.mark_all(layout);
         }
@@ -2251,7 +2262,7 @@ fn process_key(
         }
         update.full_redraw = true;
     } else if key.code == KeyCode::Char('d') && ctrl {
-        let _ = super::do_split(
+        let _ = do_split(
             layout,
             panes,
             *active,
@@ -2265,7 +2276,7 @@ fn process_key(
         update.mark_all(layout);
         update.border_dirty = true;
     } else if key.code == KeyCode::Char('e') && ctrl {
-        let _ = super::do_split(
+        let _ = do_split(
             layout,
             panes,
             *active,
@@ -2283,11 +2294,11 @@ fn process_key(
         update.full_redraw = true;
     } else if key.code == KeyCode::F(2) {
         layout.equalize();
-        super::resize_all(panes, layout, tw, th, settings);
+        resize_all(panes, layout, tw, th, settings);
         update.mark_all(layout);
         update.border_dirty = true;
     } else if alt {
-        let inner = super::make_inner(tw, th, settings.show_status_bar);
+        let inner = make_inner(tw, th, settings.show_status_bar);
         let nav = match key.code {
             KeyCode::Left => Some(NavDir::Left),
             KeyCode::Right => Some(NavDir::Right),
@@ -2323,7 +2334,7 @@ fn process_key(
             })
             .unwrap_or((PaneLaunch::Shell, None, None));
         let eff_shell = pane_shell.as_deref().unwrap_or(default_shell);
-        if super::replace_pane(
+        if replace_pane(
             panes, layout, *active, launch, eff_shell, tw, th, settings, scrollback,
         )
         .is_ok()
@@ -2357,7 +2368,7 @@ fn execute_command(
     panes: &mut HashMap<usize, Pane>,
     active: &mut usize,
     settings: &mut Settings,
-    update: &mut super::RenderUpdate,
+    update: &mut RenderUpdate,
     default_shell: &str,
     tw: u16,
     th: u16,
@@ -2374,7 +2385,7 @@ fn execute_command(
             } else {
                 Direction::Horizontal
             };
-            let _ = super::do_split(
+            let _ = do_split(
                 layout,
                 panes,
                 *active,
@@ -2399,8 +2410,8 @@ fn execute_command(
         }
         Some("kill-pane") | Some("close-pane") => {
             let target = *active;
-            super::close_pane(layout, panes, active, target);
-            super::resize_all(panes, layout, tw, th, settings);
+            close_pane(layout, panes, active, target);
+            resize_all(panes, layout, tw, th, settings);
             update.mark_all(layout);
             update.border_dirty = true;
         }
@@ -2417,7 +2428,7 @@ fn execute_command(
         Some("select-layout") | Some("layout") => {
             if let Some(spec) = parts.get(1) {
                 if let Ok(new_layout) = Layout::from_spec(spec) {
-                    if let Ok(new_panes) = super::spawn_layout_panes(
+                    if let Ok(new_panes) = spawn_layout_panes(
                         &new_layout,
                         HashMap::new(),
                         default_shell,
@@ -2426,7 +2437,7 @@ fn execute_command(
                         settings,
                         scrollback,
                     ) {
-                        super::kill_all_panes(panes);
+                        kill_all_panes(panes);
                         *layout = new_layout;
                         *panes = new_panes;
                         *active = *layout.pane_ids().first().unwrap_or(&0);
@@ -2438,17 +2449,17 @@ fn execute_command(
         }
         Some("equalize") | Some("even") => {
             layout.equalize();
-            super::resize_all(panes, layout, tw, th, settings);
+            resize_all(panes, layout, tw, th, settings);
             update.mark_all(layout);
             update.border_dirty = true;
         }
         Some("zoom") => {
             if zoomed_pane.is_some() {
                 *zoomed_pane = None;
-                super::resize_all(panes, layout, tw, th, settings);
+                resize_all(panes, layout, tw, th, settings);
             } else {
                 *zoomed_pane = Some(*active);
-                super::resize_zoomed_pane(panes, *active, tw, th, settings);
+                resize_zoomed_pane(panes, *active, tw, th, settings);
             }
             update.mark_all(layout);
             update.border_dirty = true;
@@ -2538,7 +2549,7 @@ fn process_mouse(
                 }
                 if settings.show_status_bar != prev_status || settings.show_tab_bar != prev_tab_bar
                 {
-                    super::resize_all(panes, layout, tw, th, settings);
+                    resize_all(panes, layout, tw, th, settings);
                     update.border_dirty = true;
                     update.mark_all(layout);
                 }
@@ -2558,11 +2569,11 @@ fn process_mouse(
             {
                 match action {
                     render::TitleAction::Close(pid) => {
-                        super::close_pane(layout, panes, active, pid);
-                        super::resize_all(panes, layout, tw, th, settings);
+                        close_pane(layout, panes, active, pid);
+                        resize_all(panes, layout, tw, th, settings);
                     }
                     render::TitleAction::SplitH(pid) => {
-                        let _ = super::do_split(
+                        let _ = do_split(
                             layout,
                             panes,
                             pid,
@@ -2575,7 +2586,7 @@ fn process_mouse(
                         );
                     }
                     render::TitleAction::SplitV(pid) => {
-                        let _ = super::do_split(
+                        let _ = do_split(
                             layout,
                             panes,
                             pid,
@@ -2607,10 +2618,10 @@ fn process_mouse(
                 if is_double && panes.contains_key(&pid) {
                     if zoomed_pane.is_some() {
                         *zoomed_pane = None;
-                        super::resize_all(panes, layout, tw, th, settings);
+                        resize_all(panes, layout, tw, th, settings);
                     } else {
                         *zoomed_pane = Some(pid);
-                        super::resize_zoomed_pane(panes, pid, tw, th, settings);
+                        resize_zoomed_pane(panes, pid, tw, th, settings);
                     }
                     *active = pid;
                     update.mark_all(layout);
@@ -2646,7 +2657,7 @@ fn process_mouse(
             if let Some(ref ds) = drag {
                 let new_ratio = ds.calc_ratio(mouse.column, mouse.row);
                 layout.set_ratio_at_path(&ds.path, new_ratio);
-                super::resize_all(panes, layout, tw, th, settings);
+                resize_all(panes, layout, tw, th, settings);
                 update.mark_all(layout);
                 update.border_dirty = true;
             } else if let Some((pid, anchor_col, anchor_row)) = *selection_anchor {
@@ -2672,7 +2683,7 @@ fn process_mouse(
         }
         MouseEventKind::Up(MouseButton::Left) => {
             if drag.take().is_some() {
-                super::resize_all(panes, layout, tw, th, settings);
+                resize_all(panes, layout, tw, th, settings);
                 update.mark_all(layout);
                 update.border_dirty = true;
             } else if let Some(ref sel) = text_selection {
@@ -2680,7 +2691,7 @@ fn process_mouse(
                 // Note: in server mode, the OSC 52 goes through the output buffer to the client
                 if let Some(pane) = panes.get_mut(&sel.pane_id) {
                     pane.sync_scrollback();
-                    let text = super::extract_selected_text(
+                    let text = extract_selected_text(
                         pane.screen(),
                         sel.pane_id,
                         sel.start_row,
@@ -2690,7 +2701,7 @@ fn process_mouse(
                     );
                     pane.reset_scrollback_view();
                     if !text.is_empty() {
-                        let encoded = super::base64_encode(text.as_bytes());
+                        let encoded = base64_encode(text.as_bytes());
                         let osc = format!("\x1b]52;c;{}\x07", encoded);
                         pane.osc52_pending.push(osc.into_bytes());
                     }
