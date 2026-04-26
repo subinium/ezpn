@@ -13,6 +13,8 @@
   <a href="https://crates.io/crates/ezpn"><img src="https://img.shields.io/crates/v/ezpn?style=flat-square&color=orange" alt="crates.io"></a>
   <a href="../LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="MIT License"></a>
   <a href="https://github.com/subinium/ezpn/actions"><img src="https://img.shields.io/github/actions/workflow/status/subinium/ezpn/ci.yml?style=flat-square&label=CI" alt="CI"></a>
+  <a href="https://github.com/subinium/ezpn/actions/workflows/gitleaks.yml"><img src="https://img.shields.io/github/actions/workflow/status/subinium/ezpn/gitleaks.yml?style=flat-square&label=gitleaks" alt="gitleaks"></a>
+  <a href="https://github.com/subinium/ezpn/actions/workflows/supply-chain.yml"><img src="https://img.shields.io/github/actions/workflow/status/subinium/ezpn/supply-chain.yml?style=flat-square&label=audit" alt="audit"></a>
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey?style=flat-square" alt="Platform">
 </p>
 
@@ -35,8 +37,12 @@ $ ezpn -l dev         # 프리셋 레이아웃
 **프로젝트에서**, `.ezpn.toml`을 레포에 넣고 `ezpn`을 실행하면 모두가 같은 워크스페이스를 사용합니다:
 
 ```toml
+[session]
+name = "myproject"           # 세션 이름 고정 (충돌 시 myproject-1, -2... 로 처리)
+
 [workspace]
 layout = "7:3/1:1"
+persist_scrollback = true    # 스크롤백이 분리/재연결 후에도 유지됨
 
 [[pane]]
 name = "editor"
@@ -46,6 +52,7 @@ command = "nvim ."
 name = "server"
 command = "npm run dev"
 restart = "on_failure"
+env = { NODE_ENV = "${env:NODE_ENV}", DB_URL = "${file:.env.local}" }
 
 [[pane]]
 name = "tests"
@@ -57,7 +64,8 @@ command = "tail -f logs/app.log"
 ```
 
 ```bash
-$ ezpn   # .ezpn.toml을 읽고 전부 시작
+$ ezpn         # .ezpn.toml을 읽고 전부 시작
+$ ezpn doctor  # 실행 전에 환경 변수 보간과 시크릿 참조를 검증
 ```
 
 tmuxinator도 없고. YAML도 없고. 레포에 TOML 파일 하나면 끝.
@@ -67,6 +75,8 @@ tmuxinator도 없고. YAML도 없고. 레포에 TOML 파일 하나면 끝.
 ```bash
 cargo install ezpn
 ```
+
+또는 [최신 릴리스](https://github.com/subinium/ezpn/releases/latest)에서 미리 빌드된 바이너리를 받으세요 — `ezpn-x86_64-unknown-linux-gnu.tar.gz`, `ezpn-x86_64-apple-darwin.tar.gz`, `ezpn-aarch64-apple-darwin.tar.gz`.
 
 <details>
 <summary>소스에서 빌드</summary>
@@ -95,7 +105,10 @@ ezpn a                 # 가장 최근 세션에 재연결
 ezpn a myproject       # 이름으로 재연결
 ezpn ls                # 활성 세션 목록
 ezpn kill myproject    # 세션 종료
+ezpn --new             # $PWD에 기존 세션이 있어도 새 세션을 강제로 생성
 ```
+
+세션 이름은 기본적으로 `basename($PWD)`를 따릅니다. 충돌은 결정론적으로 해결됩니다 — `repo` → `repo-1` → `repo-2` (스캔 중 죽은 소켓은 정리됨). `.ezpn.toml`의 `[session].name = "..."`로 이름을 고정할 수 있습니다.
 
 ### 탭
 
@@ -113,16 +126,21 @@ Ctrl+B 0-9             # 번호로 탭 이동
 |---|---|
 | **제로 설정** | 바로 사용 가능. rc 파일 불필요. |
 | **레이아웃 프리셋** | `dev`, `ide`, `monitor`, `quad`, `stack`, `main`, `trio` |
-| **세션 유지** | tmux처럼 분리/연결. 백그라운드 데몬이 프로세스 유지. |
+| **세션 유지** | tmux처럼 분리/연결. 백그라운드 데몬이 프로세스 유지. 콜드 어태치 50ms 미만. |
+| **스크롤백 저장** | 옵션 `persist_scrollback`으로 분리/재연결 후에도 스크롤백 유지 (v3 스냅샷에서 gzip+bincode). |
 | **탭** | tmux 스타일 윈도우. 탭 바와 마우스 클릭 전환 지원. |
 | **마우스 우선** | 클릭으로 포커스, 드래그로 크기 조절, 스크롤로 히스토리, 드래그로 선택 & 복사. |
-| **복사 모드** | Vi 키, 비주얼 선택, 증분 검색, OSC 52 클립보드. |
+| **복사 모드** | Vi 키, 비주얼 선택, 표시 폭 기반 증분 검색, OSC 52 클립보드. |
 | **커맨드 팔레트** | `Ctrl+B :` tmux 호환 명령어. |
 | **브로드캐스트 모드** | 모든 패널에 동시 입력. |
 | **프로젝트 설정** | `.ezpn.toml` — 레이아웃, 명령어, 환경변수, 자동 재시작. |
+| **환경 변수 보간** | 패널 env에서 `${HOME}`, `${env:VAR}`, `${file:.env.local}`, `${secret:keychain:KEY}` 사용. |
+| **테마** | TOML 팔레트 + 4개 빌트인 (`tokyo-night`, `gruvbox-dark`, `solarized-dark`/`-light`). |
+| **핫 리로드** | `Ctrl+B r`로 분리 없이 `~/.config/ezpn/config.toml` 재로드. |
 | **보더리스 모드** | `ezpn -b none`으로 화면 공간 극대화. |
-| **Kitty 키보드** | `Shift+Enter`, `Ctrl+Arrow` 등 수정 키 정상 동작. |
+| **Kitty 키보드** | `Shift+Enter`, `Ctrl+Arrow`, Alt+Char (CSI u / RFC 3665) — 수정 키 정상 동작. |
 | **CJK/유니코드** | 한국어, 중국어, 일본어, 이모지 정확한 폭 계산. |
+| **크래시 격리** | 패닉이 발생한 패널 하나가 데몬을 죽이지 못함 (시그널 안전한 SIGTERM/SIGCHLD 처리). |
 
 ## 레이아웃 프리셋
 
@@ -147,21 +165,50 @@ ezpn -l trio      # 1/1:1 — 상단 전체 + 하단 2개
 ```bash
 ezpn init              # .ezpn.toml 템플릿 생성
 ezpn from Procfile     # Procfile에서 가져오기
+ezpn doctor            # 설정 + 환경 변수 보간 검증, 참조 누락 시 비-0 종료
 ```
 
-<details>
-<summary>글로벌 설정</summary>
+### 환경 변수 보간
 
-`~/.config/ezpn/config.toml`:
+패널 env 값은 네 가지 참조 형식을 지원합니다:
 
 ```toml
-border = rounded        # single | rounded | heavy | double | none
+[[pane]]
+command = "npm run dev"
+env = {
+  HOME       = "${HOME}",                    # 프로세스 env
+  NODE_ENV   = "${env:NODE_ENV}",            # 명시적 env
+  DB_URL     = "${file:.env.local}",         # dotenv 스타일 파일 조회
+  GH_TOKEN   = "${secret:keychain:GH_TOKEN}",# macOS Keychain (Linux: secret-tool)
+}
+```
+
+`.ezpn.toml` 옆의 `.env.local`은 자동으로 머지되어 `[env]`를 덮어씁니다. OS 키체인을 사용할 수 없을 때 `${secret:keychain:KEY}`는 경고와 함께 `${env:KEY}`로 폴백합니다. 순환을 잡기 위해 재귀 깊이는 8로 제한됩니다.
+
+### 테마
+
+```toml
+# .ezpn.toml 또는 ~/.config/ezpn/config.toml
+theme = "tokyo-night"   # default | tokyo-night | gruvbox-dark | solarized-dark | solarized-light
+```
+
+사용자 테마는 `~/.config/ezpn/themes/<name>.toml`에서 로드됩니다. ezpn은 `$COLORTERM` / `$TERM`을 자동 감지하며 트루컬러가 지원되지 않을 때 256색 또는 16색으로 다운그레이드합니다.
+
+<details>
+<summary>글로벌 설정 (~/.config/ezpn/config.toml)</summary>
+
+```toml
+border = rounded            # single | rounded | heavy | double | none
 shell = /bin/zsh
 scrollback = 10000
 status_bar = true
 tab_bar = true
-prefix = b              # 프리픽스 키 (Ctrl+<key>)
+prefix = b                  # 프리픽스 키 (Ctrl+<key>)
+theme = default             # default | tokyo-night | gruvbox-dark | solarized-dark | solarized-light
+persist_scrollback = false  # 자동 스냅샷에 스크롤백 저장 (기본 비활성)
 ```
+
+설정 패널 변경(`Ctrl+B Shift+,`)은 원자적으로 저장됩니다. 디스크에서 다시 불러오려면 `Ctrl+B r`.
 
 </details>
 
@@ -188,6 +235,7 @@ prefix = b              # 프리픽스 키 (Ctrl+<key>)
 | `[` | 복사 모드 |
 | `B` | 브로드캐스트 |
 | `:` | 커맨드 팔레트 |
+| `r` | 설정 재로드 |
 | `d` | 디태치 |
 | `?` | 도움말 |
 
@@ -292,12 +340,14 @@ ezpn -l <PRESET>         레이아웃 프리셋으로 시작
 ezpn -e <CMD> [-e ...]   패널별 명령어
 ezpn -S <NAME>           이름 지정 세션
 ezpn -b <STYLE>          보더 스타일 (single/rounded/heavy/double/none)
+ezpn --new               새 세션 강제 (기존 세션 자동 연결 건너뛰기)
 ezpn a [NAME]            세션 연결
 ezpn ls                  세션 목록
 ezpn kill [NAME]         세션 종료
 ezpn rename OLD NEW      세션 이름 변경
 ezpn init                .ezpn.toml 템플릿 생성
 ezpn from <FILE>         Procfile에서 가져오기
+ezpn doctor              .ezpn.toml + 환경 변수 보간 검증
 ```
 
 ## 라이선스

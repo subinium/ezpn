@@ -37,8 +37,12 @@ No config files, no setup, no learning curve. Sessions persist in the background
 **In a project**, drop `.ezpn.toml` in your repo and run `ezpn` — everyone gets the same workspace:
 
 ```toml
+[session]
+name = "myproject"           # pin the session name (collisions become myproject-1, -2...)
+
 [workspace]
 layout = "7:3/1:1"
+persist_scrollback = true    # scrollback survives detach/reattach
 
 [[pane]]
 name = "editor"
@@ -48,6 +52,7 @@ command = "nvim ."
 name = "server"
 command = "npm run dev"
 restart = "on_failure"
+env = { NODE_ENV = "${env:NODE_ENV}", DB_URL = "${file:.env.local}" }
 
 [[pane]]
 name = "tests"
@@ -59,7 +64,8 @@ command = "tail -f logs/app.log"
 ```
 
 ```bash
-$ ezpn   # reads .ezpn.toml, starts everything
+$ ezpn         # reads .ezpn.toml, starts everything
+$ ezpn doctor  # validates env interpolation + secret refs before you run
 ```
 
 No tmuxinator. No YAML. Just a TOML file in your repo.
@@ -69,6 +75,8 @@ No tmuxinator. No YAML. Just a TOML file in your repo.
 ```bash
 cargo install ezpn
 ```
+
+Or grab a prebuilt binary from the [latest release](https://github.com/subinium/ezpn/releases/latest) — `ezpn-x86_64-unknown-linux-gnu.tar.gz`, `ezpn-x86_64-apple-darwin.tar.gz`, or `ezpn-aarch64-apple-darwin.tar.gz`.
 
 <details>
 <summary>Build from source</summary>
@@ -97,7 +105,10 @@ ezpn a                 # Reattach to most recent session
 ezpn a myproject       # Reattach by name
 ezpn ls                # List active sessions
 ezpn kill myproject    # Kill a session
+ezpn --new             # Force a new session even if one already exists for $PWD
 ```
+
+Session names default to `basename($PWD)`. Collisions are resolved deterministically — `repo` → `repo-1` → `repo-2` (dead sockets are reaped during the scan). Pin a name in `.ezpn.toml` via `[session].name = "..."`.
 
 ### Tabs
 
@@ -111,20 +122,25 @@ All tmux keys work — `Ctrl+B %` to split, `Ctrl+B x` to close, `Ctrl+B [` for 
 
 ## Features
 
-|                         |                                                                            |
-| ----------------------- | -------------------------------------------------------------------------- |
-| **Zero config**         | Works out of the box. No rc files needed.                                  |
-| **Layout presets**      | `dev`, `ide`, `monitor`, `quad`, `stack`, `main`, `trio`                   |
-| **Session persistence** | Detach/attach like tmux. Background daemon keeps processes alive.          |
-| **Tabs**                | tmux-style windows with tab bar and mouse click switching.                 |
-| **Mouse-first**         | Click to focus, drag to resize, scroll for history, drag to select & copy. |
-| **Copy mode**           | Vi keys, visual selection, incremental search, OSC 52 clipboard.           |
-| **Command palette**     | `Ctrl+B :` with tmux-compatible commands.                                  |
-| **Broadcast mode**      | Type in all panes simultaneously.                                          |
-| **Project config**      | `.ezpn.toml` per project — layout, commands, env vars, auto-restart.       |
-| **Borderless mode**     | `ezpn -b none` for maximum screen space.                                   |
-| **Kitty keyboard**      | `Shift+Enter`, `Ctrl+Arrow`, and modified keys work correctly.             |
-| **CJK/Unicode**         | Proper width calculation for Korean, Chinese, Japanese, and emoji.         |
+|                          |                                                                                            |
+| ------------------------ | ------------------------------------------------------------------------------------------ |
+| **Zero config**          | Works out of the box. No rc files needed.                                                  |
+| **Layout presets**       | `dev`, `ide`, `monitor`, `quad`, `stack`, `main`, `trio`                                   |
+| **Session persistence**  | Detach/attach like tmux. Background daemon keeps processes alive. Sub-50 ms cold attach.   |
+| **Scrollback persist**   | Opt-in `persist_scrollback` survives detach/reattach (gzip+bincode in v3 snapshots).       |
+| **Tabs**                 | tmux-style windows with tab bar and mouse click switching.                                 |
+| **Mouse-first**          | Click to focus, drag to resize, scroll for history, drag to select & copy.                 |
+| **Copy mode**            | Vi keys, visual selection, incremental display-width search, OSC 52 clipboard.             |
+| **Command palette**      | `Ctrl+B :` with tmux-compatible commands.                                                  |
+| **Broadcast mode**       | Type in all panes simultaneously.                                                          |
+| **Project config**       | `.ezpn.toml` per project — layout, commands, env vars, auto-restart.                       |
+| **Env interpolation**    | `${HOME}`, `${env:VAR}`, `${file:.env.local}`, `${secret:keychain:KEY}` in pane env.       |
+| **Themes**               | TOML palette + 4 builtins (`tokyo-night`, `gruvbox-dark`, `solarized-dark`/`-light`).      |
+| **Hot reload**           | `Ctrl+B r` reloads `~/.config/ezpn/config.toml` without detaching.                         |
+| **Borderless mode**      | `ezpn -b none` for maximum screen space.                                                   |
+| **Kitty keyboard**       | `Shift+Enter`, `Ctrl+Arrow`, Alt+Char (CSI u / RFC 3665) — modified keys work correctly.   |
+| **CJK/Unicode**          | Proper width calculation for Korean, Chinese, Japanese, and emoji.                         |
+| **Crash isolation**      | One panicking pane can't take down the daemon (signal-safe SIGTERM/SIGCHLD handling).      |
 
 ## Layout Presets
 
@@ -149,21 +165,50 @@ Drop `.ezpn.toml` in your project root and run `ezpn`. That's it.
 ```bash
 ezpn init              # Generate .ezpn.toml template
 ezpn from Procfile     # Import from Procfile
+ezpn doctor            # Validate config + env interpolation, exit non-zero on missing refs
 ```
 
-<details>
-<summary>Global config</summary>
+### Env interpolation
 
-`~/.config/ezpn/config.toml`:
+Pane env values support four reference forms:
 
 ```toml
-border = rounded        # single | rounded | heavy | double | none
+[[pane]]
+command = "npm run dev"
+env = {
+  HOME       = "${HOME}",                    # process env
+  NODE_ENV   = "${env:NODE_ENV}",            # explicit env
+  DB_URL     = "${file:.env.local}",         # dotenv-style file lookup
+  GH_TOKEN   = "${secret:keychain:GH_TOKEN}",# macOS Keychain (Linux: secret-tool)
+}
+```
+
+`.env.local` next to `.ezpn.toml` is auto-merged and overrides `[env]`. `${secret:keychain:KEY}` falls back to `${env:KEY}` with a warning when the OS keychain isn't available. Recursion is depth-capped at 8 to catch cycles.
+
+### Themes
+
+```toml
+# .ezpn.toml or ~/.config/ezpn/config.toml
+theme = "tokyo-night"   # default | tokyo-night | gruvbox-dark | solarized-dark | solarized-light
+```
+
+User themes load from `~/.config/ezpn/themes/<name>.toml`. ezpn auto-detects `$COLORTERM` / `$TERM` and downgrades to 256 or 16 colors when truecolor isn't supported.
+
+<details>
+<summary>Global config (~/.config/ezpn/config.toml)</summary>
+
+```toml
+border = rounded            # single | rounded | heavy | double | none
 shell = /bin/zsh
 scrollback = 10000
 status_bar = true
 tab_bar = true
-prefix = b              # prefix key (Ctrl+<key>)
+prefix = b                  # prefix key (Ctrl+<key>)
+theme = default             # default | tokyo-night | gruvbox-dark | solarized-dark | solarized-light
+persist_scrollback = false  # save scrollback into auto-snapshots (off by default)
 ```
+
+Settings panel changes (`Ctrl+B Shift+,`) are persisted atomically. Reload from disk with `Ctrl+B r`.
 
 </details>
 
@@ -190,6 +235,7 @@ prefix = b              # prefix key (Ctrl+<key>)
 | `[`         | Copy mode       |
 | `B`         | Broadcast       |
 | `:`         | Command palette |
+| `r`         | Reload config   |
 | `d`         | Detach session  |
 | `?`         | Help            |
 
@@ -294,12 +340,14 @@ ezpn -l <PRESET>         Start with layout preset
 ezpn -e <CMD> [-e ...]   Per-pane commands
 ezpn -S <NAME>           Named session
 ezpn -b <STYLE>          Border style (single/rounded/heavy/double/none)
+ezpn --new               Force a new session (skip auto-attach to existing)
 ezpn a [NAME]            Attach to session
 ezpn ls                  List sessions
 ezpn kill [NAME]         Kill session
 ezpn rename OLD NEW      Rename session
 ezpn init                Generate .ezpn.toml template
 ezpn from <FILE>         Import from Procfile
+ezpn doctor              Validate .ezpn.toml + env interpolation
 ```
 
 ## License
