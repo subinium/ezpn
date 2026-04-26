@@ -1,0 +1,13 @@
+# cargo-audit configuration. Mirrors `[advisories].ignore` in `deny.toml`
+# so the rustsec/audit-check workflow doesn't fire on advisories we've
+# already classified as unactionable (no safe upgrade available upstream).
+
+[advisories]
+ignore = [
+    # bincode 1.3.3 is a final release; the upstream team has stopped
+    # development. We pin to 1.3 deliberately for snapshot v3 stability.
+    "RUSTSEC-2025-0141",
+    # `serial` is a transitive dep of `portable-pty 0.8.x`. No safe
+    # upgrade path until portable-pty migrates.
+    "RUSTSEC-2017-0008",
+]

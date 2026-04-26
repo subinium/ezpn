@@ -11,6 +11,12 @@ on:
 jobs:
   audit:
     runs-on: ubuntu-latest
+    # `checks: write` lets rustsec/audit-check publish a check run.
+    # Without this, the action falls back to a hard error on push events.
+    permissions:
+      contents: read
+      checks: write
+      issues: write
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2
