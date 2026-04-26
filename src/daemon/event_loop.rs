@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use crate::app::state::RenderUpdate;
 use crate::config;
 use crate::daemon::dispatch::process_event;
+use crate::daemon::events::EventBus;
 use crate::daemon::render::render_frame_to_buf;
 use crate::daemon::router::{accept_client, effective_size};
 use crate::daemon::snapshot::capture_workspace;
@@ -112,6 +113,11 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
     // user `Save` IPC is acked synchronously. Drop on `run()` return
     // flushes any pending auto with a 5 s deadline.
     let snapshot_worker = SnapshotWorker::spawn();
+
+    // SPEC 07: event subscription bus. Owns the per-subscriber writer
+    // threads + drop-oldest backpressure. The main loop emits envelopes
+    // through `event_bus.emit_*`; serialization happens off-thread.
+    let mut event_bus = EventBus::new(session_name);
 
     // Tab management
     use crate::tab::{Tab, TabManager};
@@ -511,6 +517,34 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                         let mut w = &conn;
                         let _ = protocol::write_msg(&mut w, protocol::S_PONG, &[]);
                     }
+                    Ok((protocol::C_SUBSCRIBE, payload)) => {
+                        // SPEC 07: register an event subscriber. The connection
+                        // becomes one-way push (S_EVENT) — no further commands
+                        // accepted on it. `register` writes `S_SUBSCRIBE_OK`
+                        // synchronously before moving `conn` into the worker.
+                        match serde_json::from_slice::<protocol::SubscribeRequest>(&payload) {
+                            Ok(req) if !req.topics.is_empty() => {
+                                let filter_session = req.filter.and_then(|f| f.session);
+                                let _ = event_bus.register(req.topics, filter_session, conn);
+                            }
+                            Ok(_) => {
+                                let mut w = &conn;
+                                let _ = protocol::write_msg(
+                                    &mut w,
+                                    protocol::S_HELLO_ERR,
+                                    br#"{"reason":"empty topics list","server_version":1}"#,
+                                );
+                            }
+                            Err(_) => {
+                                let mut w = &conn;
+                                let _ = protocol::write_msg(
+                                    &mut w,
+                                    protocol::S_HELLO_ERR,
+                                    br#"{"reason":"malformed subscribe payload","server_version":1}"#,
+                                );
+                            }
+                        }
+                    }
                     Ok((protocol::C_KILL, _)) => {
                         // Kill server: kill all panes and exit
                         for pane in panes.values_mut() {
@@ -527,6 +561,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                         // New protocol: attach with mode
                         if let Ok(req) = serde_json::from_slice::<protocol::AttachRequest>(&payload)
                         {
+                            let prev_count = clients.len();
                             accept_client(
                                 conn,
                                 req.cols,
@@ -543,11 +578,21 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                                 zoomed_pane,
                                 &mut update,
                             );
+                            // SPEC 07: emit `client.attached` if the accept
+                            // actually added a client (it might have just
+                            // detached others in steal mode without adding
+                            // anyone if the socket clone failed).
+                            if clients.len() > prev_count {
+                                if let Some(c) = clients.last() {
+                                    event_bus.emit_client_attached(c.id, c.mode, c.tw, c.th);
+                                }
+                            }
                         }
                     }
                     Ok((protocol::C_RESIZE, payload)) => {
                         // Legacy client attach — always steal mode
                         if let Some((w, h)) = protocol::decode_resize(&payload) {
+                            let prev_count = clients.len();
                             accept_client(
                                 conn,
                                 w,
@@ -564,6 +609,11 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                                 zoomed_pane,
                                 &mut update,
                             );
+                            if clients.len() > prev_count {
+                                if let Some(c) = clients.last() {
+                                    event_bus.emit_client_attached(c.id, c.mode, c.tw, c.th);
+                                }
+                            }
                         }
                     }
                     _ => {
@@ -572,6 +622,11 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                 }
             }
         }
+
+        // SPEC 07: reap event subscribers whose worker thread has exited
+        // (consumer hung up, EPIPE, or panic). Cheap — `is_finished()` is
+        // a single atomic load per subscriber.
+        event_bus.reap_dead();
 
         // ── Process client events from all clients ──
         let mut detach_ids: Vec<u64> = Vec::new();
@@ -712,11 +767,13 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
             if let Some(pos) = clients.iter().position(|c| c.id == *id) {
                 let _ = clients[pos].outbound_tx.try_send(OutboundMsg::Detached);
                 clients.remove(pos);
+                event_bus.emit_client_detached(*id, "detach_request");
             }
         }
         for id in &disconnect_ids {
             if let Some(pos) = clients.iter().position(|c| c.id == *id) {
                 clients.remove(pos);
+                event_bus.emit_client_detached(*id, "socket_closed");
             }
         }
         // Recompute effective size after any client changes
@@ -859,6 +916,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                     TabAction::GoToTab(idx) => idx,
                     _ => unreachable!(),
                 };
+                let from_index = tab_mgr.active_idx;
                 if target != tab_mgr.active_idx && target < tab_mgr.count {
                     let current_tab = Tab {
                         name: std::mem::take(&mut tab_name),
@@ -879,6 +937,9 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                         restart_state = new_tab.restart_state;
                         zoomed_pane = new_tab.zoomed_pane;
                         broadcast = new_tab.broadcast;
+                        // SPEC 07: emit `tab.switched` once we know the
+                        // target took (the switch is gated above).
+                        event_bus.emit_tab_switched(from_index, target, &tab_name);
                         // Reset per-interaction state on tab switch
                         drag = None;
                         selection_anchor = None;
