@@ -11,10 +11,13 @@ mod layout;
 mod pane;
 #[path = "../src/render.rs"]
 mod render;
+#[path = "../src/theme.rs"]
+mod theme;
 
 use layout::{Layout, Rect};
 use pane::{Pane, PaneLaunch};
 use render::BorderStyle;
+use theme::{AdaptedTheme, TermCaps};
 
 const TERM_W: u16 = 160;
 const TERM_H: u16 = 48;
@@ -115,6 +118,7 @@ fn bench_render(c: &mut Criterion) {
             .first()
             .expect("pane order should not be empty");
 
+        let bench_theme: AdaptedTheme = theme::default_theme().adapt(TermCaps::TRUECOLOR);
         group.bench_function(BenchmarkId::new("full_redraw", name), |b| {
             let dirty = HashSet::new();
             let mut buf = Vec::with_capacity(64 * 1024);
@@ -135,6 +139,7 @@ fn bench_render(c: &mut Criterion) {
                     true,
                     None,
                     false,
+                    &bench_theme,
                 )
                 .expect("full redraw render");
                 criterion::black_box(&buf);
@@ -162,6 +167,7 @@ fn bench_render(c: &mut Criterion) {
                     false,
                     None,
                     false,
+                    &bench_theme,
                 )
                 .expect("partial redraw render");
                 criterion::black_box(&buf);

@@ -1,4 +1,5 @@
 use crate::render::BorderStyle;
+use crate::settings::Settings;
 use std::path::PathBuf;
 
 /// Runtime config merged from: defaults < config file < CLI args.
@@ -10,6 +11,14 @@ pub struct EzpnConfig {
     pub show_tab_bar: bool,
     /// Prefix key character (default: 'b' for Ctrl+B).
     pub prefix_key: char,
+    /// Whether to persist pane scrollback into auto-saved snapshots.
+    /// Off by default (snapshots stay small); enable to restore terminal
+    /// contents on reattach. May be overridden per-project via `.ezpn.toml`'s
+    /// `[workspace] persist_scrollback`.
+    pub persist_scrollback: bool,
+    /// Theme name (resolved against `~/.config/ezpn/themes/<name>.toml`
+    /// then the embedded built-in palettes).  Defaults to `"default"`.
+    pub theme: String,
 }
 
 impl Default for EzpnConfig {
@@ -21,6 +30,8 @@ impl Default for EzpnConfig {
             show_status_bar: true,
             show_tab_bar: true,
             prefix_key: 'b',
+            persist_scrollback: false,
+            theme: "default".to_string(),
         }
     }
 }
@@ -32,48 +43,66 @@ impl Default for EzpnConfig {
 ///   scrollback = 10000
 ///   status_bar = true
 ///   tab_bar = true
+///   theme = tokyo-night
+///
+/// `[ui]` section headers are accepted but ignored — every key is global.
 pub fn load_config() -> EzpnConfig {
     let mut config = EzpnConfig::default();
-    if let Some(path) = config_path() {
+    if let Some(path) = existing_config_path() {
         if let Ok(contents) = std::fs::read_to_string(&path) {
-            for line in contents.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                if let Some((key, value)) = line.split_once('=') {
-                    let key = key.trim();
-                    let value = normalize_value(value);
-                    match key {
-                        "border" => {
-                            if let Some(style) = BorderStyle::from_str(value) {
-                                config.border = style;
-                            }
-                        }
-                        "shell" => config.shell = value.to_string(),
-                        "scrollback" => {
-                            if let Ok(n) = value.parse::<usize>() {
-                                config.scrollback = n.min(100_000);
-                            }
-                        }
-                        "status_bar" => config.show_status_bar = value == "true",
-                        "tab_bar" => config.show_tab_bar = value == "true",
-                        "prefix" => {
-                            // Accept single char like "a" or "b"
-                            let ch = value.to_lowercase();
-                            if let Some(c) = ch.chars().next() {
-                                if c.is_ascii_lowercase() {
-                                    config.prefix_key = c;
-                                }
-                            }
-                        }
-                        _ => {} // ignore unknown keys
-                    }
-                }
-            }
+            parse_config_into(&contents, &mut config);
         }
     }
     config
+}
+
+fn parse_config_into(contents: &str, config: &mut EzpnConfig) {
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Section headers like `[ui]` are accepted but ignored — every
+        // recognised key is global. Lets users author
+        // `[ui]\ntheme = "..."` without surprising failures.
+        if line.starts_with('[') && line.ends_with(']') {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            let key = key.trim();
+            let value = normalize_value(value);
+            match key {
+                "border" => {
+                    if let Some(style) = BorderStyle::from_str(value) {
+                        config.border = style;
+                    }
+                }
+                "shell" => config.shell = value.to_string(),
+                "scrollback" => {
+                    if let Ok(n) = value.parse::<usize>() {
+                        config.scrollback = n.min(100_000);
+                    }
+                }
+                "status_bar" => config.show_status_bar = value == "true",
+                "tab_bar" => config.show_tab_bar = value == "true",
+                "persist_scrollback" => {
+                    config.persist_scrollback = value == "true";
+                }
+                "prefix" => {
+                    let ch = value.to_lowercase();
+                    if let Some(c) = ch.chars().next() {
+                        if c.is_ascii_lowercase() {
+                            config.prefix_key = c;
+                        }
+                    }
+                }
+                "theme" if !value.is_empty() => {
+                    config.theme = value.to_string();
+                }
+                _ => {} // ignore unknown keys
+            }
+        }
+    }
 }
 
 fn normalize_value(value: &str) -> &str {
@@ -88,8 +117,9 @@ fn normalize_value(value: &str) -> &str {
     value
 }
 
-fn config_path() -> Option<PathBuf> {
-    // Try XDG_CONFIG_HOME, then ~/.config
+/// Resolve the config file path, regardless of whether it currently exists.
+/// Used for both reads and writes.
+pub fn config_path() -> anyhow::Result<PathBuf> {
     let dir = std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
@@ -97,12 +127,33 @@ fn config_path() -> Option<PathBuf> {
             home.push(".config");
             home
         });
-    let path = dir.join("ezpn").join("config.toml");
-    if path.exists() {
-        Some(path)
+    Ok(dir.join("ezpn").join("config.toml"))
+}
+
+/// Convenience for callers that only care about an *existing* config.
+pub fn existing_config_path() -> Option<PathBuf> {
+    let p = config_path().ok()?;
+    if p.exists() {
+        Some(p)
     } else {
         None
     }
+}
+
+/// User-friendly display path for the config file (with leading "~/" when
+/// inside $HOME). Used by the settings panel header to show users where
+/// their changes are saved.
+pub fn display_config_path() -> String {
+    let path = match config_path() {
+        Ok(p) => p,
+        Err(_) => return "~/.config/ezpn/config.toml".to_string(),
+    };
+    if let Ok(home) = std::env::var("HOME") {
+        if let Ok(stripped) = path.strip_prefix(&home) {
+            return format!("~/{}", stripped.display());
+        }
+    }
+    path.display().to_string()
 }
 
 fn dirs_fallback() -> PathBuf {
@@ -111,14 +162,162 @@ fn dirs_fallback() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/tmp"))
 }
 
+/// Serialize the live settings panel state to the same key=value format
+/// `load_config` understands. Only the knobs the panel can change are
+/// emitted; other keys (shell, scrollback, prefix) are not present here
+/// since the panel does not expose them.
+fn serialize_settings(s: &Settings) -> String {
+    let border = match s.border_style {
+        BorderStyle::Single => "single",
+        BorderStyle::Rounded => "rounded",
+        BorderStyle::Heavy => "heavy",
+        BorderStyle::Double => "double",
+        BorderStyle::None => "none",
+    };
+    let mut out = String::new();
+    out.push_str("# Written by ezpn settings panel.\n");
+    out.push_str("# Edit by hand or via Ctrl+B Shift+, — reload with Ctrl+B r.\n");
+    out.push_str(&format!("border = {border}\n"));
+    out.push_str(&format!("status_bar = {}\n", s.show_status_bar));
+    out.push_str(&format!("tab_bar = {}\n", s.show_tab_bar));
+    out
+}
+
+/// Persist settings panel state to `~/.config/ezpn/config.toml` using an
+/// atomic write (tmp file + rename). Creates the parent directory if it
+/// doesn't exist. The temp filename includes the current pid so concurrent
+/// daemons don't clobber each other's tmp files.
+pub fn save_settings(s: &Settings) -> anyhow::Result<()> {
+    let path = config_path()?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let pid = std::process::id();
+    let tmp_name = format!(
+        "{}.tmp.{pid}",
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "config.toml".to_string())
+    );
+    let tmp = path.with_file_name(tmp_name);
+    let contents = serialize_settings(s);
+    if let Err(e) = std::fs::write(&tmp, contents) {
+        // Best-effort cleanup; rename never happened.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+/// Apply file-loaded config knobs to a live `Settings` value. Only the
+/// fields the settings panel manages are touched.
+pub fn apply_config_to_settings(cfg: &EzpnConfig, s: &mut Settings) {
+    s.border_style = cfg.border;
+    s.show_status_bar = cfg.show_status_bar;
+    s.show_tab_bar = cfg.show_tab_bar;
+}
+
 #[cfg(test)]
 mod tests {
-    use super::normalize_value;
+    use super::*;
+    use crate::render::BorderStyle;
+    use crate::settings::Settings;
+    use std::sync::Mutex;
+
+    /// Serializes tests that mutate the `XDG_CONFIG_HOME` env var so they
+    /// don't race when cargo runs them in parallel within the same process.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn normalize_value_trims_quotes() {
         assert_eq!(normalize_value("rounded"), "rounded");
         assert_eq!(normalize_value(" \"rounded\" "), "rounded");
         assert_eq!(normalize_value(" '/bin/zsh' "), "/bin/zsh");
+    }
+
+    #[test]
+    fn save_then_parse_roundtrips_panel_state() {
+        let mut s = Settings::new(BorderStyle::Heavy);
+        s.show_status_bar = false;
+        s.show_tab_bar = true;
+
+        let serialized = serialize_settings(&s);
+        let mut cfg = EzpnConfig::default();
+        parse_config_into(&serialized, &mut cfg);
+
+        assert_eq!(cfg.border, BorderStyle::Heavy);
+        assert!(!cfg.show_status_bar);
+        assert!(cfg.show_tab_bar);
+    }
+
+    #[test]
+    fn save_settings_writes_atomically_and_leaves_no_tmp() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        // Point XDG_CONFIG_HOME at our scratch dir for the duration of this test.
+        let prev = std::env::var("XDG_CONFIG_HOME").ok();
+        std::env::set_var("XDG_CONFIG_HOME", tmpdir.path());
+
+        let mut s = Settings::new(BorderStyle::Double);
+        s.show_status_bar = true;
+        s.show_tab_bar = false;
+
+        save_settings(&s).expect("save should succeed");
+
+        let path = tmpdir.path().join("ezpn").join("config.toml");
+        assert!(path.exists(), "config.toml should exist after save");
+
+        // No leftover *.tmp.* siblings.
+        let dir = path.parent().unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(dir)
+            .expect("read_dir")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("config.toml.tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "expected no .tmp.* files, found {leftovers:?}"
+        );
+
+        // Round-trip via the public loader.
+        let loaded = std::fs::read_to_string(&path).expect("read");
+        let mut cfg = EzpnConfig::default();
+        parse_config_into(&loaded, &mut cfg);
+        assert_eq!(cfg.border, BorderStyle::Double);
+        assert!(cfg.show_status_bar);
+        assert!(!cfg.show_tab_bar);
+
+        // Restore env.
+        match prev {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+    }
+
+    #[test]
+    fn save_settings_creates_missing_parent_dir() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let prev = std::env::var("XDG_CONFIG_HOME").ok();
+        std::env::set_var("XDG_CONFIG_HOME", tmpdir.path().join("does-not-exist-yet"));
+
+        let s = Settings::new(BorderStyle::Single);
+        save_settings(&s).expect("save should create parent dir");
+
+        let path = tmpdir
+            .path()
+            .join("does-not-exist-yet")
+            .join("ezpn")
+            .join("config.toml");
+        assert!(path.exists());
+
+        match prev {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
     }
 }

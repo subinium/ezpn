@@ -193,7 +193,8 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
     } else {
         file_config.border
     };
-    let mut settings = Settings::new(effective_border);
+    let theme = crate::theme::load_theme(&file_config.theme).adapt(crate::theme::detect_caps());
+    let mut settings = Settings::with_theme(effective_border, theme);
     settings.show_status_bar = file_config.show_status_bar;
     settings.show_tab_bar = file_config.show_tab_bar;
     let prefix_key = file_config.prefix_key;
@@ -212,6 +213,10 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
     // Auto-restart state
     let mut restart_policies: HashMap<usize, project::RestartPolicy> = HashMap::new();
 
+    // Scrollback persistence opt-in: starts from the global config and may be
+    // overridden by `.ezpn.toml`'s `[workspace] persist_scrollback`.
+    let mut persist_scrollback = file_config.persist_scrollback;
+
     // Build layout and spawn panes (same logic as direct mode)
     let (mut layout, mut panes, mut active, snapshot_extra) = super::build_initial_state(
         &config,
@@ -219,6 +224,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
         &mut settings,
         &mut restart_policies,
         effective_scrollback,
+        &mut persist_scrollback,
     )?;
 
     let mut drag: Option<DragState> = None;
@@ -311,10 +317,31 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
         .map_err(|e| eprintln!("ezpn-server: IPC unavailable ({e})"))
         .ok();
 
-    // Create session socket and listen for client connections
+    // Create session socket and listen for client connections.
+    //
+    // Bind safety (issue #22): the higher-level `resolve_session_name` in
+    // `main` already arbitrates collisions, but a narrow race remains
+    // between resolve and bind when two `ezpn` processes target the same
+    // free slot in the same millisecond. If the first bind fails with
+    // `EADDRINUSE`, we re-probe the existing socket: if it's a stale file
+    // (no live server answering C_PING), unlink and retry once. If the
+    // sibling is genuinely live we propagate the error rather than
+    // silently renaming, since the parent (`spawn_server`) is polling the
+    // original `session_name` and a rename would break its readiness probe.
     let sock_path = session::socket_path(session_name);
     let _ = std::fs::remove_file(&sock_path);
-    let listener = UnixListener::bind(&sock_path)?;
+    let listener = match UnixListener::bind(&sock_path) {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            if !session::is_alive(&sock_path) {
+                let _ = std::fs::remove_file(&sock_path);
+                UnixListener::bind(&sock_path)?
+            } else {
+                return Err(e.into());
+            }
+        }
+        Err(e) => return Err(e.into()),
+    };
     listener.set_nonblocking(true)?;
 
     #[cfg(unix)]
@@ -830,6 +857,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                 settings.show_status_bar,
                 settings.show_tab_bar,
                 effective_scrollback,
+                persist_scrollback,
             );
             workspace::auto_save(session_name, &snapshot);
             mode = InputMode::Normal;
@@ -1039,6 +1067,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                         settings.show_status_bar,
                         settings.show_tab_bar,
                         effective_scrollback,
+                        persist_scrollback,
                     );
                     let response = match workspace::save_snapshot(path, &snapshot) {
                         Ok(()) => ipc::IpcResponse::success(format!("saved {}", path)),
@@ -1059,7 +1088,8 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                         tab_mgr.kill_all_inactive();
 
                         default_shell = snapshot.shell.clone();
-                        settings = Settings::new(snapshot.border_style);
+                        let preserved_theme = settings.theme.clone();
+                        settings = Settings::with_theme(snapshot.border_style, preserved_theme);
                         settings.show_status_bar = snapshot.show_status_bar;
                         settings.show_tab_bar = snapshot.show_tab_bar;
 
@@ -1261,6 +1291,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                             settings.show_status_bar,
                             settings.show_tab_bar,
                             effective_scrollback,
+                            persist_scrollback,
                         );
                         workspace::auto_save(session_name, &snapshot);
                         for pane in panes.values_mut() {
@@ -1467,6 +1498,7 @@ fn render_frame_to_buf(
                 tw,
                 th,
                 settings.show_status_bar,
+                &settings.theme,
             )?;
         }
         if settings.show_status_bar {
@@ -1485,6 +1517,7 @@ fn render_frame_to_buf(
                 zoom_label,
                 pane_name,
                 0,
+                &settings.theme,
             )?;
         }
         queue!(buf, terminal::EndSynchronizedUpdate)?;
@@ -1505,6 +1538,7 @@ fn render_frame_to_buf(
             full_redraw,
             selection,
             broadcast,
+            &settings.theme,
         )?;
         let is_text_input = matches!(
             mode,
@@ -1527,6 +1561,7 @@ fn render_frame_to_buf(
                 mode_label,
                 pane_name,
                 selection_chars,
+                &settings.theme,
             )?;
         }
         if settings.visible {
@@ -1538,25 +1573,32 @@ fn render_frame_to_buf(
 
     // Tab bar (only when multiple tabs exist and show_tab_bar is enabled)
     if tab_names.len() > 1 && settings.show_tab_bar {
-        render::draw_tab_bar(buf, tw, th, tab_names, settings.show_status_bar)?;
+        render::draw_tab_bar(
+            buf,
+            tw,
+            th,
+            tab_names,
+            settings.show_status_bar,
+            &settings.theme,
+        )?;
     }
 
     // Overlays
     if matches!(mode, InputMode::HelpOverlay) {
-        render::draw_help_overlay(buf, tw, th)?;
+        render::draw_help_overlay(buf, tw, th, &settings.theme)?;
     }
     if matches!(mode, InputMode::PaneSelect) {
         let inner = super::make_inner(tw, th, settings.show_status_bar);
-        render::draw_pane_numbers(buf, layout, &inner)?;
+        render::draw_pane_numbers(buf, layout, &inner, &settings.theme)?;
     }
 
     // Text input overlay — drawn LAST so it's on top of status bar
     match mode {
         InputMode::RenameTab { buffer } => {
-            render::draw_text_input(buf, tw, th, "Rename tab: ", buffer)?;
+            render::draw_text_input(buf, tw, th, "Rename tab: ", buffer, &settings.theme)?;
         }
         InputMode::CommandPalette { buffer } => {
-            render::draw_text_input(buf, tw, th, ":", buffer)?;
+            render::draw_text_input(buf, tw, th, ":", buffer, &settings.theme)?;
         }
         _ => {}
     }
@@ -2049,6 +2091,23 @@ fn process_key(
                 update.mark_all(layout);
                 update.border_dirty = true;
             }
+            // Hot-reload config from ~/.config/ezpn/config.toml.
+            // Picks up edits made externally (or by another ezpn instance) without
+            // restarting the daemon. Does NOT touch shell/scrollback/prefix at runtime
+            // since those are sampled at startup.
+            KeyCode::Char('r') => {
+                let cfg = config::load_config();
+                let prev_status = settings.show_status_bar;
+                let prev_tab_bar = settings.show_tab_bar;
+                config::apply_config_to_settings(&cfg, settings);
+                if settings.show_status_bar != prev_status || settings.show_tab_bar != prev_tab_bar
+                {
+                    super::resize_all(panes, layout, tw, th, settings);
+                    update.mark_all(layout);
+                    update.border_dirty = true;
+                }
+                update.full_redraw = true;
+            }
             // Zoom toggle
             KeyCode::Char('z') => {
                 if zoomed_pane.is_some() {
@@ -2184,6 +2243,11 @@ fn process_key(
             super::resize_all(panes, layout, tw, th, settings);
             update.border_dirty = true;
             update.mark_all(layout);
+        }
+        if action == SettingsAction::Changed {
+            if let Err(e) = config::save_settings(settings) {
+                eprintln!("warning: failed to save settings: {e}");
+            }
         }
         update.full_redraw = true;
     } else if key.code == KeyCode::Char('d') && ctrl {
@@ -2477,6 +2541,11 @@ fn process_mouse(
                     super::resize_all(panes, layout, tw, th, settings);
                     update.border_dirty = true;
                     update.mark_all(layout);
+                }
+                if action == SettingsAction::Changed {
+                    if let Err(e) = config::save_settings(settings) {
+                        eprintln!("warning: failed to save settings: {e}");
+                    }
                 }
                 if action == SettingsAction::Changed
                     || action == SettingsAction::Close

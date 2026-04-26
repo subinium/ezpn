@@ -23,7 +23,9 @@ mod server;
 mod session;
 mod settings;
 mod signals;
+mod snapshot_blob;
 mod tab;
+mod theme;
 mod workspace;
 
 use layout::{Direction, Layout, NavDir, Rect, SepHit};
@@ -55,6 +57,7 @@ fn main() -> anyhow::Result<()> {
         Some("ls") => return cmd_ls(),
         Some("kill") => return cmd_kill(args.get(2).map(|s| s.as_str())),
         Some("a") | Some("attach") => return cmd_attach(&args[2..]),
+        Some("doctor") => return cmd_doctor(),
         Some("rename") => {
             return cmd_rename(
                 args.get(2).map(|s| s.as_str()),
@@ -95,35 +98,62 @@ fn main() -> anyhow::Result<()> {
         return run_direct(&config);
     }
 
-    // Create a new session and attach
-    // Check for -S/--session flag to set custom session name
-    let session_name = {
-        let mut custom = None;
+    // Resolve session name with precedence:
+    //   1. CLI `-S/--session NAME` (highest)
+    //   2. `.ezpn.toml [session].name` pin
+    //   3. Auto: sanitized basename of cwd
+    //
+    // Then run the chosen "preferred" name through `resolve_session_name`,
+    // which handles atomic collision counters and dead-socket cleanup. The
+    // `force_new` flag (`--new` / `--force-new`) disables the auto-attach
+    // shortcut so users can deterministically spawn a fresh session even when
+    // a live one already owns the preferred slot.
+    let mut cli_session: Option<String> = None;
+    let mut force_new = false;
+    {
         let mut i = 1;
         while i < args.len() {
-            if (args[i] == "-S" || args[i] == "--session") && i + 1 < args.len() {
-                custom = Some(args[i + 1].clone());
-                break;
+            match args[i].as_str() {
+                "-S" | "--session" if i + 1 < args.len() => {
+                    cli_session = Some(args[i + 1].clone());
+                    i += 1;
+                }
+                "--new" | "--force-new" => {
+                    force_new = true;
+                }
+                _ => {}
             }
             i += 1;
         }
-        custom.unwrap_or_else(session::auto_name)
-    };
-
-    // Auto-attach: if a session with this name already exists, attach to it
-    // instead of creating a new one. (Like `cd` into a tmux project.)
-    if let Some((existing_name, existing_path)) = session::find(Some(&session_name)) {
-        match client::run(&existing_path, &existing_name) {
-            Ok(()) => return Ok(()),
-            Err(_) => {
-                // Session was stale — clean up and fall through to create new
-                session::cleanup(&existing_name);
-            }
-        }
     }
 
-    let sock_path = session::spawn_server(&session_name, &original_args)?;
-    client::run(&sock_path, &session_name)
+    let preferred = cli_session
+        .or_else(project::pinned_session_name)
+        .unwrap_or_else(session::auto_base_name);
+
+    match session::resolve_session_name(&preferred, !force_new) {
+        session::SessionResolution::AttachExisting(name) => {
+            // Live session under the preferred name — attach instead of
+            // spawning a duplicate. Matches the historical `cd repo && ezpn`
+            // behavior so existing scripts keep working.
+            let path = session::socket_path(&name);
+            match client::run(&path, &name) {
+                Ok(()) => Ok(()),
+                Err(_) => {
+                    // Connection died mid-attach (server crashed between
+                    // is_alive probe and our connect). Clean up and spawn
+                    // fresh under the same name.
+                    session::cleanup(&name);
+                    let sock_path = session::spawn_server(&name, &original_args)?;
+                    client::run(&sock_path, &name)
+                }
+            }
+        }
+        session::SessionResolution::New(name) => {
+            let sock_path = session::spawn_server(&name, &original_args)?;
+            client::run(&sock_path, &name)
+        }
+    }
 }
 
 fn run_direct(config: &Config) -> anyhow::Result<()> {
@@ -343,6 +373,93 @@ fn cmd_from(source: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Validate `.ezpn.toml` env interpolation (`ezpn doctor`).
+///
+/// Reads `.ezpn.toml` from cwd, resolves every pane's env via [`project::resolve_env`],
+/// and prints per-pane status. Exits 1 if any reference fails to resolve.
+fn cmd_doctor() -> anyhow::Result<()> {
+    let path = std::path::Path::new(".ezpn.toml");
+    if !path.exists() {
+        eprintln!("ezpn doctor: .ezpn.toml not found in current directory");
+        std::process::exit(1);
+    }
+    println!("Reading .ezpn.toml... OK");
+
+    let contents = std::fs::read_to_string(path)?;
+    let config: project::ProjectConfig =
+        toml::from_str(&contents).map_err(|e| anyhow::anyhow!("parse error in .ezpn.toml: {e}"))?;
+    let base_dir = path
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+    println!("Resolving env...");
+    let mut error_count = 0usize;
+    for (i, pane) in config.pane.iter().enumerate() {
+        let label = pane.name.as_deref().unwrap_or("(unnamed)");
+        println!("  pane[{i}] ({label}):");
+        if pane.env.is_empty() {
+            // Still surface .env.local merges for empty-section panes.
+            match project::resolve_env(&base_dir, &pane.env, 0) {
+                Ok(resolved) if resolved.is_empty() => {
+                    println!("    (no env)");
+                }
+                Ok(resolved) => {
+                    let mut keys: Vec<&String> = resolved.keys().collect();
+                    keys.sort();
+                    for k in keys {
+                        let v = &resolved[k];
+                        println!("    {k} = {} ✓ (from .env.local)", redact(v));
+                    }
+                }
+                Err(e) => {
+                    println!("    ✗ {e}");
+                    error_count += 1;
+                }
+            }
+            continue;
+        }
+        match project::resolve_env(&base_dir, &pane.env, 0) {
+            Ok(resolved) => {
+                let mut keys: Vec<&String> = resolved.keys().collect();
+                keys.sort();
+                for k in keys {
+                    let v = &resolved[k];
+                    let source = if pane.env.contains_key(k) {
+                        ""
+                    } else {
+                        " (from .env.local)"
+                    };
+                    println!("    {k} = {}{} ✓", redact(v), source);
+                }
+            }
+            Err(e) => {
+                println!("    ✗ {e}");
+                error_count += 1;
+            }
+        }
+    }
+    if error_count > 0 {
+        eprintln!("\n{error_count} error(s). See above.");
+        std::process::exit(1);
+    }
+    println!("\nAll pane env resolved successfully.");
+    Ok(())
+}
+
+/// Mask values that look like secrets so doctor output is safe to share.
+/// Heuristic: long opaque strings, or keys named like *TOKEN/SECRET/KEY/PASSWORD.
+fn redact(value: &str) -> String {
+    // Conservative: redact values >= 12 chars that are mostly non-space.
+    // Doctor is for validation, not exfiltration.
+    if value.len() >= 12 && !value.contains(' ') && !value.contains('/') {
+        "********".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
 /// Parse Procfile format: `name: command`
 fn parse_procfile(contents: &str) -> Vec<(String, String)> {
     contents
@@ -457,6 +574,7 @@ fn parse_args() -> anyhow::Result<Config> {
             "-S" | "--session" => {
                 i += 1; // Skip value — handled in main()
             }
+            "--new" | "--force-new" => {} // Handled in main()
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -679,6 +797,7 @@ USAGE:
   ezpn --restore <FILE>              Restore workspace snapshot
   ezpn init                          Generate .ezpn.toml template
   ezpn from [FILE]                   Generate .ezpn.toml from Procfile
+  ezpn doctor                        Validate .ezpn.toml env interpolation
   ezpn --no-daemon [OPTIONS]         Run in single-process mode (no detach)
 
 EXAMPLES:
@@ -701,6 +820,7 @@ OPTIONS:
   -d, --direction <DIR> h (horizontal, default) or v (vertical)
   -s, --shell <SHELL>   Default shell path (default: $SHELL)
   -S, --session <NAME>  Custom session name (default: auto from directory)
+  --new, --force-new    Always spawn a new session (skip auto-attach to live one)
   -h, --help            Show this help
   -V, --version         Show version
 
@@ -778,7 +898,8 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
     } else {
         file_config.border
     };
-    let mut settings = Settings::new(effective_border);
+    let theme = theme::load_theme(&file_config.theme).adapt(theme::detect_caps());
+    let mut settings = Settings::with_theme(effective_border, theme);
     settings.show_status_bar = file_config.show_status_bar;
 
     // Auto-restart state (populated from .ezpn.toml if present)
@@ -1870,6 +1991,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                         tw,
                         th,
                         settings.show_status_bar,
+                        &settings.theme,
                     )?;
                 }
                 // Status bar
@@ -1889,6 +2011,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                         zoom_label,
                         pane_name,
                         0,
+                        &settings.theme,
                     )?;
                 }
                 queue!(stdout, terminal::EndSynchronizedUpdate)?;
@@ -1925,14 +2048,14 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
             // Overlays on top of the main render
             if matches!(mode, InputMode::HelpOverlay) {
                 queue!(stdout, terminal::BeginSynchronizedUpdate)?;
-                render::draw_help_overlay(stdout, tw, th)?;
+                render::draw_help_overlay(stdout, tw, th, &settings.theme)?;
                 queue!(stdout, terminal::EndSynchronizedUpdate)?;
                 stdout.flush()?;
             }
             if matches!(mode, InputMode::PaneSelect) {
                 let inner = make_inner(tw, th, settings.show_status_bar);
                 queue!(stdout, terminal::BeginSynchronizedUpdate)?;
-                render::draw_pane_numbers(stdout, &layout, &inner)?;
+                render::draw_pane_numbers(stdout, &layout, &inner, &settings.theme)?;
                 queue!(stdout, terminal::EndSynchronizedUpdate)?;
                 stdout.flush()?;
             }
@@ -2020,6 +2143,7 @@ fn render_frame(
         full_redraw,
         selection,
         broadcast,
+        &settings.theme,
     )?;
     // Mode-aware status bar (render over the default one if we have a mode)
     if settings.show_status_bar && (!mode_label.is_empty() || selection_chars > 0) {
@@ -2035,6 +2159,7 @@ fn render_frame(
             mode_label,
             pane_name,
             selection_chars,
+            &settings.theme,
         )?;
     }
     if settings.visible {
@@ -2128,6 +2253,7 @@ pub(crate) fn build_initial_state(
     settings: &mut Settings,
     restart_policies: &mut HashMap<usize, project::RestartPolicy>,
     scrollback: usize,
+    persist_scrollback: &mut bool,
 ) -> anyhow::Result<(Layout, HashMap<usize, Pane>, usize, Option<SnapshotExtra>)> {
     // Use a default terminal size for initial spawn (server doesn't have a terminal yet).
     // Panes will be resized when a client connects.
@@ -2179,6 +2305,10 @@ pub(crate) fn build_initial_state(
             let proj = result.map_err(|e| anyhow::anyhow!("{e}"))?;
             let panes = spawn_project_panes(&proj, default_shell, tw, th, settings, scrollback)?;
             *restart_policies = proj.restarts.clone();
+            // Per-project override for persist_scrollback (falls back to global).
+            if let Some(override_value) = proj.persist_scrollback {
+                *persist_scrollback = override_value;
+            }
             let active = *proj.layout.pane_ids().first().unwrap_or(&0);
             return Ok((proj.layout, panes, active, None));
         } else if let Some((layout, launches)) = try_load_procfile() {
@@ -2426,6 +2556,13 @@ pub(crate) fn spawn_snapshot_panes(
         if ps.shell.is_some() {
             pane.set_initial_shell(ps.shell.clone());
         }
+        // Replay v3 scrollback blob if present. On error, warn and continue
+        // with an empty scrollback — never fail the whole restore.
+        if let Some(blob) = &ps.scrollback_blob {
+            if let Err(e) = crate::snapshot_blob::decode_scrollback(blob, pane.parser_mut()) {
+                eprintln!("ezpn: scrollback restore failed for pane {}: {}", ps.id, e);
+            }
+        }
         panes.insert(ps.id, pane);
     }
     Ok(panes)
@@ -2540,7 +2677,7 @@ fn apply_snapshot(
     _scrollback: usize,
 ) -> anyhow::Result<()> {
     let tab = &snapshot.tabs[snapshot.active_tab];
-    let mut next_settings = Settings::new(snapshot.border_style);
+    let mut next_settings = Settings::with_theme(snapshot.border_style, settings.theme.clone());
     next_settings.show_status_bar = snapshot.show_status_bar;
     next_settings.show_tab_bar = snapshot.show_tab_bar;
     let next_layout = tab.layout.clone();
@@ -2911,12 +3048,13 @@ pub(crate) fn handle_ipc_command(
                             env: pane.map(|p| p.initial_env().clone()).unwrap_or_default(),
                             restart: project::RestartPolicy::default(),
                             shell: pane.and_then(|p| p.initial_shell().map(|s| s.to_string())),
+                            scrollback_blob: None,
                         }
                     })
                     .collect(),
             };
             let snapshot = WorkspaceSnapshot {
-                version: 2,
+                version: workspace::SNAPSHOT_VERSION,
                 shell: shell.clone(),
                 border_style: settings.border_style,
                 show_status_bar: settings.show_status_bar,

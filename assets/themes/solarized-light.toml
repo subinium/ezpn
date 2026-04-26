@@ -1,0 +1,21 @@
+name = "solarized-light"
+description = "Solarized Light palette by Ethan Schoonover"
+
+bg              = { r = 253, g = 246, b = 227 }
+focus_bg        = { r = 238, g = 232, b = 213 }
+lbl_fg          = { r =  88, g = 110, b = 117 }
+accent          = { r =  38, g = 139, b = 210 }
+warn_fg         = { r = 220, g =  50, b =  47 }
+sec_fg          = { r = 101, g = 123, b = 131 }
+dim_fg          = { r = 147, g = 161, b = 161 }
+div_fg          = { r = 219, g = 213, b = 196 }
+status_bg       = { r = 238, g = 232, b = 213 }
+status_fg       = { r =   0, g =  43, b =  54 }
+hint_fg         = { r = 101, g = 123, b = 131 }
+broadcast_color = { r = 203, g =  75, b =  22 }
+muted_fg        = { r = 147, g = 161, b = 161 }
+border_color    = { r = 147, g = 161, b = 161 }
+active_color    = { r =  42, g = 161, b = 152 }
+close_color     = { r = 220, g =  50, b =  47 }
+drag_color      = { r = 181, g = 137, b =   0 }
+dead_fg         = { r = 147, g = 161, b = 161 }

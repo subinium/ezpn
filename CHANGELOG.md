@@ -9,6 +9,34 @@ Entries are written in **functional-only style**: every bullet describes an obse
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-04-26 — Workflows that Stick
+
+### Added
+- **`.ezpn.toml` env interpolation**: `${HOME}`, `${env:VAR}`, `${file:.env.local}`, `${secret:keychain:KEY}` now expand in pane env values. Recursion capped at depth 8 with cycle detection.
+- **`.env.local` auto-merge**: file beside `.ezpn.toml` is loaded automatically and overrides `[env]` keys. Format: `KEY=VALUE`, `# comments`, `KEY="quoted"`.
+- **macOS Keychain backend** for `${secret:keychain:KEY}` via the `security` CLI; Linux uses `secret-tool`; both fall through to `${env:KEY}` with a warning when unavailable.
+- **`ezpn doctor`** subcommand: validates `.ezpn.toml` and prints per-pane env resolution with `✓` / `✗ Missing reference: …`. Exits non-zero on any failure.
+- **Settings persistence**: every change in `Ctrl+B Shift+,` is atomically written to `~/.config/ezpn/config.toml` (tmp + rename, pid-suffixed). Failures warn but never crash.
+- **`Ctrl+B r` hot reload** of `~/.config/ezpn/config.toml` — apply external edits without detaching.
+- **Settings panel footer** shows the path settings are saved to.
+- **TOML theme system** (`src/theme.rs`): 18-color `Theme` with `Rgb`, `Theme::adapt(TermCaps)` quantizing to truecolor / 256 / 16 based on `$COLORTERM` and `$TERM`.
+- **5 built-in themes** embedded at compile time: `default`, `tokyo-night`, `gruvbox-dark`, `solarized-dark`, `solarized-light`. Selectable via `theme = "..."` in config.
+- **User themes**: drop a TOML at `~/.config/ezpn/themes/<name>.toml` and reference it by name. Corrupt files fall back to `default` with a one-line warning.
+- **Scrollback persistence in snapshots** (v3 schema, opt-in). Toggle via `persist_scrollback = true` globally or `[workspace] persist_scrollback = true` per project. Encoded as base64(gzip(bincode(rows))) with a 5 MiB-per-pane hard cap; oldest rows truncated first.
+- **Session pin**: `[session].name` in `.ezpn.toml` overrides `basename($PWD)`. CLI `-S` still wins. New `--new` / `--force-new` flag bypasses auto-attach to existing sessions.
+- **Atomic collision counter**: `repo`, `repo-1`, …, `repo-99`, then `repo-{millis}-{pid}` fallback. Dead sockets are reaped during the scan instead of going stale.
+- **`SessionResolution::{New, AttachExisting}`** lets callers distinguish "spawned a new daemon" from "joined an existing one" without re-probing the socket.
+
+### Changed
+- **Snapshot schema bumped to v3** (`SNAPSHOT_VERSION = 3`). v2 snapshots load transparently with `migrate_v2` — they simply have no scrollback. v3 snapshots written without `persist_scrollback` are bit-compatible with v2 readers (`scrollback_blob` is `skip_serializing_if`).
+- **Rendering colors are no longer hardcoded.** Every `Color::Rgb` literal in `src/render.rs` and `src/settings.rs` was replaced with field access on `AdaptedTheme`. The active theme is loaded once at startup and threaded through every render path.
+- **Bind-time `EADDRINUSE`** triggers one in-place retry after re-probing socket liveness, eliminating a narrow race when two `ezpn` invocations resolve the same name within microseconds.
+
+### Compatibility
+- **Wire protocol**: unchanged (still v1).
+- **Snapshot schema**: bumped to v3. v2 snapshots auto-migrate; v3 snapshots without scrollback remain readable by v2 code.
+- **New deps**: `flate2`, `bincode 1.3`, `base64 0.22` (all for snapshot blobs).
+
 ## [0.7.0] — 2026-04-26 — Native Feel & Perf
 
 ### Added
