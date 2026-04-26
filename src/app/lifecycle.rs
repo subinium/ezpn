@@ -369,16 +369,30 @@ pub(crate) fn do_split(
     Ok(())
 }
 
+/// Remove a pane from the layout and free every map keyed off its id.
+///
+/// Per SPEC 03 §4.2: dropping the pane out of `panes` triggers
+/// `Pane::Drop` which kills the child + joins the reader thread, so we no
+/// longer need an explicit `pane.kill()` here. The added `restart_*` and
+/// `zoomed_pane` arguments close the leak surface where these maps grew
+/// unboundedly with each split/close cycle.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn close_pane(
     layout: &mut Layout,
     panes: &mut HashMap<usize, Pane>,
     active: &mut usize,
     pane_id: usize,
+    restart_policies: &mut HashMap<usize, project::RestartPolicy>,
+    restart_state: &mut HashMap<usize, (std::time::Instant, u32)>,
+    zoomed_pane: &mut Option<usize>,
 ) {
-    if let Some(mut pane) = panes.remove(&pane_id) {
-        pane.kill();
-    }
+    panes.remove(&pane_id); // Drop fires here — see SPEC 03 §4.1.
     layout.remove(pane_id);
+    restart_policies.remove(&pane_id);
+    restart_state.remove(&pane_id);
+    if *zoomed_pane == Some(pane_id) {
+        *zoomed_pane = None;
+    }
     if *active == pane_id {
         *active = *layout.pane_ids().first().unwrap_or(&0);
     }

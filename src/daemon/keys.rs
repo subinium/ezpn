@@ -15,6 +15,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::config;
 use crate::layout::{Direction, Layout, NavDir};
 use crate::pane::{Pane, PaneLaunch};
+use crate::project;
 use crate::render::BorderCache;
 use crate::settings::{Settings, SettingsAction};
 
@@ -43,6 +44,8 @@ pub(crate) fn process_key(
     detach_requested: &mut bool,
     tab_action: &mut TabAction,
     prefix_key: char,
+    restart_policies: &mut HashMap<usize, project::RestartPolicy>,
+    restart_state: &mut HashMap<usize, (std::time::Instant, u32)>,
 ) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -82,7 +85,15 @@ pub(crate) fn process_key(
         match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {
                 let target = *active;
-                crate::app::lifecycle::close_pane(layout, panes, active, target);
+                crate::app::lifecycle::close_pane(
+                    layout,
+                    panes,
+                    active,
+                    target,
+                    restart_policies,
+                    restart_state,
+                    zoomed_pane,
+                );
                 crate::app::lifecycle::resize_all(panes, layout, tw, th, settings);
                 update.mark_all(layout);
                 update.border_dirty = true;
@@ -179,6 +190,8 @@ pub(crate) fn process_key(
                     zoomed_pane,
                     broadcast,
                     tab_action,
+                    restart_policies,
+                    restart_state,
                 );
             }
             KeyCode::Esc => {

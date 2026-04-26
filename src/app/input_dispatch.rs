@@ -39,6 +39,9 @@ pub(crate) fn handle_ipc_command(
     settings: &mut Settings,
     scrollback: usize,
     max_scrollback: usize,
+    restart_policies: &mut HashMap<usize, project::RestartPolicy>,
+    restart_state: &mut HashMap<usize, (std::time::Instant, u32)>,
+    zoomed_pane: &mut Option<usize>,
 ) -> (ipc::IpcResponse, RenderUpdate) {
     let mut update = RenderUpdate::default();
 
@@ -68,7 +71,15 @@ pub(crate) fn handle_ipc_command(
             if !panes.contains_key(&pane) && !layout.pane_ids().contains(&pane) {
                 ipc::IpcResponse::error("pane not found")
             } else {
-                close_pane(layout, panes, active, pane);
+                close_pane(
+                    layout,
+                    panes,
+                    active,
+                    pane,
+                    restart_policies,
+                    restart_state,
+                    zoomed_pane,
+                );
                 resize_all(panes, layout, tw, th, settings);
                 update.mark_all(layout);
                 update.border_dirty = true;
