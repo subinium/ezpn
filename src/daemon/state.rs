@@ -5,7 +5,6 @@
 //! plumbing for `ConnectedClient`. Lives in its own file so the rest of the
 //! daemon can `use crate::daemon::state::*` without circular imports.
 
-use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -13,6 +12,8 @@ use crossterm::event::Event;
 
 use crate::layout::{Direction, Rect, SepHit};
 use crate::protocol;
+
+use super::writer::OutboundMsg;
 
 /// Input state machine for prefix key support.
 #[allow(dead_code)]
@@ -121,9 +122,18 @@ pub(crate) enum ClientMsg {
 }
 
 /// Connected client with attach mode and per-client state.
+///
+/// Outbound frames are sent through `outbound_tx` (bounded mpsc) and
+/// drained by a dedicated writer thread (`writer_handle`). See SPEC 01
+/// `docs/spec/v0.10.0/01-daemon-io-resilience.md` §4.1 for rationale.
 pub(crate) struct ConnectedClient {
     pub(crate) id: u64,
-    pub(crate) writer: std::io::BufWriter<UnixStream>,
+    /// Bounded outbound queue. `try_send` returning `Full` means the
+    /// writer thread is wedged behind a slow peer — main loop treats
+    /// the client as dead on the next iteration.
+    pub(crate) outbound_tx: mpsc::SyncSender<OutboundMsg>,
+    /// Writer thread handle. `Drop` joins after sending `Shutdown`.
+    pub(crate) writer_handle: Option<std::thread::JoinHandle<()>>,
     pub(crate) event_rx: mpsc::Receiver<ClientMsg>,
     pub(crate) mode: protocol::AttachMode,
     /// Capability bits negotiated during the C_HELLO handshake. Zero for
@@ -137,7 +147,15 @@ pub(crate) struct ConnectedClient {
 
 impl Drop for ConnectedClient {
     fn drop(&mut self) {
-        // Shutdown the underlying socket to force the reader thread to exit.
-        let _ = self.writer.get_ref().shutdown(std::net::Shutdown::Both);
+        // Tell the writer to drain and exit. `try_send` because we don't
+        // want to block here if the queue is already full — the writer
+        // will see the channel close and exit anyway.
+        let _ = self.outbound_tx.try_send(OutboundMsg::Shutdown);
+        if let Some(handle) = self.writer_handle.take() {
+            // Bounded patience: the writer should drain within at most
+            // one write_timeout (50ms). If it doesn't, we leak the join
+            // handle — the OS reaps the thread on process exit.
+            let _ = handle.join();
+        }
     }
 }

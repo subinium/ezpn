@@ -23,6 +23,7 @@ use crate::daemon::snapshot::capture_workspace;
 use crate::daemon::state::{
     ClientMsg, ConnectedClient, DragState, InputMode, TabAction, TextSelection,
 };
+use crate::daemon::writer::OutboundMsg;
 use crate::ipc;
 use crate::layout::Layout;
 use crate::pane::PaneLaunch;
@@ -277,7 +278,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
             if !osc52_seqs.is_empty() {
                 for c in &mut clients {
                     for seq in &osc52_seqs {
-                        let _ = protocol::write_msg(&mut c.writer, protocol::S_OUTPUT, seq);
+                        let _ = c.outbound_tx.try_send(OutboundMsg::Output(seq.clone()));
                     }
                 }
             }
@@ -409,7 +410,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
             } else {
                 // Last tab — exit server
                 for c in &mut clients {
-                    let _ = protocol::write_msg(&mut c.writer, protocol::S_EXIT, &[]);
+                    let _ = c.outbound_tx.try_send(OutboundMsg::Exit);
                 }
                 break;
             }
@@ -503,7 +504,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                             pane.kill();
                         }
                         for c in &mut clients {
-                            let _ = protocol::write_msg(&mut c.writer, protocol::S_EXIT, &[]);
+                            let _ = c.outbound_tx.try_send(OutboundMsg::Exit);
                         }
                         session::cleanup(session_name);
                         ipc::cleanup();
@@ -646,7 +647,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                 pane.kill();
             }
             for c in &mut clients {
-                let _ = protocol::write_msg(&mut c.writer, protocol::S_EXIT, &[]);
+                let _ = c.outbound_tx.try_send(OutboundMsg::Exit);
             }
             session::cleanup(session_name);
             ipc::cleanup();
@@ -694,7 +695,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
         let had_clients = !clients.is_empty();
         for id in &detach_ids {
             if let Some(pos) = clients.iter().position(|c| c.id == *id) {
-                let _ = protocol::write_msg(&mut clients[pos].writer, protocol::S_DETACHED, &[]);
+                let _ = clients[pos].outbound_tx.try_send(OutboundMsg::Detached);
                 clients.remove(pos);
             }
         }
@@ -922,7 +923,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                 crate::app::lifecycle::kill_all_panes(&mut panes);
                 tab_mgr.kill_all_inactive();
                 for c in &mut clients {
-                    let _ = protocol::write_msg(&mut c.writer, protocol::S_EXIT, &[]);
+                    let _ = c.outbound_tx.try_send(OutboundMsg::Exit);
                 }
                 session::cleanup(session_name);
                 ipc::cleanup();
@@ -1136,15 +1137,22 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
 
                 // Broadcast frame to all clients; remove failed ones
                 if render_result.is_ok() && !render_buf.is_empty() {
-                    clients.retain_mut(|c| {
-                        if protocol::write_msg(&mut c.writer, protocol::S_OUTPUT, &render_buf)
-                            .is_err()
+                    // Per SPEC 01 §4.1: outbound writes go through the bounded
+                    // per-client queue; `try_send` returning Full means the
+                    // writer thread is wedged behind a slow peer — treat the
+                    // client as dead. The writer will also independently emit
+                    // `ClientMsg::Disconnected` after MAX_WOULDBLOCKS timeouts.
+                    clients.retain(|c| {
+                        match c
+                            .outbound_tx
+                            .try_send(OutboundMsg::Frame(render_buf.clone()))
                         {
-                            // Try to send detach ack before dropping
-                            let _ = protocol::write_msg(&mut c.writer, protocol::S_DETACHED, &[]);
-                            false
-                        } else {
-                            true
+                            Ok(()) => true,
+                            Err(mpsc::TrySendError::Full(_))
+                            | Err(mpsc::TrySendError::Disconnected(_)) => {
+                                let _ = c.outbound_tx.try_send(OutboundMsg::Detached);
+                                false
+                            }
                         }
                     });
                 }
@@ -1193,7 +1201,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                             pane.kill();
                         }
                         for c in &mut clients {
-                            let _ = protocol::write_msg(&mut c.writer, protocol::S_EXIT, &[]);
+                            let _ = c.outbound_tx.try_send(OutboundMsg::Exit);
                         }
                         session::cleanup(session_name);
                         ipc::cleanup();

@@ -9,6 +9,13 @@ Entries are written in **functional-only style**: every bullet describes an obse
 
 ## [Unreleased]
 
+### Changed
+- **Daemon I/O resilience** (#33): each attached client now drains a bounded `mpsc::sync_channel(64)` through a dedicated writer thread with `set_write_timeout(50ms)`; clients are evicted after 3 consecutive `WouldBlock`/`TimedOut`. The IPC socket is now served by a fixed pool of 4 worker threads (`crossbeam-channel::bounded(16)`) with `set_read_timeout(5s)` + `set_write_timeout(2s)`; surplus connections receive `IpcResponse::error("ezpn ipc pool saturated; retry")` and idle peers receive `IpcResponse::error("idle timeout")`.
+
+### Compatibility
+- **Wire protocol**: unchanged (still v1).
+- **New deps**: `crossbeam-channel 0.5` (runtime).
+
 ## [0.9.0] — 2026-04-26 — Codebase & Release Hygiene
 
 ### Added
