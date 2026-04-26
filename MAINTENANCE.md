@@ -94,6 +94,30 @@ If any step fails, do NOT force-push or move the tag. Cut a patch.
 
 ---
 
+## 🧪 Test pyramid (issue #25)
+
+| Layer | Where | When it runs | What it protects |
+|---|---|---|---|
+| Unit | `src/**` `#[cfg(test)]` | Every `cargo test --bins` | Pure-logic correctness (layout DSL, snapshot serde, restart policy) |
+| Property | `tests/property_layout.rs`, `tests/property_snapshot.rs` | `property` CI job + `cargo test --test 'property*'` | Layout invariants (no overlap, in-bounds, MIN_PANE, navigate-reachable) and snapshot wire-format invariants (roundtrip, v2→v3 migration, pane-id uniqueness) under `proptest` |
+| Integration | `tests/daemon_lifecycle.rs`, `tests/integration_recordings.rs` | `integration` CI job (Linux + macOS) | Real-binary protocol: handshake, attach, resize storms, panic isolation, SIGTERM snapshot |
+| Soak | `benches/soak_10min.rs` | `cargo bench --features soak --bench soak_10min` (manual or future nightly cron) | Long-lived daemon stability, RSS budget, deadlock detection across ~600 attach/detach cycles |
+| Coverage | `scripts/coverage.sh` (`coverage` CI job) | Cron (weekly) + PRs labeled `area:test` | Floor on total line coverage. Current threshold: **65 %** — raise to 70 % once the baseline is established and stable |
+
+**Adding a property:** if a property exercises layout-only invariants, add it to `tests/property_layout.rs` and use `#[path = "../src/layout.rs"]` (already wired). Snapshot-shape properties live in `tests/property_snapshot.rs` and operate on `serde_json::Value` to avoid pulling the whole module graph into the test crate.
+
+**Adding an integration test:** prefer reusing `tests/common.rs::spawn_test_daemon` for simple lifecycle. For tests that need extra `--server` args or a controlled `XDG_DATA_HOME` (snapshot persistence cases), follow the `ExtDaemon` helper in `tests/integration_recordings.rs`.
+
+**Running the soak harness locally:**
+
+```bash
+cargo bench --features soak --bench soak_10min
+```
+
+Takes ~10 minutes. Asserts RSS < 600 MB and zero cycles over 10 s. Skipped from the default `cargo bench` so the interactive perf bench (`render_hotpaths`) stays fast.
+
+---
+
 ## 🔒 Load-bearing invariants
 
 If any of these regress, a higher-level guarantee breaks.

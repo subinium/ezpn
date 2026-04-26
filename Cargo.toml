@@ -40,7 +40,19 @@ signal-hook = "0.3"
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 tempfile = "3"
+proptest = "1"
+
+[features]
+# Opt-in 10-minute soak harness. Excluded from default `cargo bench` so the
+# ordinary perf bench (`render_hotpaths`) stays interactive. Enable with
+# `cargo bench --features soak --bench soak_10min` (also gated nightly in CI).
+soak = []
 
 [[bench]]
 name = "render_hotpaths"
 harness = false
+
+[[bench]]
+name = "soak_10min"
+harness = false
+required-features = ["soak"]
