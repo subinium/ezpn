@@ -25,6 +25,7 @@ mod settings;
 mod signals;
 mod snapshot_blob;
 mod tab;
+mod theme;
 mod workspace;
 
 use layout::{Direction, Layout, NavDir, Rect, SepHit};
@@ -897,7 +898,8 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
     } else {
         file_config.border
     };
-    let mut settings = Settings::new(effective_border);
+    let theme = theme::load_theme(&file_config.theme).adapt(theme::detect_caps());
+    let mut settings = Settings::with_theme(effective_border, theme);
     settings.show_status_bar = file_config.show_status_bar;
 
     // Auto-restart state (populated from .ezpn.toml if present)
@@ -1989,6 +1991,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                         tw,
                         th,
                         settings.show_status_bar,
+                        &settings.theme,
                     )?;
                 }
                 // Status bar
@@ -2008,6 +2011,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                         zoom_label,
                         pane_name,
                         0,
+                        &settings.theme,
                     )?;
                 }
                 queue!(stdout, terminal::EndSynchronizedUpdate)?;
@@ -2044,14 +2048,14 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
             // Overlays on top of the main render
             if matches!(mode, InputMode::HelpOverlay) {
                 queue!(stdout, terminal::BeginSynchronizedUpdate)?;
-                render::draw_help_overlay(stdout, tw, th)?;
+                render::draw_help_overlay(stdout, tw, th, &settings.theme)?;
                 queue!(stdout, terminal::EndSynchronizedUpdate)?;
                 stdout.flush()?;
             }
             if matches!(mode, InputMode::PaneSelect) {
                 let inner = make_inner(tw, th, settings.show_status_bar);
                 queue!(stdout, terminal::BeginSynchronizedUpdate)?;
-                render::draw_pane_numbers(stdout, &layout, &inner)?;
+                render::draw_pane_numbers(stdout, &layout, &inner, &settings.theme)?;
                 queue!(stdout, terminal::EndSynchronizedUpdate)?;
                 stdout.flush()?;
             }
@@ -2139,6 +2143,7 @@ fn render_frame(
         full_redraw,
         selection,
         broadcast,
+        &settings.theme,
     )?;
     // Mode-aware status bar (render over the default one if we have a mode)
     if settings.show_status_bar && (!mode_label.is_empty() || selection_chars > 0) {
@@ -2154,6 +2159,7 @@ fn render_frame(
             mode_label,
             pane_name,
             selection_chars,
+            &settings.theme,
         )?;
     }
     if settings.visible {
@@ -2671,7 +2677,7 @@ fn apply_snapshot(
     _scrollback: usize,
 ) -> anyhow::Result<()> {
     let tab = &snapshot.tabs[snapshot.active_tab];
-    let mut next_settings = Settings::new(snapshot.border_style);
+    let mut next_settings = Settings::with_theme(snapshot.border_style, settings.theme.clone());
     next_settings.show_status_bar = snapshot.show_status_bar;
     next_settings.show_tab_bar = snapshot.show_tab_bar;
     let next_layout = tab.layout.clone();

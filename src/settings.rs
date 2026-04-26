@@ -4,6 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use crossterm::{cursor, queue, style::*};
 
 use crate::render::BorderStyle;
+use crate::theme::AdaptedTheme;
 
 // ─── Layout constants ──────────────────────────────────
 
@@ -32,49 +33,6 @@ const Y_FOOTER: u16 = 18; // "Saved to ~/.config/ezpn/config.toml"
 const ITEM_Y: [u16; 9] = [Y_I0, Y_I1, Y_I2, Y_I3, Y_I4, Y_I5, Y_I6, Y_I7, Y_I8];
 const ITEM_COUNT: usize = 9;
 
-// ─── Colors ────────────────────────────────────────────
-
-const BG: Color = Color::Rgb {
-    r: 16,
-    g: 18,
-    b: 24,
-};
-const FOCUS_BG: Color = Color::Rgb {
-    r: 26,
-    g: 32,
-    b: 44,
-};
-const SEC_FG: Color = Color::Rgb {
-    r: 75,
-    g: 90,
-    b: 110,
-};
-const LBL_FG: Color = Color::Rgb {
-    r: 190,
-    g: 200,
-    b: 212,
-};
-const DIM_FG: Color = Color::Rgb {
-    r: 90,
-    g: 98,
-    b: 110,
-};
-const ACCENT: Color = Color::Rgb {
-    r: 102,
-    g: 217,
-    b: 239,
-};
-const DIV_FG: Color = Color::Rgb {
-    r: 36,
-    g: 42,
-    b: 52,
-};
-const WARN_FG: Color = Color::Rgb {
-    r: 255,
-    g: 110,
-    b: 110,
-};
-
 // ─── Item indices ──────────────────────────────────────
 
 const I_SINGLE: usize = 0;
@@ -94,6 +52,10 @@ pub struct Settings {
     pub border_style: BorderStyle,
     pub show_status_bar: bool,
     pub show_tab_bar: bool,
+    /// Adapted (terminal-quantized) color palette used by every renderer
+    /// in the project.  Cloned cheaply (`Color`s are `Copy` and the name
+    /// `String` is owned per-Settings).
+    pub theme: AdaptedTheme,
     focused: usize,
 }
 
@@ -106,12 +68,21 @@ pub enum SettingsAction {
 }
 
 impl Settings {
+    /// Constructor for tests / boot-before-config.  Uses a truecolor-quantized
+    /// default palette; production code should call [`Settings::with_theme`]
+    /// with a config-derived [`AdaptedTheme`].
+    #[allow(dead_code)]
     pub fn new(border: BorderStyle) -> Self {
+        Self::with_theme(border, AdaptedTheme::default_truecolor())
+    }
+
+    pub fn with_theme(border: BorderStyle, theme: AdaptedTheme) -> Self {
         Self {
             visible: false,
             border_style: border,
             show_status_bar: true,
             show_tab_bar: true,
+            theme,
             focused: I_ROUNDED,
         }
     }
@@ -182,13 +153,19 @@ impl Settings {
         if tw < W + 4 || th < H + 2 {
             return Ok(());
         }
+        let theme = &self.theme;
+        let bg_color = theme.bg;
+        let sec_fg = theme.sec_fg;
+        let dim_fg = theme.dim_fg;
+        let lbl_fg = theme.lbl_fg;
         let (ox, oy) = origin(tw, th);
         let inner_w = (W - PAD * 2) as usize;
 
-        // Backdrop
+        // Backdrop — re-uses the theme background; with truecolor adapters
+        // this is visually identical to the previous near-black backdrop.
         queue!(
             stdout,
-            SetBackgroundColor(Color::Rgb { r: 4, g: 5, b: 8 }),
+            SetBackgroundColor(bg_color),
             crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
         )?;
 
@@ -198,7 +175,7 @@ impl Settings {
             queue!(
                 stdout,
                 cursor::MoveTo(ox, oy + dy),
-                SetBackgroundColor(BG),
+                SetBackgroundColor(bg_color),
                 Print(&blank)
             )?;
         }
@@ -207,19 +184,27 @@ impl Settings {
         let xr = ox + W - PAD; // content right edge
 
         // Title
-        text(stdout, x, oy + Y_TITLE, BG, Color::White, true, "Settings")?;
+        text(stdout, x, oy + Y_TITLE, bg_color, lbl_fg, true, "Settings")?;
         text(
             stdout,
             x,
             oy + Y_HINT,
-            BG,
-            DIM_FG,
+            bg_color,
+            dim_fg,
             false,
             "j/k move  Enter apply  1-5 border  q close",
         )?;
 
         // Section: Border Style
-        text(stdout, x, oy + Y_SEC1, BG, SEC_FG, true, "BORDER STYLE")?;
+        text(
+            stdout,
+            x,
+            oy + Y_SEC1,
+            bg_color,
+            sec_fg,
+            true,
+            "BORDER STYLE",
+        )?;
         self.item_border(stdout, x, xr, oy, I_SINGLE, "Single", BorderStyle::Single)?;
         self.item_border(
             stdout,
@@ -235,8 +220,8 @@ impl Settings {
         self.item_border(stdout, x, xr, oy, I_NONE, "None", BorderStyle::None)?;
 
         // Divider + Section: Display
-        div(stdout, x, oy + Y_DIV1, inner_w)?;
-        text(stdout, x, oy + Y_SEC2, BG, SEC_FG, true, "DISPLAY")?;
+        div(stdout, x, oy + Y_DIV1, inner_w, bg_color, theme.div_fg)?;
+        text(stdout, x, oy + Y_SEC2, bg_color, sec_fg, true, "DISPLAY")?;
         self.item_toggle(
             stdout,
             x,
@@ -250,13 +235,21 @@ impl Settings {
         self.item_toggle(stdout, x, xr, oy, I_BROADCAST, "Broadcast", broadcast)?;
 
         // Divider + Close
-        div(stdout, x, oy + Y_DIV2, inner_w)?;
+        div(stdout, x, oy + Y_DIV2, inner_w, bg_color, theme.div_fg)?;
         self.item_close(stdout, x, xr, oy)?;
 
         // Footer: where settings persist to. Subtle, single line.
         let scope = format!("Saved to {}", crate::config::display_config_path());
         let scope = truncate_to_width(&scope, inner_w);
-        text(stdout, x, oy + Y_FOOTER, BG, DIM_FG, false, &scope)?;
+        text(
+            stdout,
+            x,
+            oy + Y_FOOTER,
+            theme.bg,
+            theme.dim_fg,
+            false,
+            &scope,
+        )?;
 
         queue!(stdout, ResetColor, SetAttribute(Attribute::Reset))?;
         Ok(())
@@ -275,18 +268,19 @@ impl Settings {
         name: &str,
         style: BorderStyle,
     ) -> anyhow::Result<()> {
+        let theme = &self.theme;
         let y = oy + ITEM_Y[item];
         let f = self.focused == item;
         let sel = self.border_style == style;
-        let bg = if f { FOCUS_BG } else { BG };
+        let bg = if f { theme.focus_bg } else { theme.bg };
 
         row_bg(stdout, x - 1, y, (xr - x + 2) as usize, bg)?;
         if f {
-            focus_marker(stdout, x - 1, y)?;
+            focus_marker(stdout, x - 1, y, theme.focus_bg, theme.accent)?;
         }
 
         let icon = if sel { "●" } else { "○" };
-        let icon_fg = if sel { ACCENT } else { DIM_FG };
+        let icon_fg = if sel { theme.accent } else { theme.dim_fg };
         let nx = if f { x + 3 } else { x + 1 };
 
         queue!(
@@ -296,7 +290,7 @@ impl Settings {
             SetForegroundColor(icon_fg),
             Print(icon),
             Print(" "),
-            SetForegroundColor(if f { Color::White } else { LBL_FG }),
+            SetForegroundColor(if f { theme.status_fg } else { theme.lbl_fg }),
         )?;
         if f {
             queue!(stdout, SetAttribute(Attribute::Bold))?;
@@ -307,7 +301,7 @@ impl Settings {
         }
 
         if sel {
-            right_tag(stdout, xr, y, bg, ACCENT, "active")?;
+            right_tag(stdout, xr, y, bg, theme.accent, "active")?;
         }
         Ok(())
     }
@@ -323,13 +317,14 @@ impl Settings {
         label: &str,
         value: bool,
     ) -> anyhow::Result<()> {
+        let theme = &self.theme;
         let y = oy + ITEM_Y[item];
         let f = self.focused == item;
-        let bg = if f { FOCUS_BG } else { BG };
+        let bg = if f { theme.focus_bg } else { theme.bg };
 
         row_bg(stdout, x - 1, y, (xr - x + 2) as usize, bg)?;
         if f {
-            focus_marker(stdout, x - 1, y)?;
+            focus_marker(stdout, x - 1, y, theme.focus_bg, theme.accent)?;
         }
 
         let nx = if f { x + 3 } else { x + 1 };
@@ -337,7 +332,7 @@ impl Settings {
             stdout,
             cursor::MoveTo(nx, y),
             SetBackgroundColor(bg),
-            SetForegroundColor(if f { Color::White } else { LBL_FG }),
+            SetForegroundColor(if f { theme.status_fg } else { theme.lbl_fg }),
         )?;
         if f {
             queue!(stdout, SetAttribute(Attribute::Bold))?;
@@ -348,22 +343,23 @@ impl Settings {
         }
 
         let (tag, tag_fg) = if value {
-            ("ON", ACCENT)
+            ("ON", theme.accent)
         } else {
-            ("OFF", DIM_FG)
+            ("OFF", theme.dim_fg)
         };
         right_tag(stdout, xr, y, bg, tag_fg, tag)?;
         Ok(())
     }
 
     fn item_close(&self, stdout: &mut impl Write, x: u16, xr: u16, oy: u16) -> anyhow::Result<()> {
+        let theme = &self.theme;
         let y = oy + ITEM_Y[I_CLOSE];
         let f = self.focused == I_CLOSE;
-        let bg = if f { FOCUS_BG } else { BG };
+        let bg = if f { theme.focus_bg } else { theme.bg };
 
         row_bg(stdout, x - 1, y, (xr - x + 2) as usize, bg)?;
         if f {
-            focus_marker(stdout, x - 1, y)?;
+            focus_marker(stdout, x - 1, y, theme.focus_bg, theme.accent)?;
         }
 
         let nx = if f { x + 3 } else { x + 1 };
@@ -371,7 +367,7 @@ impl Settings {
             stdout,
             cursor::MoveTo(nx, y),
             SetBackgroundColor(bg),
-            SetForegroundColor(if f { WARN_FG } else { DIM_FG }),
+            SetForegroundColor(if f { theme.warn_fg } else { theme.dim_fg }),
         )?;
         if f {
             queue!(stdout, SetAttribute(Attribute::Bold))?;
@@ -381,7 +377,7 @@ impl Settings {
             queue!(stdout, SetAttribute(Attribute::Reset))?;
         }
 
-        right_tag(stdout, xr, y, bg, DIM_FG, "q / Esc")?;
+        right_tag(stdout, xr, y, bg, theme.dim_fg, "q / Esc")?;
         Ok(())
     }
 
@@ -478,12 +474,12 @@ fn text(
     Ok(())
 }
 
-fn div(out: &mut impl Write, x: u16, y: u16, w: usize) -> anyhow::Result<()> {
+fn div(out: &mut impl Write, x: u16, y: u16, w: usize, bg: Color, fg: Color) -> anyhow::Result<()> {
     queue!(
         out,
         cursor::MoveTo(x, y),
-        SetBackgroundColor(BG),
-        SetForegroundColor(DIV_FG),
+        SetBackgroundColor(bg),
+        SetForegroundColor(fg),
         Print("─".repeat(w))
     )?;
     Ok(())
@@ -497,12 +493,12 @@ fn row_bg(out: &mut impl Write, x: u16, y: u16, w: usize, bg: Color) -> anyhow::
     Ok(())
 }
 
-fn focus_marker(out: &mut impl Write, x: u16, y: u16) -> anyhow::Result<()> {
+fn focus_marker(out: &mut impl Write, x: u16, y: u16, bg: Color, fg: Color) -> anyhow::Result<()> {
     queue!(
         out,
         cursor::MoveTo(x, y),
-        SetBackgroundColor(FOCUS_BG),
-        SetForegroundColor(ACCENT),
+        SetBackgroundColor(bg),
+        SetForegroundColor(fg),
         Print("▎›")
     )?;
     Ok(())

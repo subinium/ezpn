@@ -193,7 +193,8 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
     } else {
         file_config.border
     };
-    let mut settings = Settings::new(effective_border);
+    let theme = crate::theme::load_theme(&file_config.theme).adapt(crate::theme::detect_caps());
+    let mut settings = Settings::with_theme(effective_border, theme);
     settings.show_status_bar = file_config.show_status_bar;
     settings.show_tab_bar = file_config.show_tab_bar;
     let prefix_key = file_config.prefix_key;
@@ -1087,7 +1088,8 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                         tab_mgr.kill_all_inactive();
 
                         default_shell = snapshot.shell.clone();
-                        settings = Settings::new(snapshot.border_style);
+                        let preserved_theme = settings.theme.clone();
+                        settings = Settings::with_theme(snapshot.border_style, preserved_theme);
                         settings.show_status_bar = snapshot.show_status_bar;
                         settings.show_tab_bar = snapshot.show_tab_bar;
 
@@ -1496,6 +1498,7 @@ fn render_frame_to_buf(
                 tw,
                 th,
                 settings.show_status_bar,
+                &settings.theme,
             )?;
         }
         if settings.show_status_bar {
@@ -1514,6 +1517,7 @@ fn render_frame_to_buf(
                 zoom_label,
                 pane_name,
                 0,
+                &settings.theme,
             )?;
         }
         queue!(buf, terminal::EndSynchronizedUpdate)?;
@@ -1534,6 +1538,7 @@ fn render_frame_to_buf(
             full_redraw,
             selection,
             broadcast,
+            &settings.theme,
         )?;
         let is_text_input = matches!(
             mode,
@@ -1556,6 +1561,7 @@ fn render_frame_to_buf(
                 mode_label,
                 pane_name,
                 selection_chars,
+                &settings.theme,
             )?;
         }
         if settings.visible {
@@ -1567,25 +1573,32 @@ fn render_frame_to_buf(
 
     // Tab bar (only when multiple tabs exist and show_tab_bar is enabled)
     if tab_names.len() > 1 && settings.show_tab_bar {
-        render::draw_tab_bar(buf, tw, th, tab_names, settings.show_status_bar)?;
+        render::draw_tab_bar(
+            buf,
+            tw,
+            th,
+            tab_names,
+            settings.show_status_bar,
+            &settings.theme,
+        )?;
     }
 
     // Overlays
     if matches!(mode, InputMode::HelpOverlay) {
-        render::draw_help_overlay(buf, tw, th)?;
+        render::draw_help_overlay(buf, tw, th, &settings.theme)?;
     }
     if matches!(mode, InputMode::PaneSelect) {
         let inner = super::make_inner(tw, th, settings.show_status_bar);
-        render::draw_pane_numbers(buf, layout, &inner)?;
+        render::draw_pane_numbers(buf, layout, &inner, &settings.theme)?;
     }
 
     // Text input overlay — drawn LAST so it's on top of status bar
     match mode {
         InputMode::RenameTab { buffer } => {
-            render::draw_text_input(buf, tw, th, "Rename tab: ", buffer)?;
+            render::draw_text_input(buf, tw, th, "Rename tab: ", buffer, &settings.theme)?;
         }
         InputMode::CommandPalette { buffer } => {
-            render::draw_text_input(buf, tw, th, ":", buffer)?;
+            render::draw_text_input(buf, tw, th, ":", buffer, &settings.theme)?;
         }
         _ => {}
     }

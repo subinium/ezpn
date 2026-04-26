@@ -16,6 +16,9 @@ pub struct EzpnConfig {
     /// contents on reattach. May be overridden per-project via `.ezpn.toml`'s
     /// `[workspace] persist_scrollback`.
     pub persist_scrollback: bool,
+    /// Theme name (resolved against `~/.config/ezpn/themes/<name>.toml`
+    /// then the embedded built-in palettes).  Defaults to `"default"`.
+    pub theme: String,
 }
 
 impl Default for EzpnConfig {
@@ -28,6 +31,7 @@ impl Default for EzpnConfig {
             show_tab_bar: true,
             prefix_key: 'b',
             persist_scrollback: false,
+            theme: "default".to_string(),
         }
     }
 }
@@ -39,6 +43,9 @@ impl Default for EzpnConfig {
 ///   scrollback = 10000
 ///   status_bar = true
 ///   tab_bar = true
+///   theme = tokyo-night
+///
+/// `[ui]` section headers are accepted but ignored — every key is global.
 pub fn load_config() -> EzpnConfig {
     let mut config = EzpnConfig::default();
     if let Some(path) = existing_config_path() {
@@ -53,6 +60,12 @@ fn parse_config_into(contents: &str, config: &mut EzpnConfig) {
     for line in contents.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Section headers like `[ui]` are accepted but ignored — every
+        // recognised key is global. Lets users author
+        // `[ui]\ntheme = "..."` without surprising failures.
+        if line.starts_with('[') && line.ends_with(']') {
             continue;
         }
         if let Some((key, value)) = line.split_once('=') {
@@ -82,6 +95,9 @@ fn parse_config_into(contents: &str, config: &mut EzpnConfig) {
                             config.prefix_key = c;
                         }
                     }
+                }
+                "theme" if !value.is_empty() => {
+                    config.theme = value.to_string();
                 }
                 _ => {} // ignore unknown keys
             }

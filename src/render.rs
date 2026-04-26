@@ -38,33 +38,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::layout::{Layout, Rect};
 use crate::pane::Pane;
-
-const ACTIVE_COLOR: Color = Color::Cyan;
-const BORDER_COLOR: Color = Color::DarkGrey;
-const STATUS_BG: Color = Color::Rgb {
-    r: 36,
-    g: 38,
-    b: 48,
-};
-const STATUS_FG: Color = Color::White;
-const HINT_FG: Color = Color::Rgb {
-    r: 160,
-    g: 170,
-    b: 190,
-};
-const CLOSE_COLOR: Color = Color::DarkRed;
-const DEAD_FG: Color = Color::DarkGrey;
-const BROADCAST_COLOR: Color = Color::Rgb {
-    r: 255,
-    g: 140,
-    b: 50,
-};
-const DRAG_COLOR: Color = Color::Yellow;
-const MUTED_FG: Color = Color::Rgb {
-    r: 100,
-    g: 100,
-    b: 110,
-};
+use crate::theme::{vt100_to_crossterm, AdaptedTheme};
 
 // ─── Border Styles ─────────────────────────────────────────
 
@@ -369,6 +343,7 @@ pub fn render_panes(
     full_redraw: bool,
     selection: PaneSelection,
     broadcast: bool,
+    theme: &AdaptedTheme,
 ) -> anyhow::Result<()> {
     queue!(stdout, cursor::Hide)?;
 
@@ -387,7 +362,7 @@ pub fn render_panes(
         queue!(
             stdout,
             cursor::MoveTo(mx, my),
-            SetForegroundColor(Color::Red),
+            SetForegroundColor(theme.warn_fg),
             Print(msg)
         )?;
         queue!(stdout, ResetColor)?;
@@ -404,19 +379,15 @@ pub fn render_panes(
                 .unwrap_or(false);
             let color = if border_style.is_none() {
                 // Borderless: visible but minimal separator
-                Color::Rgb {
-                    r: 70,
-                    g: 75,
-                    b: 90,
-                }
+                theme.sec_fg
             } else if dragging_sep {
-                DRAG_COLOR
+                theme.drag_color
             } else if broadcast {
-                BROADCAST_COLOR
+                theme.broadcast_color
             } else if is_active {
-                ACTIVE_COLOR
+                theme.active_color
             } else {
-                BORDER_COLOR
+                theme.border_color
             };
             queue!(
                 stdout,
@@ -455,17 +426,18 @@ pub fn render_panes(
                     is_scrolled,
                     &chars,
                     exit_code,
+                    theme,
                 )?;
             }
             if let Some(pane) = panes.get(&pid) {
                 let pane_sel = selection
                     .filter(|(sel_pid, ..)| *sel_pid == pid)
                     .map(|(_, sr, sc, er, ec)| (sr, sc, er, ec));
-                draw_content(stdout, pane, rect, is_alive, pane_sel)?;
+                draw_content(stdout, pane, rect, is_alive, pane_sel, theme)?;
             }
             // Dead pane overlay
             if !is_alive {
-                draw_dead_overlay(stdout, rect)?;
+                draw_dead_overlay(stdout, rect, theme)?;
             }
         }
     }
@@ -473,7 +445,7 @@ pub fn render_panes(
     // Status bar
     if show_status_bar && full_redraw {
         let active_idx = ids.iter().position(|&id| id == active_id).unwrap_or(0);
-        draw_status_bar(stdout, term_w, term_h, active_idx, ids.len(), "")?;
+        draw_status_bar(stdout, term_w, term_h, active_idx, ids.len(), "", theme)?;
     }
 
     // Cursor
@@ -553,6 +525,7 @@ fn draw_pane_title(
     is_scrolled: bool,
     chars: &BorderChars,
     exit_code: Option<u32>,
+    theme: &AdaptedTheme,
 ) -> anyhow::Result<()> {
     let title_y = rect.y.saturating_sub(1);
     let title_x = rect.x;
@@ -607,26 +580,14 @@ fn draw_pane_title(
 
     if avail >= tlen + 1 + right_len {
         let color = if is_active {
-            ACTIVE_COLOR
+            theme.active_color
         } else {
-            BORDER_COLOR
+            theme.border_color
         };
 
         // Borderless: fill title row with subtle background for visual separation
+        let title_bg = if is_active { theme.focus_bg } else { theme.bg };
         if borderless {
-            let title_bg = if is_active {
-                Color::Rgb {
-                    r: 30,
-                    g: 34,
-                    b: 46,
-                }
-            } else {
-                Color::Rgb {
-                    r: 18,
-                    g: 20,
-                    b: 28,
-                }
-            };
             queue!(
                 stdout,
                 cursor::MoveTo(title_x, title_y),
@@ -647,31 +608,18 @@ fn draw_pane_title(
         if is_active {
             queue!(
                 stdout,
-                SetForegroundColor(Color::White),
+                SetForegroundColor(theme.status_fg),
                 SetAttribute(Attribute::Bold)
             )?;
         }
         if !is_alive {
-            queue!(stdout, SetForegroundColor(DEAD_FG))?;
+            queue!(stdout, SetForegroundColor(theme.dead_fg))?;
         }
         queue!(stdout, Print(&title))?;
         queue!(stdout, SetAttribute(Attribute::Reset))?;
 
         // For borderless: keep the title_bg set so buttons share the same background
         if borderless {
-            let title_bg = if is_active {
-                Color::Rgb {
-                    r: 30,
-                    g: 34,
-                    b: 46,
-                }
-            } else {
-                Color::Rgb {
-                    r: 18,
-                    g: 20,
-                    b: 28,
-                }
-            };
             queue!(stdout, SetBackgroundColor(title_bg))?;
         }
         queue!(stdout, SetForegroundColor(color))?;
@@ -685,7 +633,11 @@ fn draw_pane_title(
         }
 
         if show_buttons {
-            let btn_fg = if is_active { MUTED_FG } else { BORDER_COLOR };
+            let btn_fg = if is_active {
+                theme.muted_fg
+            } else {
+                theme.border_color
+            };
             if borderless {
                 let btn_x = title_x + (avail as u16).saturating_sub(11);
                 queue!(stdout, cursor::MoveTo(btn_x, title_y))?;
@@ -694,7 +646,7 @@ fn draw_pane_title(
                 stdout,
                 SetForegroundColor(btn_fg),
                 Print("[━] [┃] "),
-                SetForegroundColor(CLOSE_COLOR),
+                SetForegroundColor(theme.close_color),
                 Print("[×]")
             )?;
         } else if show_close {
@@ -702,7 +654,7 @@ fn draw_pane_title(
                 let btn_x = title_x + (avail as u16).saturating_sub(2);
                 queue!(stdout, cursor::MoveTo(btn_x, title_y))?;
             }
-            queue!(stdout, SetForegroundColor(CLOSE_COLOR), Print(" ×"))?;
+            queue!(stdout, SetForegroundColor(theme.close_color), Print(" ×"))?;
         }
     }
 
@@ -728,17 +680,18 @@ fn truncate_label(label: &str, max_cols: usize) -> String {
 }
 
 /// Draw dimmed overlay on dead panes with centered message.
-fn draw_dead_overlay(stdout: &mut impl Write, rect: &Rect) -> anyhow::Result<()> {
+fn draw_dead_overlay(
+    stdout: &mut impl Write,
+    rect: &Rect,
+    theme: &AdaptedTheme,
+) -> anyhow::Result<()> {
     if rect.w < 5 || rect.h < 1 {
         return Ok(());
     }
 
-    // Dim background for dead pane
-    let dim_bg = Color::Rgb {
-        r: 10,
-        g: 10,
-        b: 14,
-    };
+    // Dim background for dead pane — re-uses theme bg so dark themes get a
+    // near-black wash and light themes get their parchment color.
+    let dim_bg = theme.bg;
     for row in 0..rect.h {
         queue!(
             stdout,
@@ -760,11 +713,7 @@ fn draw_dead_overlay(stdout: &mut impl Write, rect: &Rect) -> anyhow::Result<()>
             stdout,
             cursor::MoveTo(lx, my.saturating_sub(1)),
             SetBackgroundColor(dim_bg),
-            SetForegroundColor(Color::Rgb {
-                r: 120,
-                g: 60,
-                b: 60
-            }),
+            SetForegroundColor(theme.close_color),
             SetAttribute(Attribute::Bold),
             Print(label),
             SetAttribute(Attribute::Reset),
@@ -778,7 +727,7 @@ fn draw_dead_overlay(stdout: &mut impl Write, rect: &Rect) -> anyhow::Result<()>
         stdout,
         cursor::MoveTo(mx, my),
         SetBackgroundColor(dim_bg),
-        SetForegroundColor(Color::DarkGrey),
+        SetForegroundColor(theme.dead_fg),
         SetAttribute(Attribute::Italic),
         Print(msg),
         SetAttribute(Attribute::Reset),
@@ -792,6 +741,7 @@ fn draw_content(
     rect: &Rect,
     is_alive: bool,
     selection: Option<(u16, u16, u16, u16)>,
+    theme: &AdaptedTheme,
 ) -> anyhow::Result<()> {
     let screen = pane.screen();
     if rect.w == 0 || rect.h == 0 {
@@ -843,8 +793,8 @@ fn draw_content(
                     let b = vt100_to_crossterm(cell.fgcolor());
                     // Use readable defaults if both are Reset
                     (
-                        if f == Color::Reset { Color::Black } else { f },
-                        if b == Color::Reset { Color::White } else { b },
+                        if f == Color::Reset { theme.bg } else { f },
+                        if b == Color::Reset { theme.lbl_fg } else { b },
                     )
                 } else {
                     (
@@ -853,7 +803,7 @@ fn draw_content(
                     )
                 };
                 if !is_alive {
-                    fg = Color::DarkGrey;
+                    fg = theme.dead_fg;
                 }
 
                 let ca = cell.bold() || cell.italic() || cell.underline() || cell.inverse();
@@ -936,8 +886,11 @@ pub fn draw_status_bar(
     active_idx: usize,
     total: usize,
     mode_label: &str,
+    theme: &AdaptedTheme,
 ) -> anyhow::Result<()> {
-    draw_status_bar_full(stdout, term_w, term_h, active_idx, total, mode_label, "", 0)
+    draw_status_bar_full(
+        stdout, term_w, term_h, active_idx, total, mode_label, "", 0, theme,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -950,6 +903,7 @@ pub fn draw_status_bar_full(
     mode_label: &str,
     pane_name: &str,
     selection_chars: usize,
+    theme: &AdaptedTheme,
 ) -> anyhow::Result<()> {
     let y = term_h - 1;
     let w = term_w as usize;
@@ -957,8 +911,8 @@ pub fn draw_status_bar_full(
     queue!(
         stdout,
         cursor::MoveTo(0, y),
-        SetBackgroundColor(STATUS_BG),
-        SetForegroundColor(STATUS_FG)
+        SetBackgroundColor(theme.status_bg),
+        SetForegroundColor(theme.status_fg)
     )?;
     for _ in 0..w {
         queue!(stdout, Print(" "))?;
@@ -968,7 +922,7 @@ pub fn draw_status_bar_full(
     queue!(
         stdout,
         cursor::MoveTo(1, y),
-        SetForegroundColor(ACTIVE_COLOR),
+        SetForegroundColor(theme.active_color),
         SetAttribute(Attribute::Bold)
     )?;
     let left = if pane_name.is_empty() {
@@ -979,46 +933,32 @@ pub fn draw_status_bar_full(
     queue!(stdout, Print(&left))?;
     let mut left_end = 1 + left.len();
 
-    // Mode indicator or selection char count
+    // Mode indicator or selection char count.  Selection uses focus_bg/accent
+    // for visual distinction; mode badge uses status_bg/warn_fg so it pops on
+    // every theme without inventing one-off color literals.
     if selection_chars > 0 {
         let sel_label = format!("{} chars", selection_chars);
         queue!(
             stdout,
             SetAttribute(Attribute::Reset),
-            SetBackgroundColor(Color::Rgb {
-                r: 40,
-                g: 20,
-                b: 60
-            }),
-            SetForegroundColor(Color::Rgb {
-                r: 200,
-                g: 160,
-                b: 255
-            }),
+            SetBackgroundColor(theme.focus_bg),
+            SetForegroundColor(theme.accent),
             SetAttribute(Attribute::Bold),
             Print(format!(" {} ", sel_label)),
             SetAttribute(Attribute::Reset),
-            SetBackgroundColor(STATUS_BG),
+            SetBackgroundColor(theme.status_bg),
         )?;
         left_end += sel_label.len() + 2;
     } else if !mode_label.is_empty() {
         queue!(
             stdout,
             SetAttribute(Attribute::Reset),
-            SetBackgroundColor(Color::Rgb {
-                r: 60,
-                g: 40,
-                b: 10
-            }),
-            SetForegroundColor(Color::Rgb {
-                r: 255,
-                g: 200,
-                b: 50
-            }),
+            SetBackgroundColor(theme.focus_bg),
+            SetForegroundColor(theme.warn_fg),
             SetAttribute(Attribute::Bold),
             Print(format!(" {} ", mode_label)),
             SetAttribute(Attribute::Reset),
-            SetBackgroundColor(STATUS_BG),
+            SetBackgroundColor(theme.status_bg),
         )?;
         left_end += mode_label.len() + 2;
     }
@@ -1034,7 +974,7 @@ pub fn draw_status_bar_full(
     queue!(
         stdout,
         SetAttribute(Attribute::Reset),
-        SetBackgroundColor(STATUS_BG)
+        SetBackgroundColor(theme.status_bg)
     )?;
     let hints: &[&str] = match mode_label {
         "PREFIX" => &[
@@ -1103,16 +1043,8 @@ pub fn draw_status_bar_full(
     if !fitted.is_empty() {
         let rx = (w as u16).saturating_sub(total_len as u16 + clock_len as u16 + 1);
         queue!(stdout, cursor::MoveTo(rx, y))?;
-        let key_fg = Color::Rgb {
-            r: 220,
-            g: 225,
-            b: 240,
-        };
-        let desc_fg = Color::Rgb {
-            r: 120,
-            g: 130,
-            b: 150,
-        };
+        let key_fg = theme.lbl_fg;
+        let desc_fg = theme.muted_fg;
         for (i, hint) in fitted.iter().enumerate() {
             if i > 0 {
                 queue!(stdout, SetForegroundColor(desc_fg), Print(separator))?;
@@ -1126,7 +1058,7 @@ pub fn draw_status_bar_full(
                     SetAttribute(Attribute::Bold),
                     Print(key),
                     SetAttribute(Attribute::Reset),
-                    SetBackgroundColor(STATUS_BG),
+                    SetBackgroundColor(theme.status_bg),
                     SetForegroundColor(desc_fg),
                     Print(desc),
                 )?;
@@ -1137,7 +1069,7 @@ pub fn draw_status_bar_full(
                     SetAttribute(Attribute::Bold),
                     Print(*hint),
                     SetAttribute(Attribute::Reset),
-                    SetBackgroundColor(STATUS_BG),
+                    SetBackgroundColor(theme.status_bg),
                 )?;
             }
         }
@@ -1149,8 +1081,8 @@ pub fn draw_status_bar_full(
         queue!(
             stdout,
             cursor::MoveTo(cx, y),
-            SetBackgroundColor(STATUS_BG),
-            SetForegroundColor(HINT_FG),
+            SetBackgroundColor(theme.status_bg),
+            SetForegroundColor(theme.hint_fg),
             Print(&clock),
         )?;
     }
@@ -1166,26 +1098,15 @@ pub fn draw_text_input(
     term_h: u16,
     prompt: &str,
     buffer: &str,
+    theme: &AdaptedTheme,
 ) -> anyhow::Result<()> {
     let y = term_h - 1;
     let w = term_w as usize;
 
-    let input_bg = Color::Rgb {
-        r: 30,
-        g: 35,
-        b: 50,
-    };
-    let prompt_fg = Color::Rgb {
-        r: 102,
-        g: 217,
-        b: 239,
-    };
-    let text_fg = Color::White;
-    let cursor_bg = Color::Rgb {
-        r: 80,
-        g: 90,
-        b: 120,
-    };
+    let input_bg = theme.focus_bg;
+    let prompt_fg = theme.accent;
+    let text_fg = theme.status_fg;
+    let cursor_bg = theme.sec_fg;
 
     // Clear row
     queue!(stdout, cursor::MoveTo(0, y), SetBackgroundColor(input_bg),)?;
@@ -1262,6 +1183,7 @@ pub fn draw_tab_bar(
     term_h: u16,
     tabs: &[(usize, String, bool)],
     show_status_bar: bool,
+    theme: &AdaptedTheme,
 ) -> anyhow::Result<()> {
     if tabs.len() <= 1 {
         return Ok(());
@@ -1270,36 +1192,12 @@ pub fn draw_tab_bar(
     let y = tab_bar_y(term_h, show_status_bar);
     let w = term_w as usize;
 
-    let tab_bg = Color::Rgb {
-        r: 24,
-        g: 26,
-        b: 34,
-    };
-    let active_tab_bg = Color::Rgb {
-        r: 50,
-        g: 55,
-        b: 70,
-    };
-    let active_tab_fg = Color::Rgb {
-        r: 220,
-        g: 225,
-        b: 240,
-    };
-    let inactive_fg = Color::Rgb {
-        r: 100,
-        g: 110,
-        b: 130,
-    };
-    let index_fg = Color::Rgb {
-        r: 80,
-        g: 180,
-        b: 220,
-    };
-    let sep_fg = Color::Rgb {
-        r: 50,
-        g: 55,
-        b: 65,
-    };
+    let tab_bg = theme.bg;
+    let active_tab_bg = theme.focus_bg;
+    let active_tab_fg = theme.lbl_fg;
+    let inactive_fg = theme.muted_fg;
+    let index_fg = theme.accent;
+    let sep_fg = theme.div_fg;
 
     // Clear the row
     queue!(stdout, cursor::MoveTo(0, y), SetBackgroundColor(tab_bg),)?;
@@ -1433,6 +1331,7 @@ pub fn render_zoomed_pane(
     term_w: u16,
     term_h: u16,
     show_status_bar: bool,
+    theme: &AdaptedTheme,
 ) -> anyhow::Result<()> {
     queue!(stdout, cursor::Hide, terminal::Clear(ClearType::All))?;
 
@@ -1456,7 +1355,7 @@ pub fn render_zoomed_pane(
         queue!(
             stdout,
             cursor::MoveTo(*x, *y),
-            SetForegroundColor(ACTIVE_COLOR),
+            SetForegroundColor(theme.active_color),
             Print(border_char(flags, &chars))
         )?;
     }
@@ -1468,13 +1367,13 @@ pub fn render_zoomed_pane(
         queue!(
             stdout,
             cursor::MoveTo(1, 0),
-            SetForegroundColor(ACTIVE_COLOR),
+            SetForegroundColor(theme.active_color),
             Print(chars.h),
-            SetForegroundColor(Color::White),
+            SetForegroundColor(theme.status_fg),
             SetAttribute(Attribute::Bold),
             Print(&title),
             SetAttribute(Attribute::Reset),
-            SetForegroundColor(ACTIVE_COLOR),
+            SetForegroundColor(theme.active_color),
         )?;
         for _ in 0..avail - title.len() - 1 {
             queue!(stdout, Print(chars.h))?;
@@ -1488,7 +1387,7 @@ pub fn render_zoomed_pane(
         w: term_w.saturating_sub(2),
         h: border_h.saturating_sub(2),
     };
-    draw_content(stdout, pane, &rect, pane.is_alive(), None)?;
+    draw_content(stdout, pane, &rect, pane.is_alive(), None, theme)?;
 
     // Cursor
     if pane.is_alive() {
@@ -1509,7 +1408,12 @@ pub fn render_zoomed_pane(
 
 // ─── Help Overlay ──────────────────────────────────────────
 
-pub fn draw_help_overlay(stdout: &mut impl Write, term_w: u16, term_h: u16) -> anyhow::Result<()> {
+pub fn draw_help_overlay(
+    stdout: &mut impl Write,
+    term_w: u16,
+    term_h: u16,
+    theme: &AdaptedTheme,
+) -> anyhow::Result<()> {
     let help_lines = [
         "",
         "  DIRECT SHORTCUTS",
@@ -1563,21 +1467,14 @@ pub fn draw_help_overlay(stdout: &mut impl Write, term_w: u16, term_h: u16) -> a
     let ox = term_w.saturating_sub(w as u16) / 2;
     let oy = term_h.saturating_sub(h as u16) / 2;
 
-    let bg = Color::Rgb {
-        r: 16,
-        g: 18,
-        b: 24,
-    };
-    let border_fg = Color::Rgb {
-        r: 80,
-        g: 90,
-        b: 110,
-    };
+    let bg = theme.bg;
+    let border_fg = theme.sec_fg;
 
-    // Backdrop
+    // Backdrop — share the theme background so dark / light themes both
+    // get a sensible wash without inventing a deeper near-black.
     queue!(
         stdout,
-        SetBackgroundColor(Color::Rgb { r: 4, g: 5, b: 8 }),
+        SetBackgroundColor(theme.bg),
         terminal::Clear(ClearType::All)
     )?;
 
@@ -1606,7 +1503,7 @@ pub fn draw_help_overlay(stdout: &mut impl Write, term_w: u16, term_h: u16) -> a
     queue!(
         stdout,
         Print("─".repeat(lp)),
-        SetForegroundColor(Color::White),
+        SetForegroundColor(theme.status_fg),
         SetAttribute(Attribute::Bold),
         Print(title),
         SetAttribute(Attribute::Reset),
@@ -1627,11 +1524,7 @@ pub fn draw_help_overlay(stdout: &mut impl Write, term_w: u16, term_h: u16) -> a
         {
             queue!(
                 stdout,
-                SetForegroundColor(Color::Rgb {
-                    r: 102,
-                    g: 217,
-                    b: 239
-                }),
+                SetForegroundColor(theme.accent),
                 SetAttribute(Attribute::Bold),
                 Print(format!("{:<width$}", line, width = w)),
                 SetAttribute(Attribute::Reset),
@@ -1639,22 +1532,13 @@ pub fn draw_help_overlay(stdout: &mut impl Write, term_w: u16, term_h: u16) -> a
         } else if line.contains("Press any key") {
             queue!(
                 stdout,
-                SetForegroundColor(Color::Rgb {
-                    r: 90,
-                    g: 98,
-                    b: 110
-                }),
+                SetForegroundColor(theme.dim_fg),
                 Print(format!("{:<width$}", line, width = w)),
             )?;
         } else {
-            // Split at first run of spaces >= 8 for key/description alignment
             queue!(
                 stdout,
-                SetForegroundColor(Color::Rgb {
-                    r: 190,
-                    g: 200,
-                    b: 212,
-                }),
+                SetForegroundColor(theme.lbl_fg),
                 Print(format!("{:<width$}", line, width = w)),
             )?;
         }
@@ -1685,6 +1569,7 @@ pub fn draw_pane_numbers(
     stdout: &mut impl Write,
     layout: &Layout,
     inner: &Rect,
+    theme: &AdaptedTheme,
 ) -> anyhow::Result<()> {
     let rects = layout.pane_rects(inner);
     let ids = layout.pane_ids();
@@ -1704,16 +1589,8 @@ pub fn draw_pane_numbers(
             let cx = rect.x + (rect.w - num_w - 2) / 2;
             let cy = rect.y + rect.h / 2 - 1;
 
-            let bg = Color::Rgb {
-                r: 20,
-                g: 24,
-                b: 32,
-            };
-            let fg = Color::Rgb {
-                r: 102,
-                g: 217,
-                b: 239,
-            };
+            let bg = theme.bg;
+            let fg = theme.accent;
             let box_w = (num_w + 4) as usize;
 
             // Box background (3 rows)
@@ -1746,11 +1623,7 @@ pub fn draw_pane_numbers(
     queue!(
         stdout,
         cursor::MoveTo(hx, hy),
-        SetForegroundColor(Color::Rgb {
-            r: 90,
-            g: 98,
-            b: 110,
-        }),
+        SetForegroundColor(theme.dim_fg),
         Print(hint),
         ResetColor,
         cursor::Hide,
@@ -1764,13 +1637,5 @@ fn quick_jump_label(index: usize) -> Option<char> {
         0..=8 => char::from_u32('1' as u32 + index as u32),
         9 => Some('0'),
         _ => None,
-    }
-}
-
-fn vt100_to_crossterm(color: vt100::Color) -> Color {
-    match color {
-        vt100::Color::Default => Color::Reset,
-        vt100::Color::Idx(i) => Color::AnsiValue(i),
-        vt100::Color::Rgb(r, g, b) => Color::Rgb { r, g, b },
     }
 }
