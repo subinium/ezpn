@@ -18,6 +18,7 @@ pub(crate) mod keys;
 pub(crate) mod render;
 pub(crate) mod router;
 pub(crate) mod snapshot;
+pub(crate) mod snapshot_worker;
 pub(crate) mod state;
 pub(crate) mod writer;
 

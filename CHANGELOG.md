@@ -15,6 +15,9 @@ Entries are written in **functional-only style**: every bullet describes an obse
 ### Fixed
 - **Pane lifecycle GC** (#35): `Pane` is now an RAII handle with a deterministic `Drop` that signals its reader thread to exit, releases the PTY master fd, and joins the reader within a 250 ms deadline (warns and `mem::forget`s on timeout). Field declaration order ensures `master` drops before `reader_handle` so the blocking `read()` unblocks via EOF. `close_pane` accepts and prunes `restart_policies`, `restart_state`, and `zoomed_pane`. `TabManager::kill_all_inactive` now drains `tab.panes` and clears per-tab restart bookkeeping. PTY reader threads are now named `ezpn-pty-<pid>` for diagnostics.
 
+### Performance
+- **Async snapshot pipeline** (#36): snapshot writes (and gzip+bincode for `persist_scrollback = true`) move off the daemon main loop into a dedicated `ezpn-snapshot` worker thread. Auto-saves are debounced with a 150 ms window so rapid attach/detach storms coalesce into ≤ 1 disk write per quiet period. User-initiated `ezpn-ctl save` keeps a synchronous-from-the-caller contract via an ack channel (30 s timeout); queue saturation surfaces a structured `IpcResponse::error("ezpn snapshot worker queue full; retry")`. Disk writes are atomic (temp file + rename). On `run()` return the worker drains pending captures within a 5 s deadline.
+
 ### Changed
 - **Daemon I/O resilience** (#33): each attached client now drains a bounded `mpsc::sync_channel(64)` through a dedicated writer thread with `set_write_timeout(50ms)`; clients are evicted after 3 consecutive `WouldBlock`/`TimedOut`. The IPC socket is now served by a fixed pool of 4 worker threads (`crossbeam-channel::bounded(16)`) with `set_read_timeout(5s)` + `set_write_timeout(2s)`; surplus connections receive `IpcResponse::error("ezpn ipc pool saturated; retry")` and idle peers receive `IpcResponse::error("idle timeout")`.
 
