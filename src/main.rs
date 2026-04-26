@@ -15,6 +15,7 @@ mod cli;
 mod client;
 mod config;
 mod copy_mode;
+mod daemon;
 mod direct;
 mod ipc;
 mod layout;
