@@ -198,6 +198,55 @@ impl Layout {
         }
     }
 
+    /// SPEC 12 — extract the leaf identified by `target_id` from the tree
+    /// and collapse the parent split into the surviving sibling. Returns
+    /// `Some(target_id)` on success, or `None` if the target is unknown
+    /// or the only leaf in the tree (caller should detect via
+    /// `pane_count() == 1` and turn this into a tab close instead).
+    ///
+    /// Tree surgery cases (sibling = leaf, sibling = split, only-leaf)
+    /// are handled by `remove_node` already; this just wraps it.
+    /// Unwired in v0.11 batch — IPC dispatcher lands in follow-up.
+    #[allow(dead_code)]
+    pub fn detach(&mut self, target_id: usize) -> Option<usize> {
+        if self.pane_count() <= 1 {
+            return None;
+        }
+        if !contains(&self.root, target_id) {
+            return None;
+        }
+        if self.remove(target_id) {
+            Some(target_id)
+        } else {
+            None
+        }
+    }
+
+    /// SPEC 12 — insert `new_id` next to `target_id` as a new split.
+    /// Unlike `split` (which always equalises and always places the new
+    /// id in `second`), this lets the caller pick the direction, ratio,
+    /// and which slot (first vs second) the new leaf occupies. Returns
+    /// `false` if `target_id` is not in the tree. Unwired in v0.11 batch.
+    #[allow(dead_code)]
+    pub fn insert_pane(
+        &mut self,
+        new_id: usize,
+        target_id: usize,
+        direction: Direction,
+        place_after: bool,
+        ratio: f32,
+    ) -> bool {
+        if !contains(&self.root, target_id) {
+            return false;
+        }
+        let r = ratio.clamp(0.1, 0.9);
+        let old = std::mem::take(&mut self.root);
+        self.root = insert_node(old, target_id, new_id, direction, place_after, r);
+        // Bump next_id past `new_id` so a future `split()` does not collide.
+        self.next_id = self.next_id.max(new_id + 1);
+        true
+    }
+
     /// Find which separator is at screen position (for drag-to-resize).
     pub fn find_separator_at(&self, x: u16, y: u16, inner: &Rect) -> Option<SepHit> {
         let mut path = Vec::new();
@@ -632,6 +681,55 @@ fn split_node(node: LayoutNode, target: usize, new_id: usize, dir: Direction) ->
     }
 }
 
+/// SPEC 12 — split walker that respects caller-chosen `place_after` and
+/// `ratio`. Mirrors `split_node` but does not auto-equalise.
+#[allow(dead_code)]
+fn insert_node(
+    node: LayoutNode,
+    target: usize,
+    new_id: usize,
+    dir: Direction,
+    place_after: bool,
+    ratio: f32,
+) -> LayoutNode {
+    match node {
+        LayoutNode::Leaf { id } if id == target => {
+            let target_leaf = Box::new(LayoutNode::Leaf { id });
+            let new_leaf = Box::new(LayoutNode::Leaf { id: new_id });
+            let (first, second) = if place_after {
+                (target_leaf, new_leaf)
+            } else {
+                (new_leaf, target_leaf)
+            };
+            LayoutNode::Split {
+                direction: dir,
+                ratio,
+                first,
+                second,
+            }
+        }
+        LayoutNode::Split {
+            direction,
+            ratio: r,
+            first,
+            second,
+        } => LayoutNode::Split {
+            direction,
+            ratio: r,
+            first: Box::new(insert_node(*first, target, new_id, dir, place_after, ratio)),
+            second: Box::new(insert_node(
+                *second,
+                target,
+                new_id,
+                dir,
+                place_after,
+                ratio,
+            )),
+        },
+        other => other,
+    }
+}
+
 fn remove_node(node: LayoutNode, target: usize) -> Option<LayoutNode> {
     match node {
         LayoutNode::Leaf { id } if id == target => None,
@@ -1048,5 +1146,125 @@ mod tests {
 
         let trio = Layout::from_spec("trio").unwrap();
         assert_eq!(trio.pane_count(), 3); // 1/1:1
+    }
+
+    // ─── SPEC 12 — break-pane / join-pane ─────────────────────────
+
+    /// Case A from SPEC 12 §4.2: split with two leaves, detach one →
+    /// root collapses to the surviving sibling leaf.
+    #[test]
+    fn detach_collapses_to_leaf_sibling() {
+        let mut l = Layout::from_grid(2, 1);
+        let ids = l.pane_ids();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(l.detach(ids[0]), Some(ids[0]));
+        assert_eq!(l.pane_count(), 1);
+        assert_eq!(l.pane_ids(), vec![ids[1]]);
+    }
+
+    /// Case B: split where one branch is a leaf, the other is a 2-leaf
+    /// split. Detach the leaf side; root becomes the entire sibling
+    /// subtree intact.
+    #[test]
+    fn detach_collapses_to_split_sibling() {
+        let mut l = Layout::from_grid(2, 1);
+        let ids = l.pane_ids();
+        // Split the second leaf so it becomes a 2-leaf subtree.
+        let new_id = l.split(ids[1], Direction::Vertical);
+        assert_eq!(l.pane_count(), 3);
+        // Detach the original first leaf. Root should now hold the
+        // 2-leaf subtree (ids[1] + new_id).
+        assert_eq!(l.detach(ids[0]), Some(ids[0]));
+        assert_eq!(l.pane_count(), 2);
+        let surviving: std::collections::HashSet<usize> = l.pane_ids().into_iter().collect();
+        assert!(surviving.contains(&ids[1]));
+        assert!(surviving.contains(&new_id));
+    }
+
+    /// Case C: 1-leaf tree → detach must refuse and leave the tree
+    /// untouched. Caller is expected to surface this as "cannot break
+    /// the only pane" error.
+    #[test]
+    fn detach_only_leaf_returns_none() {
+        let mut l = Layout::from_grid(1, 1);
+        let only = l.pane_ids()[0];
+        assert_eq!(l.detach(only), None);
+        assert_eq!(l.pane_count(), 1);
+        assert_eq!(l.pane_ids(), vec![only]);
+    }
+
+    #[test]
+    fn detach_unknown_id_returns_none() {
+        let mut l = Layout::from_grid(2, 2);
+        assert_eq!(l.detach(99_999), None);
+        assert_eq!(l.pane_count(), 4);
+    }
+
+    /// `insert_pane` against a leaf root: result is a Split node holding
+    /// both leaves with the requested direction + ratio.
+    #[test]
+    fn insert_pane_into_leaf_root() {
+        let mut l = Layout::from_grid(1, 1);
+        let target = l.pane_ids()[0];
+        let new_id = 999;
+        assert!(l.insert_pane(new_id, target, Direction::Horizontal, true, 0.5));
+        assert_eq!(l.pane_count(), 2);
+        let ids = l.pane_ids();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&target));
+        assert!(ids.contains(&new_id));
+    }
+
+    #[test]
+    fn insert_pane_before_target_places_new_id_first() {
+        let mut l = Layout::from_grid(1, 1);
+        let target = l.pane_ids()[0];
+        let new_id = 999;
+        assert!(l.insert_pane(new_id, target, Direction::Horizontal, false, 0.4));
+        assert_eq!(l.pane_count(), 2);
+        // pane_ids() walks the tree in-order; with place_after=false the
+        // new id sits in the `first` slot, so it shows up before target.
+        let ids = l.pane_ids();
+        assert_eq!(ids[0], new_id);
+        assert_eq!(ids[1], target);
+    }
+
+    #[test]
+    fn insert_pane_unknown_target_returns_false() {
+        let mut l = Layout::from_grid(1, 1);
+        let before = l.pane_ids();
+        assert!(!l.insert_pane(999, 12345, Direction::Horizontal, true, 0.5));
+        assert_eq!(l.pane_ids(), before);
+    }
+
+    #[test]
+    fn insert_pane_clamps_ratio_to_safe_range() {
+        // The internal ratio is clamped to [0.1, 0.9]; we cannot read it
+        // back through the public API, but we can confirm the operation
+        // succeeds and produces 2 leaves regardless of the user's input.
+        let mut l = Layout::from_grid(1, 1);
+        let target = l.pane_ids()[0];
+        assert!(l.insert_pane(7, target, Direction::Vertical, true, -1.5));
+        assert_eq!(l.pane_count(), 2);
+        let mut l2 = Layout::from_grid(1, 1);
+        let target2 = l2.pane_ids()[0];
+        assert!(l2.insert_pane(8, target2, Direction::Vertical, true, 99.0));
+        assert_eq!(l2.pane_count(), 2);
+    }
+
+    /// Round-trip: detach a pane, then insert a NEW one back next to its
+    /// former neighbour. Pane count must return to the starting value
+    /// and both ids must coexist.
+    #[test]
+    fn detach_then_insert_restores_pane_count() {
+        let mut l = Layout::from_grid(2, 2);
+        let ids = l.pane_ids();
+        let detached = ids[0];
+        assert_eq!(l.detach(detached), Some(detached));
+        let after_detach = l.pane_count();
+        let target = l.pane_ids()[0];
+        let new_id = 1_000;
+        assert!(l.insert_pane(new_id, target, Direction::Horizontal, true, 0.5));
+        assert_eq!(l.pane_count(), after_detach + 1);
     }
 }
