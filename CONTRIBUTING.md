@@ -52,6 +52,15 @@ MSRV: **Rust 1.82**.
 
 5. **Open the PR.** The template is mandatory — every checkbox is a real gate.
 
+## Automated gates
+
+The following CI checks run on every PR and enforce conventions described above. Get them green before requesting review:
+
+- **Commit Lint** (`.github/workflows/commitlint.yml`) — validates the PR title against Conventional Commits and runs [`wagoid/commitlint-github-action`](https://github.com/wagoid/commitlint-github-action) on each commit. Allowed types: `feat fix perf refactor chore docs test ci style release`.
+- **Branch Naming** (`.github/workflows/branch-naming.yml`) — rejects branches that don't match `<type>/<short-description>`. Auto-generated branches (`dependabot/*`, `revert-*`) are skipped.
+- **PR Labeler** (`.github/workflows/labeler.yml` + `.github/labeler.yml`) — auto-applies `area:*` labels based on the changed file paths so reviewers can triage quickly.
+- **Release Drafter** (`.github/workflows/release-drafter.yml` + `.github/release-drafter.yml`) — runs on every push to `main` and continuously rebuilds the next release's draft notes, grouped by `type:*` label.
+
 ## Commit messages
 
 Conventional Commits. Subject in imperative mood, lowercase, no trailing period, ≤ 72 chars.

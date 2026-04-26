@@ -1,0 +1,26 @@
+name: Branch Naming
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate branch name
+        env:
+          BRANCH: ${{ github.head_ref }}
+        run: |
+          # Skip auto-generated branches that we don't control.
+          case "$BRANCH" in
+            dependabot/*|revert-*)
+              echo "Skipping branch-name check for auto-generated branch: $BRANCH"
+              exit 0
+              ;;
+          esac
+          if ! echo "$BRANCH" | grep -qE '^(feat|fix|perf|refactor|chore|docs|test|release)/[a-z0-9._-]+$'; then
+            echo "Branch '$BRANCH' must match: <type>/<short-description>"
+            echo "Allowed types: feat, fix, perf, refactor, chore, docs, test, release"
+            echo "Example: feat/scrollback-persistence, release/v0.9.0"
+            exit 1
+          fi

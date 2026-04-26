@@ -1,0 +1,54 @@
+name-template: "v$RESOLVED_VERSION"
+tag-template: "v$RESOLVED_VERSION"
+
+categories:
+  - title: "🚀 Features"
+    labels:
+      - "type:feat"
+  - title: "🐛 Bug Fixes"
+    labels:
+      - "type:fix"
+  - title: "⚡ Performance"
+    labels:
+      - "type:perf"
+  - title: "🧹 Refactor"
+    labels:
+      - "type:refactor"
+  - title: "🧪 Tests"
+    labels:
+      - "type:test"
+  - title: "📚 Docs"
+    labels:
+      - "type:docs"
+  - title: "🔧 Chore"
+    labels:
+      - "type:chore"
+      - "type:ci"
+
+change-template: "- $TITLE (#$NUMBER) by @$AUTHOR"
+change-title-escapes: '\<*_&'
+
+version-resolver:
+  major:
+    labels:
+      - "breaking"
+  minor:
+    labels:
+      - "type:feat"
+  patch:
+    labels:
+      - "type:fix"
+      - "type:perf"
+      - "type:refactor"
+      - "type:chore"
+      - "type:docs"
+      - "type:test"
+      - "type:ci"
+  default: patch
+
+template: |
+  ## What's Changed
+
+  $CHANGES
+
+  **Full Changelog**: https://github.com/$OWNER/$REPOSITORY/compare/$PREVIOUS_TAG...v$RESOLVED_VERSION

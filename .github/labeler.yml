@@ -1,0 +1,58 @@
+"area:render":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/render.rs"
+          - "src/settings.rs"
+          - "assets/themes/**"
+
+"area:daemon":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/server.rs"
+          - "src/daemon/**"
+          - "src/session.rs"
+          - "src/ipc.rs"
+          - "src/protocol.rs"
+
+"area:layout":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/layout.rs"
+          - "src/tab.rs"
+          - "src/pane.rs"
+
+"area:copy-mode":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/copy_mode.rs"
+
+"area:config":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/config.rs"
+          - "src/project.rs"
+          - "src/theme.rs"
+
+"area:cli":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/main.rs"
+          - "src/cli/**"
+          - "src/app/**"
+          - "src/direct.rs"
+          - "src/bin/**"
+
+"area:test":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "tests/**"
+          - "benches/**"
+
+"area:repo":
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/**"
+          - "*.md"
+          - "CONTRIBUTING.md"
+          - "MAINTENANCE.md"
+          - "CHANGELOG.md"
