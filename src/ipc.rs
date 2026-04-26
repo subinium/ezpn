@@ -23,11 +23,29 @@ pub(crate) const IPC_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// `IpcResponse` on a misbehaving peer.
 pub(crate) const IPC_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Maximum size of a single `send-keys` payload (sum of all token bytes).
+/// Mirrors the existing 16 MiB protocol payload cap from `protocol.rs` so a
+/// hostile script cannot flood a pane in one IPC round-trip. Per SPEC 06 §10.
+pub(crate) const SEND_KEYS_MAX_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SplitDirection {
     Horizontal,
     Vertical,
+}
+
+/// Where a SPEC 06 `send-keys` payload should land. The enum keeps the wire
+/// format forward-compatible with future targeting modes (by-name, by-index,
+/// cross-tab) without breaking existing CLI consumers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PaneTarget {
+    /// Numeric pane ID as shown by `ezpn-ctl list`.
+    Id { value: usize },
+    /// The active pane on the active tab — resolved server-side at dispatch
+    /// time, so there is no race between resolution and delivery.
+    Current,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +85,18 @@ pub enum IpcRequest {
     SetHistoryLimit {
         pane: usize,
         lines: usize,
+    },
+    /// Deliver a sequence of keystrokes / text into a pane's PTY write half.
+    /// Per SPEC 06: tokens are concatenated with no separator between them,
+    /// and parsed via `keymap::keyspec` unless `literal` is set (in which
+    /// case the bytes are written verbatim). Wire field uses a serde-default
+    /// for `literal` so older `ezpn-ctl` builds that omit the flag still
+    /// deserialize cleanly.
+    SendKeys {
+        target: PaneTarget,
+        keys: Vec<String>,
+        #[serde(default)]
+        literal: bool,
     },
 }
 

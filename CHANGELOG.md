@@ -10,6 +10,7 @@ Entries are written in **functional-only style**: every bullet describes an obse
 ## [Unreleased]
 
 ### Added
+- **`send-keys` API** (#38): new `ezpn-ctl send-keys [--pane N | --target current] [--literal] -- <key>...` subcommand and matching `IpcRequest::SendKeys` variant deliver chord-token sequences (or raw bytes via `--literal`) into a pane's PTY write half. KeySpec grammar in `src/keymap/keyspec.rs` covers Ctrl/Alt/Shift modifiers and the standard Named keys (Enter, Tab, Esc, Space, Backspace, Delete, arrows, Home/End, PageUp/PageDown, F1–F12). `--literal` writes bytes verbatim and rejects tokens that would compile to a Named key with `--literal forbids named keys (got 'X')`. Wire format uses `keys: Vec<String>` to keep multi-char literal arguments unambiguous; `IpcResponse::message` reports `"sent N bytes"` on success. No protocol bump.
 - **Scrollback memory hygiene** (#34): per-pane `[[pane]] scrollback_lines` override in `.ezpn.toml`, new `[scrollback]` config table (`default_lines`, `max_lines`, `warn_bytes`), runtime IPC commands `IpcRequest::ClearHistory` and `SetHistoryLimit`, matching `ezpn-ctl clear-history --pane N` and `ezpn-ctl set-scrollback --pane N --lines L` subcommands. Daemon emits a one-shot `WARN` log line when a pane's estimated scrollback exceeds the configured byte budget (default 50 MiB).
 
 ### Fixed

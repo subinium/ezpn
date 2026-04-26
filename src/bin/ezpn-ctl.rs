@@ -155,9 +155,73 @@ fn parse_request(args: &[String]) -> anyhow::Result<ipc::IpcRequest> {
             pane: parse_flag_pane(args)?,
             lines: parse_flag_lines(args)?,
         }),
+        Some("send-keys") => parse_send_keys(args),
         Some(other) => anyhow::bail!("unknown command: {}", other),
         None => anyhow::bail!("missing command"),
     }
+}
+
+/// Parse `ezpn-ctl send-keys [--pane N | --target current] [--literal] -- <key>...`.
+///
+/// Per SPEC 06 §5: the `--` separator is mandatory once any `<key>` could
+/// look like a flag. We require it unconditionally to keep the contract
+/// simple and unambiguous (matches `git`'s convention).
+fn parse_send_keys(args: &[String]) -> anyhow::Result<ipc::IpcRequest> {
+    // Find the `--` separator; everything after it is `<key>` tokens.
+    let dash_dash = args.iter().position(|a| a == "--").ok_or_else(|| {
+        anyhow::anyhow!(
+            "send-keys requires `--` before key tokens (e.g. \
+             `ezpn-ctl send-keys --pane 0 -- 'echo hi' Enter`)"
+        )
+    })?;
+    let opts = &args[1..dash_dash];
+    let keys: Vec<String> = args[dash_dash + 1..].to_vec();
+    if keys.is_empty() {
+        anyhow::bail!("send-keys requires at least one key after `--`");
+    }
+
+    let mut pane_id: Option<usize> = None;
+    let mut current = false;
+    let mut literal = false;
+    let mut i = 0;
+    while i < opts.len() {
+        match opts[i].as_str() {
+            "--pane" => {
+                i += 1;
+                let v = opts
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--pane requires a number"))?;
+                pane_id = Some(v.parse()?);
+            }
+            "--target" => {
+                i += 1;
+                let v = opts
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--target requires a value"))?;
+                if v != "current" {
+                    anyhow::bail!("only --target current is supported in v0.10");
+                }
+                current = true;
+            }
+            "--literal" => literal = true,
+            other => anyhow::bail!("unknown send-keys option: {}", other),
+        }
+        i += 1;
+    }
+    if pane_id.is_some() && current {
+        anyhow::bail!("--pane and --target current are mutually exclusive");
+    }
+    let target = match (pane_id, current) {
+        (Some(id), false) => ipc::PaneTarget::Id { value: id },
+        (None, true) => ipc::PaneTarget::Current,
+        (None, false) => anyhow::bail!("send-keys requires --pane <N> or --target current"),
+        (Some(_), true) => unreachable!(),
+    };
+    Ok(ipc::IpcRequest::SendKeys {
+        target,
+        keys,
+        literal,
+    })
 }
 
 /// Parse a required `--pane N` flag from the args after the subcommand.
@@ -267,6 +331,11 @@ COMMANDS:
   set-scrollback --pane N --lines L
                              Resize a pane's scrollback ring (max from
                              [scrollback] max_lines, default 100000)
+  send-keys [--pane N | --target current] [--literal] -- <key>...
+                             Deliver keystrokes/text into a pane's PTY.
+                             Each <key> is a chord token: 'C-a', 'Enter',
+                             'F5', or literal text like 'echo hi'.
+                             --literal writes bytes verbatim (no parsing).
 
 EXAMPLES:
   ezpn-ctl list
@@ -274,6 +343,9 @@ EXAMPLES:
   ezpn-ctl save .ezpn-session.json
   ezpn-ctl --pid 12345 load .ezpn-session.json
   ezpn-ctl clear-history --pane 0
-  ezpn-ctl set-scrollback --pane 0 --lines 5000"
+  ezpn-ctl set-scrollback --pane 0 --lines 5000
+  ezpn-ctl send-keys --pane 0 -- 'echo hello' Enter
+  ezpn-ctl send-keys --target current -- C-c
+  ezpn-ctl send-keys --pane 2 -- C-x C-s"
     );
 }
