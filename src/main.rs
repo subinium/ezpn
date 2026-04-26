@@ -18,6 +18,7 @@ mod copy_mode;
 mod daemon;
 mod direct;
 mod ipc;
+mod keymap;
 mod layout;
 mod pane;
 mod project;

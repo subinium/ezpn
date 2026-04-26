@@ -21,6 +21,7 @@ use crate::app::lifecycle::{
 use crate::app::render_ctl::make_inner;
 use crate::app::state::RenderUpdate;
 use crate::ipc;
+use crate::keymap::keyspec;
 use crate::layout::{Direction, Layout};
 use crate::pane::{Pane, PaneLaunch};
 use crate::project;
@@ -267,7 +268,73 @@ pub(crate) fn handle_ipc_command(
                 ipc::IpcResponse::error(format!("no pane {pane}"))
             }
         }
+        ipc::IpcRequest::SendKeys {
+            target,
+            keys,
+            literal,
+        } => handle_send_keys(panes, *active, target, keys, literal),
     };
 
     (response, update)
+}
+
+/// SPEC 06 §4 — `send-keys` dispatch.
+///
+/// Resolves the target pane, optionally compiles the chord-token list into
+/// raw PTY bytes (`literal=false`) or concatenates them verbatim
+/// (`literal=true`), and writes the result through `Pane::write_bytes`. The
+/// success message reports the byte count for debugging visibility.
+fn handle_send_keys(
+    panes: &mut HashMap<usize, Pane>,
+    active: usize,
+    target: ipc::PaneTarget,
+    tokens: Vec<String>,
+    literal: bool,
+) -> ipc::IpcResponse {
+    if tokens.is_empty() {
+        return ipc::IpcResponse::error("no keys to send");
+    }
+    let total_bytes: usize = tokens.iter().map(|s| s.len()).sum();
+    if total_bytes > ipc::SEND_KEYS_MAX_BYTES {
+        return ipc::IpcResponse::error(format!(
+            "send-keys payload too large ({total_bytes} > {} bytes)",
+            ipc::SEND_KEYS_MAX_BYTES
+        ));
+    }
+
+    let pane_id = match target {
+        ipc::PaneTarget::Id { value } => value,
+        ipc::PaneTarget::Current => active,
+    };
+
+    let bytes = if literal {
+        // Per SPEC §4.5, literal mode forbids token strings that would
+        // otherwise compile to a Named key — surfaces the user's intent
+        // mismatch ("did you mean to press Enter or send the 5 letters
+        // E-n-t-e-r?") rather than silently writing raw bytes.
+        if let Some(named) = tokens.iter().find(|t| keyspec::is_named_key(t)) {
+            return ipc::IpcResponse::error(format!(
+                "--literal forbids named keys (got '{named}')"
+            ));
+        }
+        let mut out = Vec::with_capacity(total_bytes);
+        for tok in &tokens {
+            out.extend_from_slice(tok.as_bytes());
+        }
+        out
+    } else {
+        match keyspec::compile_to_bytes(&tokens) {
+            Ok(bytes) => bytes,
+            Err(error) => return ipc::IpcResponse::error(format!("parse: {error}")),
+        }
+    };
+
+    let Some(pane) = panes.get_mut(&pane_id) else {
+        return ipc::IpcResponse::error(format!("pane {pane_id} not found"));
+    };
+    if !pane.is_alive() {
+        return ipc::IpcResponse::error(format!("pane {pane_id} not alive"));
+    }
+    pane.write_bytes(&bytes);
+    ipc::IpcResponse::success(format!("sent {} bytes", bytes.len()))
 }
