@@ -12,6 +12,9 @@ Entries are written in **functional-only style**: every bullet describes an obse
 ### Added
 - **Scrollback memory hygiene** (#34): per-pane `[[pane]] scrollback_lines` override in `.ezpn.toml`, new `[scrollback]` config table (`default_lines`, `max_lines`, `warn_bytes`), runtime IPC commands `IpcRequest::ClearHistory` and `SetHistoryLimit`, matching `ezpn-ctl clear-history --pane N` and `ezpn-ctl set-scrollback --pane N --lines L` subcommands. Daemon emits a one-shot `WARN` log line when a pane's estimated scrollback exceeds the configured byte budget (default 50 MiB).
 
+### Fixed
+- **Pane lifecycle GC** (#35): `Pane` is now an RAII handle with a deterministic `Drop` that signals its reader thread to exit, releases the PTY master fd, and joins the reader within a 250 ms deadline (warns and `mem::forget`s on timeout). Field declaration order ensures `master` drops before `reader_handle` so the blocking `read()` unblocks via EOF. `close_pane` accepts and prunes `restart_policies`, `restart_state`, and `zoomed_pane`. `TabManager::kill_all_inactive` now drains `tab.panes` and clears per-tab restart bookkeeping. PTY reader threads are now named `ezpn-pty-<pid>` for diagnostics.
+
 ### Changed
 - **Daemon I/O resilience** (#33): each attached client now drains a bounded `mpsc::sync_channel(64)` through a dedicated writer thread with `set_write_timeout(50ms)`; clients are evicted after 3 consecutive `WouldBlock`/`TimedOut`. The IPC socket is now served by a fixed pool of 4 worker threads (`crossbeam-channel::bounded(16)`) with `set_read_timeout(5s)` + `set_write_timeout(2s)`; surplus connections receive `IpcResponse::error("ezpn ipc pool saturated; retry")` and idle peers receive `IpcResponse::error("idle timeout")`.
 

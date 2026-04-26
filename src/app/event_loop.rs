@@ -537,7 +537,15 @@ pub(crate) fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()
                             // Close pane
                             KeyCode::Char('x') => {
                                 let target = active;
-                                close_pane(&mut layout, &mut panes, &mut active, target);
+                                close_pane(
+                                    &mut layout,
+                                    &mut panes,
+                                    &mut active,
+                                    target,
+                                    &mut restart_policies,
+                                    &mut restart_state,
+                                    &mut zoomed_pane,
+                                );
                                 resize_all(&mut panes, &layout, tw, th, &settings);
                                 update.mark_all(&layout);
                                 update.border_dirty = true;
@@ -854,7 +862,15 @@ pub(crate) fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()
                             {
                                 match action {
                                     render::TitleAction::Close(pid) => {
-                                        close_pane(&mut layout, &mut panes, &mut active, pid);
+                                        close_pane(
+                                            &mut layout,
+                                            &mut panes,
+                                            &mut active,
+                                            pid,
+                                            &mut restart_policies,
+                                            &mut restart_state,
+                                            &mut zoomed_pane,
+                                        );
                                         resize_all(&mut panes, &layout, tw, th, &settings);
                                     }
                                     render::TitleAction::SplitH(pid) => {
@@ -1096,6 +1112,9 @@ pub(crate) fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()
                     &mut settings,
                     effective_scrollback,
                     effective_max_scrollback,
+                    &mut restart_policies,
+                    &mut restart_state,
+                    &mut zoomed_pane,
                 );
                 update.merge(&mut ipc_update);
                 let _ = resp_tx.send(response);

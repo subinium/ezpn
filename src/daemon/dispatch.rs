@@ -47,6 +47,8 @@ pub(crate) fn process_event(
     tab_action: &mut TabAction,
     tab_names: &[(usize, String, bool)],
     prefix_key: char,
+    restart_policies: &mut HashMap<usize, crate::project::RestartPolicy>,
+    restart_state: &mut HashMap<usize, (Instant, u32)>,
 ) {
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -69,6 +71,8 @@ pub(crate) fn process_event(
                 detach_requested,
                 tab_action,
                 prefix_key,
+                restart_policies,
+                restart_state,
             );
         }
         Event::Mouse(mouse) => {
@@ -102,6 +106,8 @@ pub(crate) fn process_event(
                     &inner,
                     tab_action,
                     tab_names,
+                    restart_policies,
+                    restart_state,
                 );
             }
         }
@@ -158,6 +164,8 @@ pub(super) fn execute_command(
     zoomed_pane: &mut Option<usize>,
     broadcast: &mut bool,
     tab_action: &mut TabAction,
+    restart_policies: &mut HashMap<usize, crate::project::RestartPolicy>,
+    restart_state: &mut HashMap<usize, (Instant, u32)>,
 ) {
     let parts: Vec<&str> = cmd.split_whitespace().collect();
     match parts.first().copied() {
@@ -192,7 +200,15 @@ pub(super) fn execute_command(
         }
         Some("kill-pane") | Some("close-pane") => {
             let target = *active;
-            crate::app::lifecycle::close_pane(layout, panes, active, target);
+            crate::app::lifecycle::close_pane(
+                layout,
+                panes,
+                active,
+                target,
+                restart_policies,
+                restart_state,
+                zoomed_pane,
+            );
             crate::app::lifecycle::resize_all(panes, layout, tw, th, settings);
             update.mark_all(layout);
             update.border_dirty = true;
@@ -281,6 +297,8 @@ pub(crate) fn process_mouse(
     inner: &Rect,
     tab_action: &mut TabAction,
     tab_names: &[(usize, String, bool)],
+    restart_policies: &mut HashMap<usize, crate::project::RestartPolicy>,
+    restart_state: &mut HashMap<usize, (Instant, u32)>,
 ) {
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
@@ -351,7 +369,15 @@ pub(crate) fn process_mouse(
             {
                 match action {
                     render::TitleAction::Close(pid) => {
-                        crate::app::lifecycle::close_pane(layout, panes, active, pid);
+                        crate::app::lifecycle::close_pane(
+                            layout,
+                            panes,
+                            active,
+                            pid,
+                            restart_policies,
+                            restart_state,
+                            zoomed_pane,
+                        );
                         crate::app::lifecycle::resize_all(panes, layout, tw, th, settings);
                     }
                     render::TitleAction::SplitH(pid) => {

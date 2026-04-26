@@ -168,12 +168,23 @@ impl TabManager {
         }
     }
 
-    /// Kill all panes in all inactive tabs (for session shutdown).
+    /// Kill all panes in all inactive tabs (for session shutdown). Per SPEC
+    /// 03 §4.3, drains `tab.panes` so each `Pane::Drop` fires (joining the
+    /// reader thread + releasing the master fd) and clears the per-tab
+    /// restart maps + zoomed state. Without the drain the tab retained
+    /// ~640 MB × N inactive tabs of vt100 RSS until the whole
+    /// `TabManager` itself dropped.
     pub fn kill_all_inactive(&mut self) {
         for tab in &mut self.tabs {
-            for pane in tab.panes.values_mut() {
+            // Send SIGHUP up-front so the reader thread can observe EOF
+            // while we're still iterating; `Pane::Drop` is idempotent and
+            // will skip the second kill call.
+            for (_, mut pane) in tab.panes.drain() {
                 pane.kill();
             }
+            tab.restart_policies.clear();
+            tab.restart_state.clear();
+            tab.zoomed_pane = None;
         }
     }
 
@@ -425,5 +436,37 @@ mod tests {
         assert_eq!(active.name, "only");
         assert_eq!(mgr.count, 1);
         assert_eq!(mgr.active_idx, 0);
+    }
+
+    /// SPEC 03 §4.3: `kill_all_inactive` drains `tab.panes` (releasing fds
+    /// and joining reader threads via `Pane::Drop`) and clears the per-tab
+    /// restart bookkeeping. We exercise the bookkeeping side without
+    /// spawning real PTYs by injecting a tab and seeding its restart maps.
+    #[test]
+    fn kill_all_inactive_clears_bookkeeping() {
+        let mut mgr = TabManager::new();
+        let mut tab = dummy_tab("syn");
+        tab.restart_policies
+            .insert(42, project::RestartPolicy::Always);
+        tab.restart_state.insert(42, (Instant::now(), 3));
+        tab.zoomed_pane = Some(42);
+        mgr.tabs.push(tab);
+
+        mgr.kill_all_inactive();
+
+        let cleaned = &mgr.tabs[0];
+        assert!(
+            cleaned.panes.is_empty(),
+            "kill_all_inactive must drain tab.panes"
+        );
+        assert!(
+            cleaned.restart_policies.is_empty(),
+            "restart_policies must be cleared"
+        );
+        assert!(
+            cleaned.restart_state.is_empty(),
+            "restart_state must be cleared"
+        );
+        assert!(cleaned.zoomed_pane.is_none(), "zoomed_pane must be reset");
     }
 }

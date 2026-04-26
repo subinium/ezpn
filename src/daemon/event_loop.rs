@@ -609,6 +609,8 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                             &mut tab_action,
                             &current_tab_names,
                             prefix_key,
+                            &mut restart_policies,
+                            &mut restart_state,
                         );
                     }
                     Ok(ClientMsg::Resize(w, h)) => {
@@ -1065,6 +1067,9 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                     &mut settings,
                     effective_scrollback,
                     effective_max_scrollback,
+                    &mut restart_policies,
+                    &mut restart_state,
+                    &mut zoomed_pane,
                 );
                 update.merge(&mut ipc_update);
                 let _ = resp_tx.send(response);

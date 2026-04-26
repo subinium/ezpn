@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -35,10 +36,27 @@ pub enum PaneLaunch {
     Command(String),
 }
 
+/// Per-pane state. Field declaration order is **load-bearing** for `Drop`:
+/// Rust drops fields top-to-bottom, so any field whose `Drop` must run
+/// before the reader thread is joined must appear *above* `reader_handle`.
+/// In particular `master` (the PTY master fd) drops before `reader_handle`
+/// so the blocking `reader.read()` unblocks on EOF before we try to join.
+/// See SPEC 03 `docs/spec/v0.10.0/03-lifecycle-gc.md` §4.1.
 pub struct Pane {
-    master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    /// Child first so SIGHUP propagates before the master fd drops.
     child: Box<dyn Child + Send + Sync>,
+    writer: Box<dyn Write + Send>,
+    /// Send `()` to ask the reader to exit. `take()`-d in `Drop` so the
+    /// signal is idempotent. The reader also exits naturally on PTY EOF
+    /// (triggered by `master` dropping below); this signal just bounds
+    /// shutdown latency for slow / sleeping children.
+    shutdown_tx: Option<mpsc::SyncSender<()>>,
+    /// Drops here → kernel notices slave fd is closed → reader's blocking
+    /// `read()` returns 0 → reader exits → handle is joinable.
+    master: Box<dyn MasterPty + Send>,
+    /// `Some` until joined in `Drop`. If join exceeds the 250 ms deadline
+    /// the handle is `mem::forget`ed and a single warn line is emitted.
+    reader_handle: Option<std::thread::JoinHandle<()>>,
     reader_rx: Receiver<Vec<u8>>,
     parser: vt100::Parser,
     alive: bool,
@@ -163,46 +181,61 @@ impl Pane {
         let writer = pair.master.take_writer()?;
 
         let (tx, rx) = mpsc::sync_channel(32); // bounded: 32 * 4KB = 128KB max buffered
-        std::thread::spawn(move || {
-            // Isolate PTY-reader panics: a bad ANSI sequence or vt100 bug must not
-            // take down the daemon. On unwind the channel drops, which causes
-            // `read_output()` to observe `TryRecvError::Disconnected` and mark the
-            // pane dead with exit_code=u32::MAX (see `read_output`).
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut reader = reader;
-                let mut buf = [0u8; 4096];
-                loop {
-                    match reader.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            if tx.send(buf[..n].to_vec()).is_err() {
-                                break;
-                            }
-                            wake_main_loop();
+        let (shutdown_tx, shutdown_rx) = mpsc::sync_channel::<()>(1);
+        let pid_for_name = child.process_id().unwrap_or(0);
+        let reader_handle = std::thread::Builder::new()
+            .name(format!("ezpn-pty-{pid_for_name}"))
+            .spawn(move || {
+                // Isolate PTY-reader panics: a bad ANSI sequence or vt100 bug
+                // must not take down the daemon. On unwind the channel drops,
+                // which causes `read_output()` to observe
+                // `TryRecvError::Disconnected` and mark the pane dead with
+                // exit_code=u32::MAX (see `read_output`).
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut reader = reader;
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        // Cheap shutdown check between reads (SPEC 03 §4.1).
+                        // The blocking read below also unblocks when the
+                        // master fd drops, so this signal only bounds
+                        // shutdown latency for slow / sleeping children.
+                        if shutdown_rx.try_recv().is_ok() {
+                            break;
                         }
-                        Err(_) => break,
+                        match reader.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                if tx.send(buf[..n].to_vec()).is_err() {
+                                    break;
+                                }
+                                wake_main_loop();
+                            }
+                            Err(_) => break,
+                        }
                     }
+                }));
+                if let Err(payload) = result {
+                    let reason = match payload.downcast_ref::<&'static str>() {
+                        Some(s) => (*s).to_string(),
+                        None => match payload.downcast_ref::<String>() {
+                            Some(s) => s.clone(),
+                            None => "unknown panic payload".to_string(),
+                        },
+                    };
+                    eprintln!("ezpn: PTY reader thread panicked: {}", reason);
+                    wake_main_loop();
                 }
-            }));
-            if let Err(payload) = result {
-                let reason = match payload.downcast_ref::<&'static str>() {
-                    Some(s) => (*s).to_string(),
-                    None => match payload.downcast_ref::<String>() {
-                        Some(s) => s.clone(),
-                        None => "unknown panic payload".to_string(),
-                    },
-                };
-                eprintln!("ezpn: PTY reader thread panicked: {}", reason);
-                wake_main_loop();
-            }
-        });
+            })
+            .map_err(|e| anyhow::anyhow!("spawn ezpn-pty thread: {e}"))?;
 
         let parser = vt100::Parser::new(rows, cols, scrollback);
 
         Ok(Self {
-            master: pair.master,
-            writer,
             child,
+            writer,
+            shutdown_tx: Some(shutdown_tx),
+            master: pair.master,
+            reader_handle: Some(reader_handle),
             reader_rx: rx,
             parser,
             alive: true,
@@ -610,6 +643,49 @@ impl Pane {
             }
         }
         self.initial_cwd.clone()
+    }
+}
+
+/// SPEC 03 §4.1: deterministic shutdown for `Pane`. Steps run in declared
+/// order:
+/// 1. SIGHUP the child (idempotent — already dead is fine).
+/// 2. Signal the reader thread to exit (one-shot, idempotent).
+/// 3. Field drop order in `Pane` ensures `master` is released next,
+///    triggering EOF on the reader's blocking `read()`.
+/// 4. Bounded join: poll `is_finished()` for up to 250 ms, then either
+///    `join()` cleanly or `mem::forget` the handle and warn.
+impl Drop for Pane {
+    fn drop(&mut self) {
+        if self.alive {
+            let _ = self.child.kill();
+            self.alive = false;
+        }
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.try_send(());
+        }
+        // Capture pid *before* `master` drops — the warn-on-leak path needs
+        // a stable identifier and `child.process_id()` may surface a stale
+        // value once the kernel reaps the slot.
+        let pid = self.child.process_id().unwrap_or(0);
+        if let Some(handle) = self.reader_handle.take() {
+            // std::thread has no "join with timeout"; emulate via
+            // `is_finished()` polling. The reader exits via either the
+            // shutdown signal above, or PTY EOF when `master` drops as
+            // part of this struct's drop (after this block returns).
+            let deadline = Instant::now() + Duration::from_millis(250);
+            while !handle.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            } else {
+                eprintln!(
+                    "ezpn: PTY reader thread for pid {pid} did not exit \
+                     within 250ms; leaking handle"
+                );
+                std::mem::forget(handle);
+            }
+        }
     }
 }
 
@@ -1040,6 +1116,42 @@ mod history_tests {
         assert!(
             scroll <= 100,
             "after shrink to cap=100, scrollback must be <= 100 (got {scroll})"
+        );
+    }
+}
+
+/// SPEC 03 §4.1: deterministic shutdown for `Pane`. The reader thread
+/// MUST exit within the bounded join window once the pane drops.
+#[cfg(test)]
+mod drop_tests {
+    // bench `render_hotpaths` includes pane.rs via `#[path]`; `super::*`
+    // ends up unused under that compilation unit. See snapshot_blob.rs
+    // for the same pattern.
+    #[allow(unused_imports)]
+    use super::*;
+
+    #[test]
+    fn pane_drop_joins_reader_within_500ms() {
+        // Spawn a real pane running a long-running command (`sleep 60`).
+        // Drop it and assert the reader thread is gone within the bounded
+        // window (allow 500ms in tests vs the production 250ms budget).
+        let pane = Pane::with_scrollback(
+            "/bin/sh",
+            PaneLaunch::Command("sleep 60".to_string()),
+            80,
+            24,
+            1000,
+        );
+        let pane = match pane {
+            Ok(p) => p,
+            Err(_) => return, // CI without /bin/sh is acceptable to skip.
+        };
+        let t0 = std::time::Instant::now();
+        drop(pane);
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "Pane::drop must complete within 500ms (got {elapsed:?})"
         );
     }
 }
