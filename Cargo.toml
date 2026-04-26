@@ -33,6 +33,9 @@ flate2 = "1"
 bincode = "1.3"
 base64 = "0.22"
 crossbeam-channel = "0.5"
+# SPEC 08 hooks system: bounded `Child::wait_timeout` so a slow user shell-out
+# cannot exhaust a worker thread. Dual-licensed MIT/Apache, ~200 LoC.
+wait-timeout = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

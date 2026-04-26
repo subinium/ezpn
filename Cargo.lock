@@ -295,6 +295,7 @@ dependencies = [
  "toml",
  "unicode-width 0.2.2",
  "vt100",
+ "wait-timeout",
 ]
 
 [[package]]

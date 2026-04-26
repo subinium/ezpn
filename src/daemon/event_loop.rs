@@ -18,6 +18,7 @@ use crate::app::state::RenderUpdate;
 use crate::config;
 use crate::daemon::dispatch::process_event;
 use crate::daemon::events::EventBus;
+use crate::daemon::hooks::{HookEvent, HookManager};
 use crate::daemon::render::render_frame_to_buf;
 use crate::daemon::router::{accept_client, effective_size};
 use crate::daemon::snapshot::capture_workspace;
@@ -118,6 +119,12 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
     // threads + drop-oldest backpressure. The main loop emits envelopes
     // through `event_bus.emit_*`; serialization happens off-thread.
     let mut event_bus = EventBus::new(session_name);
+
+    // SPEC 08: hooks worker pool. Runs every user `[[hooks]]` shell-out
+    // off the main loop with a per-hook timeout. Empty config → spawn
+    // anyway (zero overhead, one drop on shutdown) so hot-reload via
+    // `prefix r` can populate the list later.
+    let hook_manager = HookManager::spawn(file_config.hooks.clone());
 
     // Tab management
     use crate::tab::{Tab, TabManager};
@@ -585,6 +592,16 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                             if clients.len() > prev_count {
                                 if let Some(c) = clients.last() {
                                     event_bus.emit_client_attached(c.id, c.mode, c.tw, c.th);
+                                    hook_manager.dispatch(
+                                        HookEvent::ClientAttached,
+                                        client_attached_vars(
+                                            session_name,
+                                            c.id,
+                                            c.mode,
+                                            c.tw,
+                                            c.th,
+                                        ),
+                                    );
                                 }
                             }
                         }
@@ -612,6 +629,16 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                             if clients.len() > prev_count {
                                 if let Some(c) = clients.last() {
                                     event_bus.emit_client_attached(c.id, c.mode, c.tw, c.th);
+                                    hook_manager.dispatch(
+                                        HookEvent::ClientAttached,
+                                        client_attached_vars(
+                                            session_name,
+                                            c.id,
+                                            c.mode,
+                                            c.tw,
+                                            c.th,
+                                        ),
+                                    );
                                 }
                             }
                         }
@@ -768,12 +795,20 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                 let _ = clients[pos].outbound_tx.try_send(OutboundMsg::Detached);
                 clients.remove(pos);
                 event_bus.emit_client_detached(*id, "detach_request");
+                hook_manager.dispatch(
+                    HookEvent::ClientDetached,
+                    client_detached_vars(session_name, *id, "detach_request"),
+                );
             }
         }
         for id in &disconnect_ids {
             if let Some(pos) = clients.iter().position(|c| c.id == *id) {
                 clients.remove(pos);
                 event_bus.emit_client_detached(*id, "socket_closed");
+                hook_manager.dispatch(
+                    HookEvent::ClientDetached,
+                    client_detached_vars(session_name, *id, "socket_closed"),
+                );
             }
         }
         // Recompute effective size after any client changes
@@ -845,6 +880,14 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                 saved.broadcast = broadcast;
 
                 tab_name = tab_mgr.create_tab(saved);
+                // SPEC 08: tab-created hook fires once the new tab name is
+                // assigned; the per-tab pane spawn is best-effort below
+                // and may revert, but the hook intent is "user asked for a
+                // new tab" which has happened by now.
+                hook_manager.dispatch(
+                    HookEvent::TabCreated,
+                    tab_lifecycle_vars(session_name, tab_mgr.active_idx, &tab_name),
+                );
                 // Create new tab with a single shell pane
                 layout = Layout::from_grid(1, 1);
                 let inner = crate::app::render_ctl::make_inner(tw, th, settings.show_status_bar);
@@ -964,8 +1007,16 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
             }
             TabAction::CloseTab => {
                 if tab_mgr.count > 1 {
+                    let closed_index = tab_mgr.active_idx;
+                    let closed_name = tab_name.clone();
                     crate::app::lifecycle::kill_all_panes(&mut panes);
                     if let Some(new_tab) = tab_mgr.close_active() {
+                        // SPEC 08: tab-closed hook fires for the tab the
+                        // user just dismissed (not the one we switched to).
+                        hook_manager.dispatch(
+                            HookEvent::TabClosed,
+                            tab_lifecycle_vars(session_name, closed_index, &closed_name),
+                        );
                         tab_name = new_tab.name;
                         layout = new_tab.layout;
                         panes = new_tab.panes;
@@ -996,6 +1047,16 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                 }
             }
             TabAction::Rename(new_name) => {
+                // SPEC 08: session-renamed hook re-uses this site since
+                // ezpn does not yet have a separate session-rename surface
+                // (the active tab name doubles as the session label in the
+                // status bar). When per-session rename ships, switch to
+                // emitting both events.
+                let old = tab_name.clone();
+                hook_manager.dispatch(
+                    HookEvent::SessionRenamed,
+                    session_renamed_vars(&new_name, &old),
+                );
                 tab_name = new_name;
                 update.full_redraw = true;
                 tab_names_dirty = true;
@@ -1364,4 +1425,64 @@ fn warn_if_over_budget(
             );
         }
     }
+}
+
+// ── SPEC 08 hook variable map builders ───────────────────────────────
+//
+// One per event family. Keep them as free functions so the dispatch
+// sites in `run()` stay one-line and we can change a key name without
+// scanning every `dispatch` call.
+
+fn client_attached_vars(
+    session: &str,
+    client_id: u64,
+    mode: protocol::AttachMode,
+    cols: u16,
+    rows: u16,
+) -> HashMap<&'static str, String> {
+    let mode_str = match mode {
+        protocol::AttachMode::Steal => "steal",
+        protocol::AttachMode::Shared => "shared",
+        protocol::AttachMode::Readonly => "readonly",
+    };
+    let mut m = HashMap::new();
+    m.insert("session", session.to_string());
+    m.insert("client_id", client_id.to_string());
+    m.insert("client_name", format!("client-{client_id}"));
+    m.insert("mode", mode_str.to_string());
+    m.insert("cols", cols.to_string());
+    m.insert("rows", rows.to_string());
+    m
+}
+
+fn client_detached_vars(
+    session: &str,
+    client_id: u64,
+    reason: &str,
+) -> HashMap<&'static str, String> {
+    let mut m = HashMap::new();
+    m.insert("session", session.to_string());
+    m.insert("client_id", client_id.to_string());
+    m.insert("client_name", format!("client-{client_id}"));
+    m.insert("reason", reason.to_string());
+    m
+}
+
+fn tab_lifecycle_vars(
+    session: &str,
+    tab_index: usize,
+    name: &str,
+) -> HashMap<&'static str, String> {
+    let mut m = HashMap::new();
+    m.insert("session", session.to_string());
+    m.insert("tab_index", tab_index.to_string());
+    m.insert("name", name.to_string());
+    m
+}
+
+fn session_renamed_vars(new_name: &str, old_name: &str) -> HashMap<&'static str, String> {
+    let mut m = HashMap::new();
+    m.insert("session", new_name.to_string());
+    m.insert("old_session", old_name.to_string());
+    m
 }
