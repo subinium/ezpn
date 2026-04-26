@@ -18,6 +18,7 @@ use crate::protocol;
 use crate::settings::Settings;
 
 use super::state::{ClientMsg, ConnectedClient, DragState};
+use super::writer::{spawn_writer, OutboundMsg, QUEUE_CAP};
 use crate::app::state::RenderUpdate;
 
 pub(crate) static NEXT_CLIENT_ID: std::sync::atomic::AtomicU64 =
@@ -105,7 +106,7 @@ pub(crate) fn accept_client(
     // Steal mode: detach all existing clients
     if mode == protocol::AttachMode::Steal {
         for c in clients.iter_mut() {
-            let _ = protocol::write_msg(&mut c.writer, protocol::S_DETACHED, &[]);
+            let _ = c.outbound_tx.try_send(OutboundMsg::Detached);
         }
         clients.clear();
     }
@@ -115,9 +116,10 @@ pub(crate) fn accept_client(
         conn.set_read_timeout(None).ok();
         let (msg_tx, msg_rx) = mpsc::channel();
         // [perf:cold] clone here: cloning an `mpsc::Sender` is one Arc bump.
-        // Runs once per accepted client (cold path) and the second sender is
-        // only used to deliver a panic-reason message on reader-thread crash.
+        // Runs once per accepted client (cold path). One clone for the
+        // reader's panic-reason path, one for the writer's eviction signal.
         let panic_tx = msg_tx.clone();
+        let wake_writer = msg_tx.clone();
         std::thread::spawn(move || {
             // Isolate reader-thread panics so one bad client cannot kill the daemon.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -129,10 +131,16 @@ pub(crate) fn accept_client(
                 crate::pane::wake_main_loop();
             }
         });
+        // Spawn the per-client writer thread. It owns the socket and
+        // honours `set_write_timeout` so a slow peer cannot stall the
+        // daemon main loop. Eviction signal arrives via `wake_writer`.
+        let (out_tx, out_rx) = mpsc::sync_channel::<OutboundMsg>(QUEUE_CAP);
+        let writer_handle = spawn_writer(conn, out_rx, wake_writer);
         let client_id = NEXT_CLIENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         clients.push(ConnectedClient {
             id: client_id,
-            writer: std::io::BufWriter::new(conn),
+            outbound_tx: out_tx,
+            writer_handle: Some(writer_handle),
             event_rx: msg_rx,
             mode,
             caps,

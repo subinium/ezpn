@@ -19,5 +19,6 @@ pub(crate) mod render;
 pub(crate) mod router;
 pub(crate) mod snapshot;
 pub(crate) mod state;
+pub(crate) mod writer;
 
 pub use event_loop::run;

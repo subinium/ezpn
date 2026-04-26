@@ -1,9 +1,27 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::mpsc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+
+/// Number of worker threads serving IPC requests. See SPEC 01
+/// `docs/spec/v0.10.0/01-daemon-io-resilience.md` §4.2.
+pub(crate) const IPC_POOL_SIZE: usize = 4;
+
+/// Maximum number of pending accepted-but-not-handled connections. When
+/// the queue saturates, new accepts are rejected with a structured
+/// `IpcResponse::error("ezpn ipc pool saturated; retry")` and closed.
+pub(crate) const IPC_QUEUE_CAPACITY: usize = 16;
+
+/// Per-connection read timeout. A hostile/buggy `ezpn-ctl` that opens
+/// the socket and never sends a request is reaped after this interval.
+pub(crate) const IPC_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Per-connection write timeout. Bounds time spent sending one
+/// `IpcResponse` on a misbehaving peer.
+pub(crate) const IPC_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -119,6 +137,12 @@ pub fn start_listener() -> anyhow::Result<mpsc::Receiver<(IpcRequest, ResponseSe
     }
     let (tx, rx) = mpsc::channel();
 
+    // Spawn a fixed worker pool to handle accepted connections. Per SPEC 01
+    // §4.2, this caps the daemon's IPC thread budget regardless of how many
+    // clients connect — eliminating the unbounded `spawn-per-connection`
+    // leak that prior versions exhibited.
+    let pool = spawn_ipc_pool(tx);
+
     std::thread::spawn(move || {
         // Outer accept loop must survive any per-client panic; otherwise the
         // ezpn-ctl IPC interface dies after one malformed request.
@@ -126,26 +150,67 @@ pub fn start_listener() -> anyhow::Result<mpsc::Receiver<(IpcRequest, ResponseSe
             for stream in listener.incoming() {
                 match stream {
                     Ok(stream) => {
-                        let tx = tx.clone();
-                        std::thread::spawn(move || {
-                            // Per-client panics never propagate.
-                            let result =
-                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    handle_client(stream, tx);
-                                }));
-                            if let Err(payload) = result {
-                                let reason = panic_payload_to_string(&payload);
-                                eprintln!("ezpn-ctl: handler thread panicked: {}", reason);
-                            }
-                        });
+                        // Hand off to the worker pool. If the queue is full
+                        // we reject the connection with a structured error
+                        // rather than spawning an unbounded thread.
+                        if let Err(crossbeam_channel::TrySendError::Full(mut s)) =
+                            pool.work_tx.try_send(stream)
+                        {
+                            let resp = IpcResponse::error("ezpn ipc pool saturated; retry");
+                            let _ = write_response(&mut s, &resp);
+                            drop(s);
+                        }
                     }
                     Err(_) => break,
                 }
             }
+            // Acceptor exiting — drop the work channel so workers also exit.
+            drop(pool);
         }));
     });
 
     Ok(rx)
+}
+
+/// Bounded worker pool serving accepted IPC connections.
+struct IpcPool {
+    work_tx: crossbeam_channel::Sender<UnixStream>,
+    /// Worker join handles. Kept solely to extend their lifetime to the
+    /// pool's; not joined explicitly because the daemon process exit
+    /// cleans up all threads.
+    _workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+fn spawn_ipc_pool(cmd_tx: mpsc::Sender<(IpcRequest, ResponseSender)>) -> IpcPool {
+    let (work_tx, work_rx) = crossbeam_channel::bounded::<UnixStream>(IPC_QUEUE_CAPACITY);
+    let mut workers = Vec::with_capacity(IPC_POOL_SIZE);
+    for worker_id in 0..IPC_POOL_SIZE {
+        let rx = work_rx.clone();
+        let cmd_tx = cmd_tx.clone();
+        let handle = std::thread::Builder::new()
+            .name(format!("ezpn-ipc-{worker_id}"))
+            .spawn(move || {
+                while let Ok(stream) = rx.recv() {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _ = stream.set_read_timeout(Some(IPC_READ_TIMEOUT));
+                        let _ = stream.set_write_timeout(Some(IPC_WRITE_TIMEOUT));
+                        handle_client(stream, cmd_tx.clone());
+                    }));
+                    if let Err(payload) = result {
+                        eprintln!(
+                            "ezpn-ipc: worker {worker_id} panicked: {}",
+                            panic_payload_to_string(&payload)
+                        );
+                    }
+                }
+            })
+            .expect("spawn ezpn-ipc worker thread");
+        workers.push(handle);
+    }
+    IpcPool {
+        work_tx,
+        _workers: workers,
+    }
 }
 
 fn panic_payload_to_string(payload: &Box<dyn std::any::Any + Send>) -> String {
@@ -172,6 +237,16 @@ fn handle_client(stream: UnixStream, tx: mpsc::Sender<(IpcRequest, ResponseSende
     for line in reader.lines() {
         let line = match line {
             Ok(line) => line,
+            // Idle-timeout (read_timeout fired) or short-circuit recv: emit
+            // a structured error and close the connection. Per SPEC 01 §4.2,
+            // hostile or wedged peers must be reaped within IPC_READ_TIMEOUT
+            // rather than holding a worker thread forever.
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                let _ = write_response(&mut writer, &IpcResponse::error("idle timeout"));
+                break;
+            }
             Err(_) => break,
         };
 
