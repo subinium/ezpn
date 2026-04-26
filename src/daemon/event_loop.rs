@@ -20,6 +20,7 @@ use crate::daemon::dispatch::process_event;
 use crate::daemon::render::render_frame_to_buf;
 use crate::daemon::router::{accept_client, effective_size};
 use crate::daemon::snapshot::capture_workspace;
+use crate::daemon::snapshot_worker::{SnapshotJob, SnapshotWorker};
 use crate::daemon::state::{
     ClientMsg, ConnectedClient, DragState, InputMode, TabAction, TextSelection,
 };
@@ -105,6 +106,12 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
     // SPEC 02 §4.5: pane IDs that have already crossed `scrollback_warn_bytes`
     // and emitted their one-shot warning. Reset is deferred (PRD non-goal).
     let mut scrollback_warned: HashSet<usize> = HashSet::new();
+
+    // SPEC 04: snapshot worker thread. Owns gzip+bincode + atomic write.
+    // Auto-saves are debounced (150 ms) and dropped on queue saturation;
+    // user `Save` IPC is acked synchronously. Drop on `run()` return
+    // flushes any pending auto with a 5 s deadline.
+    let snapshot_worker = SnapshotWorker::spawn();
 
     // Tab management
     use crate::tab::{Tab, TabManager};
@@ -749,7 +756,13 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                 effective_scrollback,
                 persist_scrollback,
             );
-            workspace::auto_save(session_name, &snapshot);
+            // SPEC 04: hand off to the worker — encode + atomic write
+            // happen off the main loop. Drop on saturation is deliberate
+            // (debounce will pick up the next idle).
+            let _ = snapshot_worker.submit(SnapshotJob::Auto {
+                session_name: session_name.to_string(),
+                snapshot,
+            });
             mode = InputMode::Normal;
             drag = None;
             selection_anchor = None;
@@ -961,9 +974,22 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                         effective_scrollback,
                         persist_scrollback,
                     );
-                    let response = match workspace::save_snapshot(path, &snapshot) {
-                        Ok(()) => ipc::IpcResponse::success(format!("saved {}", path)),
-                        Err(error) => ipc::IpcResponse::error(error.to_string()),
+                    // SPEC 04 §4.3: user-initiated save → worker with ack.
+                    let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+                    let submitted = snapshot_worker.submit(SnapshotJob::UserSave {
+                        path: std::path::PathBuf::from(path),
+                        snapshot,
+                        ack: ack_tx,
+                    });
+                    let response = if !submitted {
+                        ipc::IpcResponse::error("snapshot worker queue full; retry")
+                    } else {
+                        match ack_rx.recv_timeout(crate::daemon::snapshot_worker::USER_SAVE_TIMEOUT)
+                        {
+                            Ok(Ok(())) => ipc::IpcResponse::success(format!("saved {}", path)),
+                            Ok(Err(e)) => ipc::IpcResponse::error(e),
+                            Err(_) => ipc::IpcResponse::error("snapshot worker timed out"),
+                        }
                     };
                     let _ = resp_tx.send(response);
                     continue;
@@ -1211,7 +1237,10 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                             effective_scrollback,
                             persist_scrollback,
                         );
-                        workspace::auto_save(session_name, &snapshot);
+                        let _ = snapshot_worker.submit(SnapshotJob::Auto {
+                            session_name: session_name.to_string(),
+                            snapshot,
+                        });
                         for pane in panes.values_mut() {
                             pane.kill();
                         }
