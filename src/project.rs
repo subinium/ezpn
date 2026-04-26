@@ -82,6 +82,10 @@ pub struct PaneSection {
     #[serde(default)]
     pub restart: RestartPolicy,
     pub shell: Option<String>,
+    /// Per-pane scrollback override (lines). When present, takes precedence
+    /// over the global `[scrollback] default_lines`. Capped against
+    /// `EzpnConfig::scrollback_max_lines` when applied. SPEC 02.
+    pub scrollback_lines: Option<usize>,
 }
 
 /// Resolved project config ready for launching.
@@ -107,6 +111,9 @@ pub struct ResolvedProject {
     /// Per-project override for `persist_scrollback`. `None` means defer to
     /// the global `EzpnConfig.persist_scrollback`.
     pub persist_scrollback: Option<bool>,
+    /// Per-pane scrollback line overrides. Empty when no `[[pane]]` section
+    /// supplied `scrollback_lines`. Looked up in `spawn_project_panes`.
+    pub scrollback_overrides: HashMap<usize, usize>,
 }
 
 /// Errors returned by [`resolve_env`].
@@ -181,6 +188,7 @@ fn load_project_from(path: &Path) -> Result<ResolvedProject, String> {
     let mut envs = HashMap::new();
     let mut restarts = HashMap::new();
     let mut shells = HashMap::new();
+    let mut scrollback_overrides: HashMap<usize, usize> = HashMap::new();
     let mut env_errors: HashMap<usize, Vec<String>> = HashMap::new();
     let base_dir = path
         .parent()
@@ -223,6 +231,9 @@ fn load_project_from(path: &Path) -> Result<ResolvedProject, String> {
             if let Some(shell) = &section.shell {
                 shells.insert(*pid, shell.clone());
             }
+            if let Some(lines) = section.scrollback_lines {
+                scrollback_overrides.insert(*pid, lines);
+            }
         } else {
             launches.insert(*pid, PaneLaunch::Shell);
         }
@@ -244,6 +255,7 @@ fn load_project_from(path: &Path) -> Result<ResolvedProject, String> {
         base_dir,
         env_errors,
         persist_scrollback,
+        scrollback_overrides,
     })
 }
 

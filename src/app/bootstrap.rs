@@ -31,6 +31,7 @@ pub(crate) fn build_initial_state(
     settings: &mut Settings,
     restart_policies: &mut HashMap<usize, project::RestartPolicy>,
     scrollback: usize,
+    max_scrollback: usize,
     persist_scrollback: &mut bool,
 ) -> anyhow::Result<(Layout, HashMap<usize, Pane>, usize, Option<SnapshotExtra>)> {
     // Use a default terminal size for initial spawn (server doesn't have a terminal yet).
@@ -81,7 +82,15 @@ pub(crate) fn build_initial_state(
     {
         if let Some(result) = project::load_project() {
             let proj = result.map_err(|e| anyhow::anyhow!("{e}"))?;
-            let panes = spawn_project_panes(&proj, default_shell, tw, th, settings, scrollback)?;
+            let panes = spawn_project_panes(
+                &proj,
+                default_shell,
+                tw,
+                th,
+                settings,
+                scrollback,
+                max_scrollback,
+            )?;
             *restart_policies = proj.restarts.clone();
             // Per-project override for persist_scrollback (falls back to global).
             if let Some(override_value) = proj.persist_scrollback {

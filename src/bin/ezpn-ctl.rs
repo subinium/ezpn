@@ -148,9 +148,43 @@ fn parse_request(args: &[String]) -> anyhow::Result<ipc::IpcRequest> {
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("load <path>"))?,
         }),
+        Some("clear-history") => Ok(ipc::IpcRequest::ClearHistory {
+            pane: parse_flag_pane(args)?,
+        }),
+        Some("set-scrollback") => Ok(ipc::IpcRequest::SetHistoryLimit {
+            pane: parse_flag_pane(args)?,
+            lines: parse_flag_lines(args)?,
+        }),
         Some(other) => anyhow::bail!("unknown command: {}", other),
         None => anyhow::bail!("missing command"),
     }
+}
+
+/// Parse a required `--pane N` flag from the args after the subcommand.
+/// Returns the pane id; bails if the flag is missing or not a usize.
+fn parse_flag_pane(args: &[String]) -> anyhow::Result<usize> {
+    parse_named_usize(args, "--pane").ok_or_else(|| {
+        anyhow::anyhow!("missing --pane <N>; example: ezpn-ctl clear-history --pane 0")
+    })
+}
+
+/// Parse a required `--lines N` flag.
+fn parse_flag_lines(args: &[String]) -> anyhow::Result<usize> {
+    parse_named_usize(args, "--lines").ok_or_else(|| {
+        anyhow::anyhow!(
+            "missing --lines <N>; example: ezpn-ctl set-scrollback --pane 0 --lines 5000"
+        )
+    })
+}
+
+fn parse_named_usize(args: &[String], flag: &str) -> Option<usize> {
+    args.iter().enumerate().find_map(|(i, a)| {
+        if a == flag {
+            args.get(i + 1).and_then(|v| v.parse().ok())
+        } else {
+            None
+        }
+    })
 }
 
 fn parse_required_usize(args: &[String], index: usize, usage: &str) -> anyhow::Result<usize> {
@@ -229,11 +263,17 @@ COMMANDS:
   exec <pane> <command>      Run command in a pane
   save <path>                Save workspace snapshot
   load <path>                Load workspace snapshot
+  clear-history --pane N     Drop scrollback above the visible screen
+  set-scrollback --pane N --lines L
+                             Resize a pane's scrollback ring (max from
+                             [scrollback] max_lines, default 100000)
 
 EXAMPLES:
   ezpn-ctl list
   ezpn-ctl exec 0 'cargo test'
   ezpn-ctl save .ezpn-session.json
-  ezpn-ctl --pid 12345 load .ezpn-session.json"
+  ezpn-ctl --pid 12345 load .ezpn-session.json
+  ezpn-ctl clear-history --pane 0
+  ezpn-ctl set-scrollback --pane 0 --lines 5000"
     );
 }

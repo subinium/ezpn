@@ -9,7 +9,7 @@
 //! state and breaking it up further would require a full state-struct
 //! refactor (out of scope for the Tidy First pass).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::net::UnixListener;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -43,6 +43,8 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
     // Load config file defaults
     let file_config = config::load_config();
     let effective_scrollback = file_config.scrollback;
+    let effective_max_scrollback = file_config.scrollback_max_lines;
+    let scrollback_warn_bytes = file_config.scrollback_warn_bytes;
     let mut default_shell = if config.has_shell_override {
         // [perf:init] clone here: read once at daemon startup; needed because
         // `config` is borrowed below for other fields. Cold path.
@@ -87,6 +89,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
             &mut settings,
             &mut restart_policies,
             effective_scrollback,
+            effective_max_scrollback,
             &mut persist_scrollback,
         )?;
 
@@ -99,6 +102,9 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
     let mut text_selection: Option<TextSelection> = None;
 
     let mut restart_state: HashMap<usize, (Instant, u32)> = HashMap::new();
+    // SPEC 02 §4.5: pane IDs that have already crossed `scrollback_warn_bytes`
+    // and emitted their one-shot warning. Reset is deferred (PRD non-goal).
+    let mut scrollback_warned: HashSet<usize> = HashSet::new();
 
     // Tab management
     use crate::tab::{Tab, TabManager};
@@ -1058,9 +1064,13 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                     th,
                     &mut settings,
                     effective_scrollback,
+                    effective_max_scrollback,
                 );
                 update.merge(&mut ipc_update);
                 let _ = resp_tx.send(response);
+                // SPEC 02 §4.5: surface a one-shot per-pane warning when
+                // estimated scrollback bytes cross the configured threshold.
+                warn_if_over_budget(&panes, scrollback_warn_bytes, &mut scrollback_warned);
             }
         }
 
@@ -1230,4 +1240,33 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
     session::cleanup(session_name);
     ipc::cleanup();
     Ok(())
+}
+
+/// Emit a one-shot per-pane warning when estimated scrollback bytes exceed
+/// `warn_bytes`. SPEC 02 §4.5 — purely informational; not a hard cap.
+///
+/// `already_warned` accumulates pane IDs across calls so the same pane never
+/// warns twice. Closed pane IDs are not pruned from the set; this is a
+/// non-issue at v0.10 scale (pane IDs are u64 and rarely recycled).
+fn warn_if_over_budget(
+    panes: &HashMap<usize, crate::pane::Pane>,
+    warn_bytes: usize,
+    already_warned: &mut HashSet<usize>,
+) {
+    if warn_bytes == 0 {
+        return; // disabled
+    }
+    for (&pid, pane) in panes {
+        let est = pane.estimated_scrollback_bytes();
+        if est > warn_bytes && already_warned.insert(pid) {
+            let cols = pane.screen().size().1;
+            eprintln!(
+                "ezpn: pane {pid} scrollback ~{} MB (cap {} lines × {} cols × ~32 B/cell); \
+                 use `ezpn-ctl set-scrollback --pane {pid} --lines N` to lower",
+                est / 1_048_576,
+                pane.scrollback_cap(),
+                cols,
+            );
+        }
+    }
 }

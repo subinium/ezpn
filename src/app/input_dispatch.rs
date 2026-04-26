@@ -38,6 +38,7 @@ pub(crate) fn handle_ipc_command(
     th: u16,
     settings: &mut Settings,
     scrollback: usize,
+    max_scrollback: usize,
 ) -> (ipc::IpcResponse, RenderUpdate) {
     let mut update = RenderUpdate::default();
 
@@ -226,6 +227,35 @@ pub(crate) fn handle_ipc_command(
             }
             Err(error) => ipc::IpcResponse::error(error.to_string()),
         },
+        ipc::IpcRequest::ClearHistory { pane } => {
+            if let Some(p) = panes.get_mut(&pane) {
+                match p.clear_history() {
+                    Ok(()) => {
+                        update.dirty_panes.insert(pane);
+                        ipc::IpcResponse::success(format!("cleared history for pane {pane}"))
+                    }
+                    Err(error) => ipc::IpcResponse::error(error.to_string()),
+                }
+            } else {
+                ipc::IpcResponse::error(format!("no pane {pane}"))
+            }
+        }
+        ipc::IpcRequest::SetHistoryLimit { pane, lines } => {
+            let lines = lines.min(max_scrollback);
+            if let Some(p) = panes.get_mut(&pane) {
+                match p.set_scrollback_lines(lines) {
+                    Ok(()) => {
+                        update.dirty_panes.insert(pane);
+                        ipc::IpcResponse::success(format!(
+                            "scrollback for pane {pane} set to {lines}"
+                        ))
+                    }
+                    Err(error) => ipc::IpcResponse::error(error.to_string()),
+                }
+            } else {
+                ipc::IpcResponse::error(format!("no pane {pane}"))
+            }
+        }
     };
 
     (response, update)

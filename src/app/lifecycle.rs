@@ -200,6 +200,7 @@ pub(crate) fn spawn_project_panes(
     th: u16,
     settings: &Settings,
     scrollback: usize,
+    max_scrollback: usize,
 ) -> anyhow::Result<HashMap<usize, Pane>> {
     let inner = make_inner(tw, th, settings.show_status_bar);
     let rects = proj.layout.pane_rects(&inner);
@@ -216,8 +217,17 @@ pub(crate) fn spawn_project_panes(
         let pane_shell = proj.shells.get(&pid).map(|s| s.as_str()).unwrap_or(shell);
         let cwd = proj.cwds.get(&pid).map(|p| p.as_path());
         let env = proj.envs.get(&pid).cloned().unwrap_or_default();
+        // SPEC 02: per-pane override takes precedence; capped against the
+        // workspace-wide max so a stray `scrollback_lines = 1_000_000` in
+        // `.ezpn.toml` cannot bypass the global ceiling.
+        let pane_scrollback = proj
+            .scrollback_overrides
+            .get(&pid)
+            .copied()
+            .unwrap_or(scrollback)
+            .min(max_scrollback);
         let mut pane =
-            Pane::with_full_config(pane_shell, launch, cols, rows, scrollback, cwd, &env)?;
+            Pane::with_full_config(pane_shell, launch, cols, rows, pane_scrollback, cwd, &env)?;
         if let Some(name) = proj.names.get(&pid) {
             pane.set_name(Some(name.clone()));
         }

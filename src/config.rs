@@ -6,7 +6,16 @@ use std::path::PathBuf;
 pub struct EzpnConfig {
     pub border: BorderStyle,
     pub shell: String,
+    /// Default scrollback line count applied to every pane unless overridden.
+    /// Mapped from either the flat `scrollback = N` (back-compat) or the new
+    /// `[scrollback] default_lines = N` (SPEC 02).
     pub scrollback: usize,
+    /// Hard ceiling enforced when applying per-pane overrides or runtime
+    /// `set-scrollback` requests. Defaults to 100_000.
+    pub scrollback_max_lines: usize,
+    /// Estimated-bytes threshold above which the daemon emits a one-shot
+    /// per-pane warning. Defaults to 50 MiB. Hint, not a hard cap.
+    pub scrollback_warn_bytes: usize,
     pub show_status_bar: bool,
     pub show_tab_bar: bool,
     /// Prefix key character (default: 'b' for Ctrl+B).
@@ -27,6 +36,8 @@ impl Default for EzpnConfig {
             border: BorderStyle::Rounded,
             shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
             scrollback: 10_000,
+            scrollback_max_lines: 100_000,
+            scrollback_warn_bytes: 50 * 1024 * 1024,
             show_status_bar: true,
             show_tab_bar: true,
             prefix_key: 'b',
@@ -57,51 +68,90 @@ pub fn load_config() -> EzpnConfig {
 }
 
 fn parse_config_into(contents: &str, config: &mut EzpnConfig) {
+    // Section state: `Some("scrollback")` while inside `[scrollback]`, etc.
+    // Other section names (e.g. `[ui]`) are accepted but their keys are still
+    // routed through the global key table — preserves legacy behaviour where
+    // `[ui]\ntheme = "..."` worked.
+    let mut section: Option<String> = None;
     for line in contents.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        // Section headers like `[ui]` are accepted but ignored — every
-        // recognised key is global. Lets users author
-        // `[ui]\ntheme = "..."` without surprising failures.
-        if line.starts_with('[') && line.ends_with(']') {
+        if let Some(name) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            section = Some(name.trim().to_string());
             continue;
         }
-        if let Some((key, value)) = line.split_once('=') {
-            let key = key.trim();
-            let value = normalize_value(value);
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = normalize_value(value);
+
+        // `[scrollback]` table — per SPEC 02. Keys here populate the new
+        // EzpnConfig fields; values are capped against `scrollback_max_lines`
+        // when applied, not here, so users can lower the cap at runtime.
+        if section.as_deref() == Some("scrollback") {
             match key {
-                "border" => {
-                    if let Some(style) = BorderStyle::from_str(value) {
-                        config.border = style;
-                    }
-                }
-                "shell" => config.shell = value.to_string(),
-                "scrollback" => {
+                "default_lines" => {
                     if let Ok(n) = value.parse::<usize>() {
-                        config.scrollback = n.min(100_000);
+                        config.scrollback = n;
                     }
                 }
-                "status_bar" => config.show_status_bar = value == "true",
-                "tab_bar" => config.show_tab_bar = value == "true",
-                "persist_scrollback" => {
-                    config.persist_scrollback = value == "true";
-                }
-                "prefix" => {
-                    let ch = value.to_lowercase();
-                    if let Some(c) = ch.chars().next() {
-                        if c.is_ascii_lowercase() {
-                            config.prefix_key = c;
-                        }
+                "max_lines" => {
+                    if let Ok(n) = value.parse::<usize>() {
+                        config.scrollback_max_lines = n;
                     }
                 }
-                "theme" if !value.is_empty() => {
-                    config.theme = value.to_string();
+                "warn_bytes" => {
+                    if let Ok(n) = value.parse::<usize>() {
+                        config.scrollback_warn_bytes = n;
+                    }
                 }
-                _ => {} // ignore unknown keys
+                _ => {}
             }
+            continue;
         }
+
+        match key {
+            "border" => {
+                if let Some(style) = BorderStyle::from_str(value) {
+                    config.border = style;
+                }
+            }
+            "shell" => config.shell = value.to_string(),
+            "scrollback" => {
+                // Flat key — keep back-compat. Users mixing `scrollback = N`
+                // with `[scrollback] default_lines = M` get last-write-wins.
+                if let Ok(n) = value.parse::<usize>() {
+                    config.scrollback = n;
+                }
+            }
+            "status_bar" => config.show_status_bar = value == "true",
+            "tab_bar" => config.show_tab_bar = value == "true",
+            "persist_scrollback" => {
+                config.persist_scrollback = value == "true";
+            }
+            "prefix" => {
+                let ch = value.to_lowercase();
+                if let Some(c) = ch.chars().next() {
+                    if c.is_ascii_lowercase() {
+                        config.prefix_key = c;
+                    }
+                }
+            }
+            "theme" if !value.is_empty() => {
+                config.theme = value.to_string();
+            }
+            _ => {} // ignore unknown keys
+        }
+    }
+
+    // Apply max-lines cap to whichever default value won. Do this once at the
+    // end so the `[scrollback] max_lines` key can lower the effective default
+    // even when listed after `default_lines`.
+    if config.scrollback > config.scrollback_max_lines {
+        config.scrollback = config.scrollback_max_lines;
     }
 }
 
@@ -296,6 +346,49 @@ mod tests {
             Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
             None => std::env::remove_var("XDG_CONFIG_HOME"),
         }
+    }
+
+    #[test]
+    fn flat_scrollback_back_compat() {
+        let mut cfg = EzpnConfig::default();
+        parse_config_into("scrollback = 7777\n", &mut cfg);
+        assert_eq!(cfg.scrollback, 7777);
+        assert_eq!(cfg.scrollback_max_lines, 100_000);
+    }
+
+    #[test]
+    fn scrollback_section_parses_all_keys() {
+        let mut cfg = EzpnConfig::default();
+        parse_config_into(
+            "[scrollback]\n\
+             default_lines = 5000\n\
+             max_lines = 50000\n\
+             warn_bytes = 1048576\n",
+            &mut cfg,
+        );
+        assert_eq!(cfg.scrollback, 5000);
+        assert_eq!(cfg.scrollback_max_lines, 50_000);
+        assert_eq!(cfg.scrollback_warn_bytes, 1_048_576);
+    }
+
+    #[test]
+    fn scrollback_section_caps_default_above_max() {
+        // default_lines 200_000 with max_lines 100_000 should clamp to 100_000.
+        let mut cfg = EzpnConfig::default();
+        parse_config_into(
+            "[scrollback]\ndefault_lines = 200000\nmax_lines = 100000\n",
+            &mut cfg,
+        );
+        assert_eq!(cfg.scrollback, 100_000);
+        assert_eq!(cfg.scrollback_max_lines, 100_000);
+    }
+
+    #[test]
+    fn unknown_section_does_not_swallow_global_keys() {
+        // Legacy `[ui]` header followed by a global key should still parse.
+        let mut cfg = EzpnConfig::default();
+        parse_config_into("[ui]\nshell = /bin/zsh\n", &mut cfg);
+        assert_eq!(cfg.shell, "/bin/zsh");
     }
 
     #[test]
