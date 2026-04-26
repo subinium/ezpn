@@ -55,6 +55,7 @@ pub(crate) fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()
     // Load config file defaults, then overlay CLI args
     let file_config = config::load_config();
     let effective_scrollback = file_config.scrollback;
+    let effective_max_scrollback = file_config.scrollback_max_lines;
     let mut default_shell = if config.has_shell_override {
         config.shell.clone()
     } else {
@@ -104,6 +105,7 @@ pub(crate) fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()
                 th,
                 &settings,
                 effective_scrollback,
+                effective_max_scrollback,
             )?;
             // Store restart policies and pane launch info for auto-restart
             restart_policies = proj.restarts.clone();
@@ -1093,6 +1095,7 @@ pub(crate) fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()
                     th,
                     &mut settings,
                     effective_scrollback,
+                    effective_max_scrollback,
                 );
                 update.merge(&mut ipc_update);
                 let _ = resp_tx.send(response);

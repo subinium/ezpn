@@ -121,6 +121,11 @@ fn try_encode(rows: &[Vec<u8>]) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    // bench `render_hotpaths` includes this file via `#[path]`, which exposes
+    // the test mod under `cfg(test)` even when the test mod's items are unused
+    // from the bench's perspective. Allow that without breaking the main
+    // `-D warnings` build.
+    #[allow(unused_imports)]
     use super::*;
 
     #[test]

@@ -11,6 +11,10 @@ mod layout;
 mod pane;
 #[path = "../src/render.rs"]
 mod render;
+// Required by `pane`'s SPEC 02 history controls — bench includes it directly
+// because we use the `#[path]` trick instead of pulling in the binary crate.
+#[path = "../src/snapshot_blob.rs"]
+mod snapshot_blob;
 #[path = "../src/theme.rs"]
 mod theme;
 

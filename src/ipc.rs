@@ -58,6 +58,16 @@ pub enum IpcRequest {
     Load {
         path: String,
     },
+    /// Drop scrollback above the visible screen for a single pane. SPEC 02.
+    ClearHistory {
+        pane: usize,
+    },
+    /// Resize a pane's scrollback ring. Capped against
+    /// `EzpnConfig::scrollback_max_lines`. SPEC 02.
+    SetHistoryLimit {
+        pane: usize,
+        lines: usize,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
