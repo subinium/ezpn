@@ -9,10 +9,32 @@ Entries are written in **functional-only style**: every bullet describes an obse
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-04-26 — Codebase & Release Hygiene
+
 ### Added
-- **Secret scanning**: `gitleaks` GitHub Action runs on every push and PR to `main` with full-history scan. Custom rules cover Cargo registry tokens and PEM private-key blocks; `docs/` and translated READMEs are allowlisted.
+- **Module decomposition**: `src/main.rs` (2951 → 144 lines) split into `cli/`, `app/`, `direct.rs`. `src/server.rs` (2700+ → 16 lines) split into `daemon/{state,router,snapshot,render,dispatch,keys,event_loop}.rs`. CONTRIBUTING.md gains a "Module anatomy" section.
+- **Property tests** (proptest 1.x, 128 cases each): 4 layout invariants (`prop_layout_render_no_overlap`, `prop_layout_all_panes_within_bounds`, `prop_layout_split_min_size`, `prop_layout_navigate_reachable`) + 4 snapshot invariants (`prop_snapshot_roundtrip`, `prop_snapshot_v2_to_v3_migration_no_loss`, `prop_pane_id_unique`, `prop_layout_in_snapshot_valid`).
+- **Integration recordings** (5 in `tests/integration_recordings.rs`, 3 active): `attach_streams_until_eof`, `panic_in_one_pane_others_alive` (M1 #8 regression), `signal_term_writes_snapshot` (M1 #11 regression). Two `#[ignore]`d pending follow-up harness work.
+- **Soak harness**: `benches/soak_10min.rs` opt-in via `--features soak` for nightly stability runs.
+- **Coverage gate**: `scripts/coverage.sh` enforcing 65% floor via `cargo-llvm-cov`. CI runs weekly and on PRs labeled `area:test`.
+- **CI matrix**: split into `check`, `integration`, `property`, and `coverage` jobs. All `dtolnay/rust-toolchain` actions pinned to `@1.95.0` to match `rust-toolchain.toml`.
+- **Conventional Commits gate**: `commitlint` workflow validates PR titles + every commit against the type enum (`feat fix perf refactor chore docs test ci style release`). `release` is a first-class type.
+- **Branch-name gate**: `branch-naming` workflow enforces `<type>/<slug>` (skips `dependabot/*` and `revert-*`).
+- **PR labeler**: `actions/labeler@v5` auto-applies `area:*` labels based on touched paths.
+- **Release drafter**: `release-drafter` aggregates merged PRs into a draft release note grouped by type.
+- **Secret scanning**: `gitleaks` runs on every push and PR with full-history scan + custom rules for Cargo registry tokens and PEM private-key blocks.
 - **Supply-chain audit**: weekly `cargo audit` (Mon 06:17 UTC) plus per-PR `cargo deny check --all-features` for advisories, license allowlist, banned wildcards, and unknown sources.
-- **CHANGELOG enforcement**: PRs to `main` that touch `src/**` or `Cargo.toml` must also edit `CHANGELOG.md`. Bypass via the `skip-changelog` label, a `chore(release):` / `release:` title, or a `dependabot/` head branch.
+- **CHANGELOG enforcement**: PRs to `main` touching `src/**` or `Cargo.toml` must also edit `CHANGELOG.md`. Bypass via `skip-changelog` label, `chore(release):`/`release:` title, or `dependabot/*` head branch.
+- **MAINTENANCE.md** gains a "Performance profiling" section with `cargo flamegraph` instructions and a `bench` workflow note.
+- **README badges**: gitleaks + audit status added next to the existing CI badge.
+
+### Changed
+- `.clone()` call sites in the daemon code are annotated with `[perf:cold]`, `[perf:init]`, or `[perf:hot]` classifications. Three `TODO(perf)` flags placed on `Layout::clone()` cold-start sites and the per-mouse-event `cache.inner().clone()` for follow-up `Arc<…>` conversion.
+
+### Compatibility
+- **Wire protocol**: unchanged (still v1).
+- **Snapshot schema**: unchanged (still v3).
+- **New deps**: `proptest 1` (dev-only), `flate2`/`bincode 1.3`/`base64 0.22` already shipped in 0.8. No new runtime deps.
 
 ## [0.8.0] — 2026-04-26 — Workflows that Stick
 
