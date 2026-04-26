@@ -14,6 +14,7 @@
 
 pub(crate) mod dispatch;
 pub(crate) mod event_loop;
+pub(crate) mod events;
 pub(crate) mod keys;
 pub(crate) mod render;
 pub(crate) mod router;
