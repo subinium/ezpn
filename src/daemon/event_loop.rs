@@ -535,19 +535,25 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                                 let _ = event_bus.register(req.topics, filter_session, conn);
                             }
                             Ok(_) => {
+                                let err = protocol::SubscribeErr {
+                                    reason: "empty topics list".to_string(),
+                                };
                                 let mut w = &conn;
                                 let _ = protocol::write_msg(
                                     &mut w,
-                                    protocol::S_HELLO_ERR,
-                                    br#"{"reason":"empty topics list","server_version":1}"#,
+                                    protocol::S_SUBSCRIBE_ERR,
+                                    &serde_json::to_vec(&err).unwrap_or_default(),
                                 );
                             }
                             Err(_) => {
+                                let err = protocol::SubscribeErr {
+                                    reason: "malformed subscribe payload".to_string(),
+                                };
                                 let mut w = &conn;
                                 let _ = protocol::write_msg(
                                     &mut w,
-                                    protocol::S_HELLO_ERR,
-                                    br#"{"reason":"malformed subscribe payload","server_version":1}"#,
+                                    protocol::S_SUBSCRIBE_ERR,
+                                    &serde_json::to_vec(&err).unwrap_or_default(),
                                 );
                             }
                         }
@@ -1343,6 +1349,21 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                     Sig::Terminate => {
                         // Graceful shutdown: persist the live workspace snapshot
                         // before tearing down so reattach restores layout/commands.
+                        //
+                        // Ordering on this path is load-bearing:
+                        //   1. capture + bounded-blocking submit so the FINAL
+                        //      auto-save is guaranteed to enqueue (the worker
+                        //      drains a slot every `DEBOUNCE` ≈ 150 ms; the
+                        //      300 ms deadline absorbs one full debounce
+                        //      cycle even if all 4 queue slots are full).
+                        //   2. kill panes / push Exit so attached clients
+                        //      detach gracefully.
+                        //   3. session/ipc cleanup so new connections fail
+                        //      with ENOENT instead of getting orphaned.
+                        //   4. return → SnapshotWorker::drop blocks up to
+                        //      SHUTDOWN_DEADLINE (5 s) draining the queue we
+                        //      just topped up. Sockets are already gone so
+                        //      no client is stuck on a half-open handshake.
                         let snapshot = capture_workspace(
                             &tab_mgr,
                             &tab_name,
@@ -1359,10 +1380,18 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                             effective_scrollback,
                             persist_scrollback,
                         );
-                        let _ = snapshot_worker.submit(SnapshotJob::Auto {
-                            session_name: session_name.to_string(),
-                            snapshot,
-                        });
+                        let enqueued = snapshot_worker.submit_with_deadline(
+                            SnapshotJob::Auto {
+                                session_name: session_name.to_string(),
+                                snapshot,
+                            },
+                            Duration::from_millis(300),
+                        );
+                        if !enqueued {
+                            eprintln!(
+                                "ezpn: SIGTERM auto-save dropped — snapshot worker saturated for >300ms"
+                            );
+                        }
                         for pane in panes.values_mut() {
                             pane.kill();
                         }

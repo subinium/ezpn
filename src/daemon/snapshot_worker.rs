@@ -80,6 +80,30 @@ impl SnapshotWorker {
         self.tx.try_send(job).is_ok()
     }
 
+    /// Bounded-blocking enqueue used on SIGTERM where dropping the final
+    /// snapshot is unacceptable. Loops `try_send` with a 20 ms backoff
+    /// until either the queue accepts the job or the deadline expires.
+    /// Std `mpsc` has no `send_timeout`, so we synthesize it. Returns
+    /// `false` only if the worker disconnected or the deadline fired
+    /// (rare — the worker drains a slot at most every `DEBOUNCE` window).
+    pub(crate) fn submit_with_deadline(&self, mut job: SnapshotJob, deadline: Duration) -> bool {
+        use std::sync::mpsc::TrySendError;
+        let start = Instant::now();
+        loop {
+            match self.tx.try_send(job) {
+                Ok(()) => return true,
+                Err(TrySendError::Full(j)) => {
+                    if start.elapsed() >= deadline {
+                        return false;
+                    }
+                    job = j;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(TrySendError::Disconnected(_)) => return false,
+            }
+        }
+    }
+
     /// Bounded shutdown: send `Shutdown`, wait up to `SHUTDOWN_DEADLINE`.
     /// Idempotent — `Drop` calls the same machinery if the caller never
     /// invokes it explicitly.

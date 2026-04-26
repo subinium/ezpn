@@ -47,6 +47,11 @@ pub struct CopyModeState {
     /// SPEC 13 — search backend. Toggleable via `Ctrl+R` while in
     /// `Phase::Search` (binding lands with the full SPEC 13 keymap PR).
     pub search_engine: SearchEngine,
+    /// Compile cache for the regex backend, keyed by the post-smart-case
+    /// pattern string. Avoids re-compiling on every keystroke during
+    /// incremental search and bounds compile-time cost (a pathological
+    /// pattern like `a{1000000}` only pays the size_limit penalty once).
+    cached_regex: Option<(String, regex::Regex)>,
 }
 
 impl CopyModeState {
@@ -68,6 +73,7 @@ impl CopyModeState {
             search_matches: Vec::new(),
             current_match_idx: None,
             search_engine,
+            cached_regex: None,
         }
     }
 
@@ -527,9 +533,18 @@ fn execute_search(state: &mut CopyModeState, screen: &vt100::Screen) {
         return;
     }
 
-    let matches = match state.search_engine {
-        SearchEngine::Substring => find_substring(&query, screen, state.pane_rows, state.pane_cols),
-        SearchEngine::Regex => find_regex(&query, screen, state.pane_rows, state.pane_cols),
+    let pane_rows = state.pane_rows;
+    let pane_cols = state.pane_cols;
+    let engine = state.search_engine;
+    let matches = match engine {
+        SearchEngine::Substring => find_substring(&query, screen, pane_rows, pane_cols),
+        SearchEngine::Regex => find_regex(
+            &query,
+            screen,
+            pane_rows,
+            pane_cols,
+            &mut state.cached_regex,
+        ),
     };
 
     state.search_matches = matches;
@@ -622,22 +637,91 @@ fn find_substring(
     matches
 }
 
-/// SPEC 13 — regex search using the `regex` crate. Smart-case: a
-/// lowercase-only query gets `(?i)` prepended (matches vim/ripgrep
-/// convention). Invalid patterns produce **zero** matches rather than a
-/// panic — the search prompt stays open so the user can edit.
+/// Smart-case judgement matching ripgrep behaviour: only literal characters
+/// outside of escape sequences and inside `[…]` character classes count.
+/// Examples:
+/// - `\D`       → no literal upper (escape eats `D`) → smart-case fires
+/// - `[A-Z]+`   → literal `A`/`Z` inside class → user meant uppercase
+/// - `\u{0041}` → escape eats `u`, then `{0041}` has no upper letter →
+///   smart-case fires (acceptable false positive)
+/// - `error`    → no upper → smart-case
+/// - `Error`    → literal `E` → case-sensitive
 ///
-/// Search remains line-scoped (one match per row, walking left-to-right)
-/// matching the substring engine's footprint.
-fn find_regex(query: &str, screen: &vt100::Screen, rows: u16, cols: u16) -> Vec<(u16, u16, u16)> {
-    let pattern = if query.chars().any(|c| c.is_uppercase()) {
+/// The previous heuristic (`chars().any(is_uppercase)`) misclassified
+/// patterns like `\D` or `\S` as uppercase-bearing, silently wrapping
+/// `(?i)` around them — meaningless for shorthand classes but a real
+/// behaviour change for `[A-Z]+` (which would match lowercase too).
+fn has_literal_uppercase(pattern: &str) -> bool {
+    let mut in_class = false;
+    let mut escaped = false;
+    for c in pattern.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if c == '\\' {
+            escaped = true;
+            continue;
+        }
+        if !in_class && c == '[' {
+            in_class = true;
+            continue;
+        }
+        if in_class && c == ']' {
+            in_class = false;
+            continue;
+        }
+        if c.is_uppercase() {
+            return true;
+        }
+    }
+    false
+}
+
+/// SPEC 13 — regex search using the `regex` crate. Smart-case: a query
+/// with no literal uppercase letter (per `has_literal_uppercase`) gets
+/// `(?i)` prepended (matches vim/ripgrep convention). Invalid patterns
+/// produce **zero** matches rather than a panic — the search prompt stays
+/// open so the user can edit.
+///
+/// Compile-time cost is bounded via `RegexBuilder::size_limit` /
+/// `dfa_size_limit` (1 MiB each). A pathological pattern like `a{100000}`
+/// fails at `build()` and returns no matches instead of stalling the
+/// daemon main loop. The compiled regex is cached by post-smart-case
+/// pattern so incremental search (one keystroke = one extra char) does
+/// not recompile when the user is just typing past a character.
+///
+/// Search remains line-scoped, walking left-to-right matching the
+/// substring engine's footprint.
+fn find_regex(
+    query: &str,
+    screen: &vt100::Screen,
+    rows: u16,
+    cols: u16,
+    cache: &mut Option<(String, regex::Regex)>,
+) -> Vec<(u16, u16, u16)> {
+    let pattern = if has_literal_uppercase(query) {
         query.to_string()
     } else {
         format!("(?i){query}")
     };
-    let re = match regex::Regex::new(&pattern) {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
+    let need_recompile = cache.as_ref().is_none_or(|(p, _)| p != &pattern);
+    if need_recompile {
+        match regex::RegexBuilder::new(&pattern)
+            .size_limit(1 << 20)
+            .dfa_size_limit(1 << 20)
+            .build()
+        {
+            Ok(re) => *cache = Some((pattern, re)),
+            Err(_) => {
+                *cache = None;
+                return Vec::new();
+            }
+        }
+    }
+    let re = match cache.as_ref() {
+        Some((_, re)) => re,
+        None => return Vec::new(),
     };
     let mut matches = Vec::new();
     for r in 0..rows {
@@ -703,8 +787,9 @@ mod tests {
     #[test]
     fn regex_matches_anchored_pattern() {
         let screen = screen_with(3, 80, &["ERROR 404", "warning ERR-12", "ok"]);
+        let mut cache = None;
         // Anchored regex — only line starting with "ERR".
-        let m = find_regex("^ERR", &screen, 3, 80);
+        let m = find_regex("^ERR", &screen, 3, 80, &mut cache);
         assert_eq!(
             m.len(),
             1,
@@ -716,16 +801,18 @@ mod tests {
     #[test]
     fn regex_smart_case_lowercase_query_matches_uppercase() {
         let screen = screen_with(2, 80, &["ERROR 404", "ok"]);
+        let mut cache = None;
         // Lowercase query → smart-case kicks in (?i) prefix.
-        let m = find_regex("error", &screen, 2, 80);
+        let m = find_regex("error", &screen, 2, 80, &mut cache);
         assert_eq!(m.len(), 1);
     }
 
     #[test]
     fn regex_uppercase_in_query_disables_smart_case() {
         let screen = screen_with(2, 80, &["ERROR 404", "error ok"]);
+        let mut cache = None;
         // Uppercase E in query → no (?i) prefix → matches only "ERROR".
-        let m = find_regex("ERROR", &screen, 2, 80);
+        let m = find_regex("ERROR", &screen, 2, 80, &mut cache);
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].0, 0);
     }
@@ -733,20 +820,89 @@ mod tests {
     #[test]
     fn regex_invalid_pattern_returns_empty() {
         let screen = screen_with(1, 80, &["abc"]);
+        let mut cache = None;
         // Unclosed character class — must not panic.
-        let m = find_regex("[unclosed", &screen, 1, 80);
+        let m = find_regex("[unclosed", &screen, 1, 80, &mut cache);
         assert!(m.is_empty());
     }
 
     #[test]
     fn regex_finds_multiple_per_line_walking_left_to_right() {
         let screen = screen_with(1, 80, &["ERR-1 ERR-2 ERR-3"]);
-        let m = find_regex(r"ERR-\d", &screen, 1, 80);
+        let mut cache = None;
+        let m = find_regex(r"ERR-\d", &screen, 1, 80, &mut cache);
         assert_eq!(m.len(), 3);
         for (r, _, _) in &m {
             assert_eq!(*r, 0);
         }
         assert!(m[0].1 < m[1].1 && m[1].1 < m[2].1);
+    }
+
+    #[test]
+    fn smart_case_skips_escape_shorthand_classes() {
+        // \D, \S, \W carry no literal uppercase letter — smart-case should
+        // still fire (the previous heuristic counted the escape's letter
+        // and silently disabled smart-case).
+        assert!(!has_literal_uppercase(r"\D"));
+        assert!(!has_literal_uppercase(r"\S"));
+        assert!(!has_literal_uppercase(r"\w"));
+        assert!(!has_literal_uppercase("error"));
+        // [A-Z]+ — the user clearly meant uppercase. Inside the class the
+        // literal A and Z trip case-sensitive mode.
+        assert!(has_literal_uppercase("[A-Z]+"));
+        // Mixed: outside-class literal upper still wins.
+        assert!(has_literal_uppercase("Error"));
+        // Unicode escape: opaque to the heuristic — acceptable false negative.
+        assert!(!has_literal_uppercase(r"\u{0041}"));
+    }
+
+    #[test]
+    fn regex_charclass_uppercase_disables_smart_case() {
+        let screen = screen_with(2, 80, &["ABC", "abc"]);
+        let mut cache = None;
+        // [A-Z]+ — smart-case must NOT add (?i), so only the uppercase row
+        // matches.
+        let m = find_regex("[A-Z]+", &screen, 2, 80, &mut cache);
+        assert_eq!(m.len(), 1, "charclass-uppercase should be case-sensitive");
+        assert_eq!(m[0].0, 0);
+    }
+
+    #[test]
+    fn regex_compile_cache_is_reused_across_calls() {
+        let screen = screen_with(2, 80, &["abc def", "abc def"]);
+        let mut cache = None;
+        // First call compiles into the cache.
+        let _ = find_regex("abc", &screen, 2, 80, &mut cache);
+        let pattern_cached = cache.as_ref().map(|(p, _)| p.clone());
+        assert_eq!(pattern_cached.as_deref(), Some("(?i)abc"));
+        // Second call with same query: must NOT replace the cache entry
+        // (the same `(?i)abc` pattern stays).
+        let _ = find_regex("abc", &screen, 2, 80, &mut cache);
+        assert_eq!(
+            cache.as_ref().map(|(p, _)| p.as_str()),
+            Some("(?i)abc"),
+            "same query must reuse cached compile"
+        );
+        // Different query: cache replaced.
+        let _ = find_regex("def", &screen, 2, 80, &mut cache);
+        assert_eq!(cache.as_ref().map(|(p, _)| p.as_str()), Some("(?i)def"));
+    }
+
+    #[test]
+    fn regex_pathological_pattern_is_rejected_by_size_limit() {
+        // A pattern that would explode the compiled program size hits the
+        // size_limit and falls into the empty-matches arm rather than
+        // stalling the daemon main loop. Use a repetition so wide that it
+        // exceeds the 1 MiB program cap without taking forever to detect.
+        let screen = screen_with(1, 80, &["aaaaaaaaaaaaaaaaaaaa"]);
+        let mut cache = None;
+        let huge = format!("a{{0,{n}}}", n = 1_000_000);
+        let m = find_regex(&huge, &screen, 1, 80, &mut cache);
+        assert!(
+            m.is_empty(),
+            "size_limit must reject the pattern (got {m:?})"
+        );
+        assert!(cache.is_none(), "failed compile must clear the cache");
     }
 
     #[test]

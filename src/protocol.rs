@@ -59,6 +59,12 @@ pub const S_EVENT: u8 = 0x88;
 /// JSON `EventEnvelope` with `topic = "_meta"` and `type = "overflow"`.
 pub const S_EVENT_OVERFLOW: u8 = 0x89;
 
+/// Server rejects a `C_SUBSCRIBE` (malformed payload, empty topics list,
+/// future cap-gating). Payload = JSON `SubscribeErr`. Connection is closed
+/// after sending. Distinct from `S_HELLO_ERR` so consumers can tell whether
+/// the failure was during initial handshake or post-handshake subscribe.
+pub const S_SUBSCRIBE_ERR: u8 = 0x8A;
+
 /// Wire-protocol major version. Bump on any backwards-incompatible
 /// change to message tags or framing semantics. `S_HELLO_OK` carries
 /// the server's version so the client can refuse a mismatch up-front
@@ -231,6 +237,12 @@ pub struct SubscribeOk {
     pub topics: Vec<EventTopic>,
 }
 
+/// `S_SUBSCRIBE_ERR` payload — connection is closed after this.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct SubscribeErr {
+    pub reason: String,
+}
+
 /// One JSON object per `S_EVENT` frame. `data` is the topic-specific
 /// payload (`PaneEvent` / `ClientEvent` / …). `_meta` is reserved for
 /// protocol notices — see `S_EVENT_OVERFLOW`.
@@ -372,6 +384,7 @@ mod tests {
             S_SUBSCRIBE_OK,
             S_EVENT,
             S_EVENT_OVERFLOW,
+            S_SUBSCRIBE_ERR,
         ];
         let mut sorted_s = stags.to_vec();
         sorted_s.sort_unstable();
