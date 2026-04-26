@@ -9,6 +9,11 @@ Entries are written in **functional-only style**: every bullet describes an obse
 
 ## [Unreleased]
 
+### Added
+- **Secret scanning**: `gitleaks` GitHub Action runs on every push and PR to `main` with full-history scan. Custom rules cover Cargo registry tokens and PEM private-key blocks; `docs/` and translated READMEs are allowlisted.
+- **Supply-chain audit**: weekly `cargo audit` (Mon 06:17 UTC) plus per-PR `cargo deny check --all-features` for advisories, license allowlist, banned wildcards, and unknown sources.
+- **CHANGELOG enforcement**: PRs to `main` that touch `src/**` or `Cargo.toml` must also edit `CHANGELOG.md`. Bypass via the `skip-changelog` label, a `chore(release):` / `release:` title, or a `dependabot/` head branch.
+
 ## [0.8.0] — 2026-04-26 — Workflows that Stick
 
 ### Added

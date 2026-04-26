@@ -1,0 +1,23 @@
+title = "ezpn gitleaks config"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "ezpn-cargo-token"
+description = "Cargo registry token"
+regex = '''(?i)cio[a-zA-Z0-9_-]{20,}'''
+secretGroup = 0
+
+[[rules]]
+id = "ezpn-private-key"
+description = "Private key blocks"
+regex = '''-----BEGIN (?:RSA|EC|OPENSSH|ED25519|PGP|DSA) PRIVATE KEY-----'''
+secretGroup = 0
+
+[allowlist]
+description = "False positives"
+paths = [
+    '''docs/.*''',
+    '''README.*\.md''',
+]
