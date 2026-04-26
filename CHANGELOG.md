@@ -9,6 +9,31 @@ Entries are written in **functional-only style**: every bullet describes an obse
 
 ## [Unreleased]
 
+## [0.11.1] — 2026-04-26 — Security & correctness hotfixes
+
+### Security
+- **Hook shell injection (B1)**: `[[hooks]]` entries with `shell = true` now POSIX-single-quote every `{var}` substitution before reaching `/bin/sh -c`. Previously a tab/session/client name containing `; rm -rf $HOME` (or any shell metacharacter) would be re-interpreted by the shell on the next matching event. New `expand_vars_shell` helper does the quoting; literal templates stay as-is so users can still write `echo {a}|grep b` and the pipe still pipes. The non-shell `Argv` path was already exec-style and unaffected.
+- **Daemon process-group protection (B2)**: hook child processes call `setsid()` in `pre_exec` to escape the daemon's process group, but the return value was ignored — if `setsid` failed (rare: caller already a session leader) the child stayed in the daemon's pgid, and `kill(-pid, SIGKILL)` on hook timeout would target the daemon itself. New `kill_pgrp_or_pid` helper checks `getpgid(child)` and falls back to a single-pid kill when the setsid invariant doesn't hold.
+- **`send-keys --literal` ANSI escape rejection (B3)**: literal mode bypassed the keyspec parser, so a script could inject `\x1B]52;c;<base64>\x07` (OSC 52) to hijack the user's clipboard, or arbitrary CSI sequences to spoof the prompt / poison shell history. The dispatcher now rejects any token containing ESC (`0x1B`) or NUL (`0x00`) with a structured error and steers users toward the non-literal keyspec form for special keys.
+
+### Fixed
+- **Regex search compile DoS + cache (C1)**: copy-mode regex search now builds via `RegexBuilder::size_limit(1<<20).dfa_size_limit(1<<20)` so a pathological pattern like `a{1000000}` fails at `build()` instead of stalling the daemon main loop. Compiled regexes are cached on `CopyModeState` keyed by post-smart-case pattern, so incremental search no longer recompiles on every keystroke when the user is just appending characters.
+- **SIGTERM auto-save reliability (C2)**: graceful shutdown was using `try_send` for the final snapshot — if the worker queue happened to be saturated at SIGTERM the latest workspace state was silently dropped. New `SnapshotWorker::submit_with_deadline` synthesizes `send_timeout` over std `mpsc` (no native equivalent) with a 300 ms ceiling that absorbs at least one full debounce cycle. Cleanup ordering is now load-bearing and documented inline.
+- **Events bus true drop-oldest (C3)**: per-subscriber backlog migrated from `mpsc::sync_channel` to `Arc<Mutex<VecDeque>>` + `Condvar`. Under backpressure subscribers now observe the **most recent** envelopes (the canonical reactive-stream contract); the previous `try_send`-based path silently degraded to drop-newest, leaving slow consumers reading a stale prefix. `EventQueue::push_drop_oldest` returns whether it kicked out an entry so the caller's overflow-notice accounting stays honest.
+- **`S_SUBSCRIBE_ERR` (0x8A) for post-handshake failures (C4)**: malformed `C_SUBSCRIBE` payloads and empty topics lists used to be reported via `S_HELLO_ERR` (0x86), which clients reasonably interpret as "version mismatch — close". New tag has its own type (`SubscribeErr`) so consumers can disambiguate. Connection still closes after the err frame; no protocol bump.
+- **send-keys element + line caps (C5)**: `SEND_KEYS_MAX_TOKENS = 4096` rejects payloads with absurd token counts before serde_json allocates a giant `Vec<String>` (the existing 16 MiB byte cap allowed `["", "", … 100M …]` to slip through with sum=0). The IPC socket reader now wraps each connection in `take(IPC_MAX_LINE_BYTES = 32 MiB)` so a hostile peer cannot OOM the daemon by sending a multi-GiB line without a newline.
+- **Hook worker `wait_timeout` for kill grace (C6)**: the SIGTERM → SIGKILL grace path used `std::thread::sleep(500ms)` which pinned the worker thread for the full grace window even when the child responded promptly. Now uses `child.wait_timeout(grace)` so a well-behaved child releases the worker immediately; the worker pool's effective throughput under stuck-child storms recovers from ~8 hooks/sec/worker to the steady-state rate.
+- **Regex smart-case for escape/char-class (C7)**: smart-case judgement now walks the pattern excluding `\X` escape sequences and counting char-class contents — `\D` / `\S` are correctly identified as carrying no literal uppercase (smart-case fires), `[A-Z]+` correctly counts the literal `A`/`Z` inside the class (smart-case skipped). The old `chars().any(is_uppercase)` heuristic misclassified both edges.
+
+### Compatibility
+- **Wire protocol**: unchanged (still v1).
+- **Binary protocol**: additive tag only (`S_SUBSCRIBE_ERR = 0x8A`). Existing clients keying off `S_HELLO_ERR` for subscribe failures continue to see `S_HELLO_ERR` only on actual handshake errors; subscribe failures now use the dedicated tag.
+- **JSON IPC**: no schema changes; new caps (`SEND_KEYS_MAX_TOKENS`, `IPC_MAX_LINE_BYTES`) only reject pathological payloads.
+- **Hook templates**: `shell = true` users whose templates *intentionally* allowed substitution-driven shell expansion should switch to argv-form hooks. The new behaviour treats every substitution as a literal value, which is the principle-of-least-surprise default.
+
+### Test totals
+- 283 → **294** (+11): hooks shell-quote unit + integration coverage, copy-mode smart-case + cache + size-limit, EventQueue drop-oldest + close-unblocks-waiter.
+
 ## [0.11.0] — 2026-04-26 — Automation, UX & parity foundations
 
 ### Added

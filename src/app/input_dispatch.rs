@@ -294,6 +294,13 @@ fn handle_send_keys(
     if tokens.is_empty() {
         return ipc::IpcResponse::error("no keys to send");
     }
+    if tokens.len() > ipc::SEND_KEYS_MAX_TOKENS {
+        return ipc::IpcResponse::error(format!(
+            "send-keys token count too large ({} > {})",
+            tokens.len(),
+            ipc::SEND_KEYS_MAX_TOKENS
+        ));
+    }
     let total_bytes: usize = tokens.iter().map(|s| s.len()).sum();
     if total_bytes > ipc::SEND_KEYS_MAX_BYTES {
         return ipc::IpcResponse::error(format!(
@@ -316,6 +323,22 @@ fn handle_send_keys(
             return ipc::IpcResponse::error(format!(
                 "--literal forbids named keys (got '{named}')"
             ));
+        }
+        // SECURITY: literal mode bypasses keyspec compilation, so a script
+        // could otherwise inject raw escape sequences into the user's PTY
+        // (OSC 52 clipboard hijack, prompt-spoofing, history poisoning).
+        // ESC (0x1B) and NUL (0x00) are the only single-byte controls that
+        // can start such a sequence on every modern terminal — reject them
+        // and steer users toward the keyspec form for special keys.
+        for tok in &tokens {
+            for &b in tok.as_bytes() {
+                if b == 0x1B || b == 0x00 {
+                    return ipc::IpcResponse::error(format!(
+                        "literal mode rejects control byte 0x{b:02X}; \
+                         use the non-literal keyspec form for special keys"
+                    ));
+                }
+            }
         }
         let mut out = Vec::with_capacity(total_bytes);
         for tok in &tokens {

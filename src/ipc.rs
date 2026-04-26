@@ -1,4 +1,4 @@
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -27,6 +27,20 @@ pub(crate) const IPC_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Mirrors the existing 16 MiB protocol payload cap from `protocol.rs` so a
 /// hostile script cannot flood a pane in one IPC round-trip. Per SPEC 06 §10.
 pub(crate) const SEND_KEYS_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// Maximum number of token entries in a single `send-keys` payload. The byte
+/// cap (`SEND_KEYS_MAX_BYTES`) does not bound element count: a hostile peer
+/// could submit `keys = ["", "", … 100M …]` (sum = 0) and force a 100M-entry
+/// `Vec<String>` allocation during JSON parse. 4096 is generous (full
+/// keyboard macros run hundreds of tokens at most) and safely caps memory.
+pub(crate) const SEND_KEYS_MAX_TOKENS: usize = 4096;
+
+/// Per-line byte cap for newline-delimited JSON requests on the IPC socket.
+/// Without this, a hostile peer that opens the socket and writes 1 GiB
+/// without a `\n` would force `BufRead::read_line` to grow its `String`
+/// buffer to 1 GiB before returning. The cap is one order of magnitude
+/// over `SEND_KEYS_MAX_BYTES` so legitimate clients are never truncated.
+pub(crate) const IPC_MAX_LINE_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -271,7 +285,13 @@ fn handle_client(stream: UnixStream, tx: mpsc::Sender<(IpcRequest, ResponseSende
     let Ok(read_stream) = stream.try_clone() else {
         return;
     };
-    let reader = BufReader::new(read_stream);
+    // Cap total bytes read on this connection so a hostile peer cannot
+    // OOM the daemon by sending a multi-GiB line without a newline.
+    // After the cap the reader EOFs; an in-flight `read_line` returns the
+    // partial buffer (no `\n`) which serde_json rejects with a structured
+    // error → loop terminates cleanly.
+    let limited = read_stream.take(IPC_MAX_LINE_BYTES as u64);
+    let reader = BufReader::new(limited);
     let mut writer = stream;
 
     for line in reader.lines() {
