@@ -1,0 +1,71 @@
+# Default keymap (issue #84). Embedded into the binary at compile time
+# (`include_str!("../assets/default-keymap.toml")`). User config in
+# `~/.config/ezpn/config.toml` merges on top of these tables; setting
+# `clear = true` in a `[keymap.<table>]` block drops every default first.
+#
+# Key syntax:
+#   - Modifiers: `C-` (Ctrl), `M-` (Alt/Meta), `S-` (Shift). Combinable in
+#     any order (`C-M-Right`, `M-C-Right`).
+#   - Named keys: Enter, Esc, Tab, BackTab, Backspace, Delete, Insert,
+#     Home, End, PageUp, PageDown, Up, Down, Left, Right, Space, F1..F12.
+#   - Single character: literal key. Unmodified `A` and `a` collapse to
+#     lower case (matches crossterm's reporting).
+#
+# Action vocabulary (frozen v1) — see `src/keymap.rs::Action`.
+
+[keymap.prefix]
+# Pane lifecycle.
+"%"  = "split-window-h"
+'"'  = "split-window-v"
+"x"  = "kill-pane"
+
+# Window/tab lifecycle.
+"c"  = "new-window"
+"&"  = "kill-window"
+"n"  = "next-window"
+"p"  = "previous-window"
+","  = "rename-window"
+"0"  = "select-window 0"
+"1"  = "select-window 1"
+"2"  = "select-window 2"
+"3"  = "select-window 3"
+"4"  = "select-window 4"
+"5"  = "select-window 5"
+"6"  = "select-window 6"
+"7"  = "select-window 7"
+"8"  = "select-window 8"
+"9"  = "select-window 9"
+
+# Pane navigation.
+"Up"    = "select-pane up"
+"Down"  = "select-pane down"
+"Left"  = "select-pane left"
+"Right" = "select-pane right"
+
+# Layout / sizing.
+"="  = "equalize"
+"{"  = "swap-pane up"
+"}"  = "swap-pane down"
+
+# Session lifecycle.
+"d"  = "detach-session"
+
+# Modes / meta.
+"["  = "copy-mode"
+":"  = "command-prompt"
+"r"  = "reload-config"
+
+[keymap.normal]
+# Always-on bindings (no prefix).
+"M-Up"    = "select-pane up"
+"M-Down"  = "select-pane down"
+"M-Left"  = "select-pane left"
+"M-Right" = "select-pane right"
+"F2"      = "equalize"
+
+[keymap.copy_mode]
+"y"     = "copy-selection-and-cancel"
+"Enter" = "copy-selection-and-cancel"
+"q"     = "cancel"
+"Esc"   = "cancel"
+"v"     = "begin-selection"

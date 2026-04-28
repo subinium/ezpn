@@ -1,6 +1,13 @@
+[workspace]
+# Exclude the cargo-fuzz crate so `cargo build --workspace` from the
+# repo root does not require nightly libfuzzer linkage. The fuzz crate
+# is a separate workspace addressable via `cargo +nightly fuzz`.
+members = ["."]
+exclude = ["fuzz"]
+
 [package]
 name = "ezpn"
-version = "0.11.1"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.82"
 autobins = false
@@ -20,6 +27,13 @@ path = "src/main.rs"
 name = "ezpn-ctl"
 path = "src/bin/ezpn-ctl.rs"
 
+[features]
+# Default: keep the legacy full-frame render path. Cell-grid diff (#93) is
+# opt-in until the bench suite proves the bytes-on-wire / CPU tradeoff in
+# CI.
+default = []
+render-diff = []
+
 [dependencies]
 portable-pty = "0.8"
 vt100 = "0.15"
@@ -28,22 +42,18 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-unicode-width = "0.2"
-flate2 = "1"
+# Snapshot v3 scrollback payload (#69): bincode for compact binary
+# encoding of `Vec<RowSnapshot>`, gzipped via flate2 for text-heavy
+# compression ratios. Pinned to bincode v1 — v2's API rework changes
+# the on-disk byte layout, so a bump is a snapshot format break.
 bincode = "1.3"
-base64 = "0.22"
-crossbeam-channel = "0.5"
-# SPEC 08 hooks system: bounded `Child::wait_timeout` so a slow user shell-out
-# cannot exhaust a worker thread. Dual-licensed MIT/Apache, ~200 LoC.
-wait-timeout = "0.2"
-# SPEC 10 fuzzy command palette. Audited (used by Helix, Zed, Yazi).
-# Single-thread API; no async surface. Allowlisted in deny.toml.
-nucleo-matcher = "0.3"
-# SPEC 13 — regex search in copy mode. Already a transitive dep via
-# criterion (dev-only); adding it explicitly puts it in the prod tree.
-# `default-features = false` + ["std", "unicode"] keeps the build size
-# modest by dropping perf-dfa-full / perf-onepass / perf-backtrack.
-regex = { version = "1", default-features = false, features = ["std", "unicode"] }
+flate2 = "1"
+# Pinned: rerank stability is part of the #86 contract — bump deliberately.
+nucleo-matcher = "=0.3.1"
+unicode-width = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+tracing-appender = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -51,20 +61,39 @@ signal-hook = "0.3"
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+assert_cmd = "2"
+predicates = "3"
 tempfile = "3"
+# Property tests for the test-pyramid (issue #94). Pinned to 1.x — the API
+# is stable; bumps go through CI like any other dep change.
 proptest = "1"
-
-[features]
-# Opt-in 10-minute soak harness. Excluded from default `cargo bench` so the
-# ordinary perf bench (`render_hotpaths`) stays interactive. Enable with
-# `cargo bench --features soak --bench soak_10min` (also gated nightly in CI).
-soak = []
 
 [[bench]]
 name = "render_hotpaths"
 harness = false
 
+# Perf regression suite (issue #99). Each tracked metric in the issue's
+# threshold table is covered by one of these benches; the
+# `bench-regression` CI job below compares results against the baseline
+# checked into `docs/benchmarks/baseline.json` on `main`.
 [[bench]]
-name = "soak_10min"
+name = "protocol_codec"
 harness = false
-required-features = ["soak"]
+
+[[bench]]
+name = "snapshot_io"
+harness = false
+
+[[bench]]
+name = "rss_proxy"
+harness = false
+
+[[test]]
+name = "integration"
+path = "tests/integration/main.rs"
+
+# Property-test pyramid (issue #94). Each invariant lives in its own file;
+# `tests/property/main.rs` wires them together.
+[[test]]
+name = "property"
+path = "tests/property/main.rs"

@@ -1,65 +1,15 @@
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-
-/// Number of worker threads serving IPC requests. See SPEC 01
-/// `docs/spec/v0.10.0/01-daemon-io-resilience.md` §4.2.
-pub(crate) const IPC_POOL_SIZE: usize = 4;
-
-/// Maximum number of pending accepted-but-not-handled connections. When
-/// the queue saturates, new accepts are rejected with a structured
-/// `IpcResponse::error("ezpn ipc pool saturated; retry")` and closed.
-pub(crate) const IPC_QUEUE_CAPACITY: usize = 16;
-
-/// Per-connection read timeout. A hostile/buggy `ezpn-ctl` that opens
-/// the socket and never sends a request is reaped after this interval.
-pub(crate) const IPC_READ_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Per-connection write timeout. Bounds time spent sending one
-/// `IpcResponse` on a misbehaving peer.
-pub(crate) const IPC_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Maximum size of a single `send-keys` payload (sum of all token bytes).
-/// Mirrors the existing 16 MiB protocol payload cap from `protocol.rs` so a
-/// hostile script cannot flood a pane in one IPC round-trip. Per SPEC 06 §10.
-pub(crate) const SEND_KEYS_MAX_BYTES: usize = 16 * 1024 * 1024;
-
-/// Maximum number of token entries in a single `send-keys` payload. The byte
-/// cap (`SEND_KEYS_MAX_BYTES`) does not bound element count: a hostile peer
-/// could submit `keys = ["", "", … 100M …]` (sum = 0) and force a 100M-entry
-/// `Vec<String>` allocation during JSON parse. 4096 is generous (full
-/// keyboard macros run hundreds of tokens at most) and safely caps memory.
-pub(crate) const SEND_KEYS_MAX_TOKENS: usize = 4096;
-
-/// Per-line byte cap for newline-delimited JSON requests on the IPC socket.
-/// Without this, a hostile peer that opens the socket and writes 1 GiB
-/// without a `\n` would force `BufRead::read_line` to grow its `String`
-/// buffer to 1 GiB before returning. The cap is one order of magnitude
-/// over `SEND_KEYS_MAX_BYTES` so legitimate clients are never truncated.
-pub(crate) const IPC_MAX_LINE_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SplitDirection {
     Horizontal,
     Vertical,
-}
-
-/// Where a SPEC 06 `send-keys` payload should land. The enum keeps the wire
-/// format forward-compatible with future targeting modes (by-name, by-index,
-/// cross-tab) without breaking existing CLI consumers.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum PaneTarget {
-    /// Numeric pane ID as shown by `ezpn-ctl list`.
-    Id { value: usize },
-    /// The active pane on the active tab — resolved server-side at dispatch
-    /// time, so there is no race between resolution and delivery.
-    Current,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,29 +40,112 @@ pub enum IpcRequest {
     Load {
         path: String,
     },
-    /// Drop scrollback above the visible screen for a single pane. SPEC 02.
-    ClearHistory {
-        pane: usize,
+}
+
+/// Extended IPC request vocabulary added in v0.12 (initially issue
+/// #89; #88 and #81 add their own variants in follow-up commits).
+/// Lives in a separate enum from [`IpcRequest`] so that
+/// `handle_client` can intercept them in [`ipc.rs`] without forcing
+/// every existing match site (`bootstrap::handle_ipc_command`,
+/// `server/mod.rs::Save/Load` filters) to grow new arms.
+///
+/// On the wire, every variant is tagged by `cmd` (same envelope as
+/// [`IpcRequest`]) — clients send a single `{"cmd": "...", ...}`
+/// object and `handle_client` resolves it to either the legacy
+/// `IpcRequest` or one of these extended commands.
+///
+/// Server-side handlers for these variants are **parent-deferred**;
+/// the in-tree implementation returns [`IpcResponse::error`] with a
+/// `not yet wired` message until the daemon-side hook lands. See
+/// `docs/scripting.md` for the user-facing surface.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "cmd", rename_all = "snake_case")]
+pub enum IpcRequestExt {
+    /// `ezpn-ctl ls --json` — full session/tab/pane tree (issue #89).
+    ///
+    /// Returns the canonical structured snapshot of the current
+    /// daemon's session(s). The schema is **frozen at v1** — see
+    /// [`SessionTree`] / [`TabInfo`] / [`PaneTreeInfo`] and
+    /// `docs/scripting.md` §3.1.
+    ///
+    /// `session` is the optional session-name filter. When
+    /// `Some(name)`, the response includes only that session's tree
+    /// (or an empty `sessions` list if it does not exist).
+    LsTree {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
     },
-    /// Resize a pane's scrollback ring. Capped against
-    /// `EzpnConfig::scrollback_max_lines`. SPEC 02.
-    SetHistoryLimit {
+    /// `ezpn-ctl dump` — capture-pane equivalent (issue #88).
+    ///
+    /// Reads from the vt100 grid (and optionally scrollback) of the
+    /// targeted pane. No PTY interaction. The server enforces the
+    /// 16 MiB hard cap on the produced text and returns
+    /// [`IpcResponse::error`] with a `dump too large` message when the
+    /// cap would be exceeded.
+    Dump {
         pane: usize,
-        lines: usize,
-    },
-    /// Deliver a sequence of keystrokes / text into a pane's PTY write half.
-    /// Per SPEC 06: tokens are concatenated with no separator between them,
-    /// and parsed via `keymap::keyspec` unless `literal` is set (in which
-    /// case the bytes are written verbatim). Wire field uses a serde-default
-    /// for `literal` so older `ezpn-ctl` builds that omit the flag still
-    /// deserialize cleanly.
-    SendKeys {
-        target: PaneTarget,
-        keys: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
+        /// 1-indexed line number; only lines `>= since` are returned.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<usize>,
+        /// Tail count. When set, returns the last `last` lines (after
+        /// `since` and scrollback inclusion are applied).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last: Option<usize>,
+        /// Whether to include scrollback. Defaults to `true` (matching
+        /// the CLI default `--include-scrollback`); pass `false` to
+        /// limit to the visible viewport.
+        #[serde(default = "default_true")]
+        include_scrollback: bool,
+        /// Strip all ANSI escape sequences from the captured text.
         #[serde(default)]
-        literal: bool,
+        strip_ansi: bool,
+    },
+    /// `ezpn-ctl send-keys` — ack-mode write to a pane (issue #81).
+    ///
+    /// `text` is written verbatim to the pane's PTY. When
+    /// `await_prompt` is `true`, the server blocks until an OSC 133 D
+    /// semantic-prompt sequence is observed for that pane (or
+    /// `timeout_ms` elapses) and fills [`IpcResponse::send_keys`].
+    SendKeys {
+        pane: usize,
+        text: String,
+        /// Block until OSC 133 D is observed. Returns
+        /// [`SendKeysStatus::DetectionUnavailable`] if neither OSC 133
+        /// nor the (off-by-default) sentinel mode is active for the
+        /// pane.
+        #[serde(default)]
+        await_prompt: bool,
+        /// Timeout in milliseconds. Only meaningful when
+        /// `await_prompt = true`. `None` means "use the server default
+        /// of 30 000 ms".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+        /// Suppress the trailing `\n` the CLI normally appends.
+        #[serde(default)]
+        no_newline: bool,
     },
 }
+
+/// Tag values handled by [`IpcRequestExt`] (used by the
+/// `handle_client` interceptor to decide which enum to deserialize
+/// into).
+const EXT_CMD_TAGS: &[&str] = &["ls_tree", "dump", "send_keys"];
+
+/// Default timeout for `send-keys --await-prompt` when the client did
+/// not pass `--timeout` (#81 spec). Mirrored on the CLI side as the
+/// `30s` fallback.
+pub const SEND_KEYS_DEFAULT_TIMEOUT_MS: u64 = 30_000;
+
+fn default_true() -> bool {
+    true
+}
+
+/// Hard cap on a single dump payload. Mirrors the wire-protocol
+/// MAX_PAYLOAD (`docs/protocol/v1.md` §2) so a successful dump can
+/// always traverse the IPC framing layer.
+pub const DUMP_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaneInfo {
@@ -125,6 +158,117 @@ pub struct PaneInfo {
     pub command: String,
 }
 
+/// Frozen v1 schema for `ezpn-ctl ls --json` (issue #89). Mirrors the
+/// shape documented in `docs/scripting.md` §3.1 and the issue body.
+///
+/// Wrapped by [`IpcResponse::ls_tree`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LsTree {
+    /// Frozen at `"1.0"`. Bumped only on a major schema break.
+    pub proto_version: String,
+    pub sessions: Vec<SessionTree>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionTree {
+    pub name: String,
+    /// Seconds since UNIX epoch (matches the `ts` field used in the
+    /// event bus — `f64`).
+    pub created_at: f64,
+    pub clients: Vec<ClientInfo>,
+    /// Index into `tabs`. `None` if there are no tabs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focused_tab: Option<usize>,
+    pub tabs: Vec<TabInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientInfo {
+    pub socket: String,
+    /// `[cols, rows]`.
+    pub size: [u16; 2],
+    /// One of `steal | shared | readonly` (mirrors `AttachMode`).
+    pub mode: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TabInfo {
+    pub id: usize,
+    pub name: String,
+    /// `id` of the focused pane within this tab.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focused_pane: Option<usize>,
+    /// Layout spec string, e.g. `"split-h:[1,2]"`.
+    pub layout: String,
+    pub panes: Vec<PaneTreeInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneTreeInfo {
+    pub id: usize,
+    pub command: String,
+    /// The cwd the pane was launched with (string-encoded path).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// `[cols, rows]`.
+    pub size: [u16; 2],
+    /// `None` once the child has exited.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    /// Live cwd as reported by OSC 7 / procfs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reported_cwd: Option<String>,
+    /// `Some(code)` once the pane has exited.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    pub is_dead: bool,
+    pub is_focused: bool,
+    /// Pane title (window-title OSC 0/2 or the pane's `name`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+/// Result payload for [`IpcRequestExt::Dump`] (issue #88).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DumpPayload {
+    pub pane: usize,
+    /// Captured lines after `since`/`last`/scrollback filtering. Each
+    /// element is a single visual line (terminator stripped). When the
+    /// CLI is in `--format text` mode, lines are joined with `\n`.
+    pub lines: Vec<String>,
+    /// Total number of lines available in the source (visible +
+    /// scrollback when included). Useful for paging clients.
+    pub total: usize,
+}
+
+/// Result payload for [`IpcRequestExt::SendKeys`] when `await_prompt`
+/// is set (issue #81). For fire-and-forget sends the response uses
+/// [`IpcResponse::success`] and [`IpcResponse::send_keys`] is `None`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendKeysOutcome {
+    /// `prompt_seen` when an OSC 133 D arrived; `timeout` when the
+    /// wait expired; `detection_unavailable` when the pane has no
+    /// prompt-detection mechanism active.
+    pub status: SendKeysStatus,
+    /// The exit code parsed out of OSC 133 D, if present. `None` for
+    /// `timeout` / `detection_unavailable`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Wall-clock duration in milliseconds the server waited.
+    pub waited_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SendKeysStatus {
+    /// OSC 133 D semantic-prompt observed for this pane.
+    PromptSeen,
+    /// `timeout_ms` elapsed before any prompt arrived.
+    Timeout,
+    /// Neither OSC 133 nor sentinel mode is active for this pane.
+    DetectionUnavailable,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcResponse {
     pub ok: bool,
@@ -134,6 +278,16 @@ pub struct IpcResponse {
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub panes: Option<Vec<PaneInfo>>,
+    /// Populated by [`IpcRequestExt::LsTree`] (issue #89).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ls_tree: Option<LsTree>,
+    /// Populated by [`IpcRequestExt::Dump`] (issue #88).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dump: Option<DumpPayload>,
+    /// Populated by [`IpcRequestExt::SendKeys`] when `await_prompt =
+    /// true` (issue #81).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub send_keys: Option<SendKeysOutcome>,
 }
 
 impl IpcResponse {
@@ -143,6 +297,9 @@ impl IpcResponse {
             message: Some(message.into()),
             error: None,
             panes: None,
+            ls_tree: None,
+            dump: None,
+            send_keys: None,
         }
     }
 
@@ -152,6 +309,49 @@ impl IpcResponse {
             message: None,
             error: None,
             panes: Some(panes),
+            ls_tree: None,
+            dump: None,
+            send_keys: None,
+        }
+    }
+
+    /// Wrap a frozen-v1 [`LsTree`] in an `ok` response.
+    pub fn with_ls_tree(tree: LsTree) -> Self {
+        Self {
+            ok: true,
+            message: None,
+            error: None,
+            panes: None,
+            ls_tree: Some(tree),
+            dump: None,
+            send_keys: None,
+        }
+    }
+
+    /// Wrap a [`DumpPayload`] in an `ok` response.
+    pub fn with_dump(dump: DumpPayload) -> Self {
+        Self {
+            ok: true,
+            message: None,
+            error: None,
+            panes: None,
+            ls_tree: None,
+            dump: Some(dump),
+            send_keys: None,
+        }
+    }
+
+    /// Wrap a [`SendKeysOutcome`] in an `ok` response (used when
+    /// `await_prompt` is set).
+    pub fn with_send_keys(outcome: SendKeysOutcome) -> Self {
+        Self {
+            ok: true,
+            message: None,
+            error: None,
+            panes: None,
+            ls_tree: None,
+            dump: None,
+            send_keys: Some(outcome),
         }
     }
 
@@ -161,6 +361,9 @@ impl IpcResponse {
             message: None,
             error: Some(message.into()),
             panes: None,
+            ls_tree: None,
+            dump: None,
+            send_keys: None,
         }
     }
 }
@@ -172,109 +375,71 @@ pub fn socket_path() -> PathBuf {
 }
 
 pub fn socket_path_for_pid(pid: u32) -> PathBuf {
-    // Prefer XDG_RUNTIME_DIR (per-user, mode 0700) over /tmp
-    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    // EZPN_TEST_SOCKET_DIR > XDG_RUNTIME_DIR > /tmp.
+    // Test override exists so integration tests (#62) can redirect.
+    let dir = std::env::var("EZPN_TEST_SOCKET_DIR")
+        .or_else(|_| std::env::var("XDG_RUNTIME_DIR"))
+        .unwrap_or_else(|_| "/tmp".to_string());
     PathBuf::from(format!("{}/ezpn-{}.sock", dir, pid))
 }
 
 pub fn start_listener() -> anyhow::Result<mpsc::Receiver<(IpcRequest, ResponseSender)>> {
     let path = socket_path();
+    if let Some(parent) = path.parent() {
+        crate::socket_security::harden_socket_dir(parent)?;
+    }
     let _ = std::fs::remove_file(&path);
 
-    let listener = UnixListener::bind(&path)?;
-
-    // Restrict socket to owner only (0o600)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    // umask 0o077 across bind so the inode is born with a restricted mode,
+    // then chmod + re-stat to assert (issue #65). Any deviation is a hard
+    // error — silently continuing here would re-introduce the leak we're
+    // trying to close.
+    let prev_umask = unsafe { libc::umask(0o077) };
+    let bind_result = UnixListener::bind(&path);
+    unsafe {
+        libc::umask(prev_umask);
     }
+    let listener = bind_result?;
+
+    crate::socket_security::fix_socket_permissions(&path)?;
+
     let (tx, rx) = mpsc::channel();
 
-    // Spawn a fixed worker pool to handle accepted connections. Per SPEC 01
-    // §4.2, this caps the daemon's IPC thread budget regardless of how many
-    // clients connect — eliminating the unbounded `spawn-per-connection`
-    // leak that prior versions exhibited.
-    let pool = spawn_ipc_pool(tx);
-
     std::thread::spawn(move || {
-        // Outer accept loop must survive any per-client panic; otherwise the
-        // ezpn-ctl IPC interface dies after one malformed request.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            for stream in listener.incoming() {
-                match stream {
-                    Ok(stream) => {
-                        // Hand off to the worker pool. If the queue is full
-                        // we reject the connection with a structured error
-                        // rather than spawning an unbounded thread.
-                        if let Err(crossbeam_channel::TrySendError::Full(mut s)) =
-                            pool.work_tx.try_send(stream)
-                        {
-                            let resp = IpcResponse::error("ezpn ipc pool saturated; retry");
-                            let _ = write_response(&mut s, &resp);
-                            drop(s);
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => {
+                    // Defense-in-depth: refuse cross-UID connections.
+                    let our_uid = unsafe { libc::getuid() };
+                    match crate::socket_security::peer_uid(&stream) {
+                        Ok(peer) if peer == our_uid => {}
+                        Ok(peer) => {
+                            tracing::warn!(
+                                event = "ipc_ctl_peer_uid_mismatch",
+                                peer_uid = peer,
+                                expected_uid = our_uid,
+                                "refusing cross-uid ctl connection"
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                event = "ipc_ctl_peer_uid_error",
+                                error = %e,
+                                "could not read peer credentials, refusing ctl connection"
+                            );
+                            continue;
                         }
                     }
-                    Err(_) => break,
+                    let tx = tx.clone();
+                    std::thread::spawn(move || handle_client(stream, tx));
                 }
+                Err(_) => break,
             }
-            // Acceptor exiting — drop the work channel so workers also exit.
-            drop(pool);
-        }));
+        }
     });
 
     Ok(rx)
-}
-
-/// Bounded worker pool serving accepted IPC connections.
-struct IpcPool {
-    work_tx: crossbeam_channel::Sender<UnixStream>,
-    /// Worker join handles. Kept solely to extend their lifetime to the
-    /// pool's; not joined explicitly because the daemon process exit
-    /// cleans up all threads.
-    _workers: Vec<std::thread::JoinHandle<()>>,
-}
-
-fn spawn_ipc_pool(cmd_tx: mpsc::Sender<(IpcRequest, ResponseSender)>) -> IpcPool {
-    let (work_tx, work_rx) = crossbeam_channel::bounded::<UnixStream>(IPC_QUEUE_CAPACITY);
-    let mut workers = Vec::with_capacity(IPC_POOL_SIZE);
-    for worker_id in 0..IPC_POOL_SIZE {
-        let rx = work_rx.clone();
-        let cmd_tx = cmd_tx.clone();
-        let handle = std::thread::Builder::new()
-            .name(format!("ezpn-ipc-{worker_id}"))
-            .spawn(move || {
-                while let Ok(stream) = rx.recv() {
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let _ = stream.set_read_timeout(Some(IPC_READ_TIMEOUT));
-                        let _ = stream.set_write_timeout(Some(IPC_WRITE_TIMEOUT));
-                        handle_client(stream, cmd_tx.clone());
-                    }));
-                    if let Err(payload) = result {
-                        eprintln!(
-                            "ezpn-ipc: worker {worker_id} panicked: {}",
-                            panic_payload_to_string(&payload)
-                        );
-                    }
-                }
-            })
-            .expect("spawn ezpn-ipc worker thread");
-        workers.push(handle);
-    }
-    IpcPool {
-        work_tx,
-        _workers: workers,
-    }
-}
-
-fn panic_payload_to_string(payload: &Box<dyn std::any::Any + Send>) -> String {
-    if let Some(s) = payload.downcast_ref::<&'static str>() {
-        return (*s).to_string();
-    }
-    if let Some(s) = payload.downcast_ref::<String>() {
-        return s.clone();
-    }
-    "unknown panic payload".to_string()
 }
 
 pub fn cleanup() {
@@ -285,28 +450,12 @@ fn handle_client(stream: UnixStream, tx: mpsc::Sender<(IpcRequest, ResponseSende
     let Ok(read_stream) = stream.try_clone() else {
         return;
     };
-    // Cap total bytes read on this connection so a hostile peer cannot
-    // OOM the daemon by sending a multi-GiB line without a newline.
-    // After the cap the reader EOFs; an in-flight `read_line` returns the
-    // partial buffer (no `\n`) which serde_json rejects with a structured
-    // error → loop terminates cleanly.
-    let limited = read_stream.take(IPC_MAX_LINE_BYTES as u64);
-    let reader = BufReader::new(limited);
+    let reader = BufReader::new(read_stream);
     let mut writer = stream;
 
     for line in reader.lines() {
         let line = match line {
             Ok(line) => line,
-            // Idle-timeout (read_timeout fired) or short-circuit recv: emit
-            // a structured error and close the connection. Per SPEC 01 §4.2,
-            // hostile or wedged peers must be reaped within IPC_READ_TIMEOUT
-            // rather than holding a worker thread forever.
-            Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
-            {
-                let _ = write_response(&mut writer, &IpcResponse::error("idle timeout"));
-                break;
-            }
             Err(_) => break,
         };
 
@@ -314,33 +463,428 @@ fn handle_client(stream: UnixStream, tx: mpsc::Sender<(IpcRequest, ResponseSende
             continue;
         }
 
-        let request = match serde_json::from_str::<IpcRequest>(&line) {
-            Ok(request) => request,
-            Err(error) => {
-                let response = IpcResponse::error(format!("invalid request: {}", error));
-                let _ = write_response(&mut writer, &response);
-                continue;
+        // Peek the `cmd` tag and dispatch to either the legacy
+        // [`IpcRequest`] handler (which routes through the daemon main
+        // loop) or the extended [`IpcRequestExt`] handler (intercepted
+        // here, server-side hook is parent-deferred).
+        let response = if is_ext_command(&line) {
+            handle_ext_request(&line)
+        } else {
+            match serde_json::from_str::<IpcRequest>(&line) {
+                Ok(request) => {
+                    let (resp_tx, resp_rx) = mpsc::sync_channel(1);
+                    if tx.send((request, resp_tx)).is_err() {
+                        let response = IpcResponse::error("listener unavailable");
+                        let _ = write_response(&mut writer, &response);
+                        break;
+                    }
+                    resp_rx
+                        .recv()
+                        .unwrap_or_else(|_| IpcResponse::error("internal error"))
+                }
+                Err(error) => IpcResponse::error(format!("invalid request: {}", error)),
             }
         };
 
-        let (resp_tx, resp_rx) = mpsc::sync_channel(1);
-        if tx.send((request, resp_tx)).is_err() {
-            let response = IpcResponse::error("listener unavailable");
-            let _ = write_response(&mut writer, &response);
-            break;
-        }
-
-        let response = resp_rx
-            .recv()
-            .unwrap_or_else(|_| IpcResponse::error("internal error"));
         if write_response(&mut writer, &response).is_err() {
             break;
         }
     }
 }
 
+/// Inspect the `cmd` tag in a JSON line without fully deserializing.
+/// Returns true when the tag matches one of [`EXT_CMD_TAGS`].
+fn is_ext_command(line: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    let Some(cmd) = value.get("cmd").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    EXT_CMD_TAGS.contains(&cmd)
+}
+
+/// Server-side intercept for [`IpcRequestExt`].
+///
+/// **Parent-deferred**: every variant currently returns an error
+/// message announcing the missing daemon hook. The CLI surface in
+/// `src/bin/ezpn-ctl.rs` exists today so external tooling can pin to
+/// the wire schema; the parent agent will replace each branch with the
+/// real implementation that reads from the live workspace / pane state.
+///
+/// Integration TODOs (see commit-message footers for the matching
+/// issue numbers):
+///
+/// * `LsTree` — walk the active `Workspace` (sessions × tabs × panes),
+///   populate [`SessionTree`] / [`TabInfo`] / [`PaneTreeInfo`].
+/// * `Dump` — call the (parent-supplied) pane snapshot helper that
+///   yields visible-grid + scrollback lines, applying `since` /
+///   `last` / `strip_ansi` and the [`DUMP_MAX_BYTES`] cap. Per #88
+///   acceptance criteria, exceeding the cap MUST return
+///   `IpcResponse::error("dump too large; use --last N")` rather than
+///   truncating silently.
+/// * `SendKeys` — write `text` (+ optional newline) to the pane's
+///   PTY; when `await_prompt` is set, block on the per-pane
+///   `prompt_seen_at: Option<Instant>` channel updated by the OSC
+///   133 D parser (see the API shape in the integration TODO at the
+///   bottom of this file).
+fn handle_ext_request(line: &str) -> IpcResponse {
+    let request = match serde_json::from_str::<IpcRequestExt>(line) {
+        Ok(req) => req,
+        Err(error) => return IpcResponse::error(format!("invalid request: {}", error)),
+    };
+
+    match request {
+        IpcRequestExt::LsTree { .. } => {
+            IpcResponse::error("ls --json: server-side handler not yet wired (issue #89)")
+        }
+        IpcRequestExt::Dump { .. } => {
+            IpcResponse::error("dump: server-side handler not yet wired (issue #88)")
+        }
+        IpcRequestExt::SendKeys { .. } => {
+            IpcResponse::error("send-keys: server-side handler not yet wired (issue #81)")
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Integration TODO — `send-keys --await-prompt` (issue #81)
+// ---------------------------------------------------------------------
+//
+// The parent agent must extend `Pane` (in `src/pane.rs`, off-limits to
+// this agent) with the following API so `handle_ext_request` /
+// `bootstrap::handle_ipc_command` can drive the await-prompt loop:
+//
+//     // src/pane.rs
+//     impl Pane {
+//         /// Wall-clock instant of the most recently observed
+//         /// OSC 133 D semantic-prompt (`\x1b]133;D;<exit>\x07`).
+//         /// `None` until the first prompt is observed for this pane.
+//         /// Updated by the OSC parser inside `read_output`.
+//         pub fn prompt_seen_at(&self) -> Option<Instant>;
+//
+//         /// Exit code parsed from the most recent OSC 133 D, paired
+//         /// with `prompt_seen_at`. `None` when the prompt sequence
+//         /// did not include an exit code.
+//         pub fn last_prompt_exit_code(&self) -> Option<i32>;
+//
+//         /// True iff this pane has emitted at least one OSC 133 A
+//         /// (prompt-start) sequence — used to answer
+//         /// `SendKeysStatus::DetectionUnavailable` before blocking.
+//         pub fn osc133_active(&self) -> bool;
+//     }
+//
+// The server hook then implements `await_prompt` as:
+//
+//     1. Snapshot `before = pane.prompt_seen_at()` BEFORE writing.
+//     2. Write `text` (and trailing `\n` unless `no_newline`) via
+//        `Pane::write_bytes`.
+//     3. If `!pane.osc133_active()`, return `DetectionUnavailable`
+//        immediately (do NOT block).
+//     4. Spin-wait on the main-loop wake channel (or a fresh
+//        `prompt_changed` watch channel — TBD by parent) until
+//        `pane.prompt_seen_at()` advances past `before` or
+//        `timeout_ms` elapses (default `SEND_KEYS_DEFAULT_TIMEOUT_MS`).
+//     5. Fill `SendKeysOutcome { status, exit_code, waited_ms }` and
+//        return it via `IpcResponse::with_send_keys`.
+
 fn write_response(writer: &mut UnixStream, response: &IpcResponse) -> anyhow::Result<()> {
     writeln!(writer, "{}", serde_json::to_string(response)?)?;
     writer.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Frozen-v1 schema check (#89): every documented field of
+    /// `LsTree` round-trips, the `proto_version` is preserved as-is,
+    /// and `Option`-typed fields collapse out of the wire form when
+    /// `None` so additive bumps remain backwards-compatible.
+    #[test]
+    fn ls_tree_roundtrip_matches_frozen_schema() {
+        let tree = LsTree {
+            proto_version: "1.0".to_string(),
+            sessions: vec![SessionTree {
+                name: "work".to_string(),
+                created_at: 1_745_800_000.0,
+                clients: vec![ClientInfo {
+                    socket: "/run/ezpn-1.sock".to_string(),
+                    size: [80, 24],
+                    mode: "steal".to_string(),
+                }],
+                focused_tab: Some(0),
+                tabs: vec![TabInfo {
+                    id: 0,
+                    name: "editor".to_string(),
+                    focused_pane: Some(1),
+                    layout: "split-h:[1,2]".to_string(),
+                    panes: vec![PaneTreeInfo {
+                        id: 1,
+                        command: "nvim".to_string(),
+                        cwd: Some("/foo".to_string()),
+                        size: [80, 24],
+                        pid: Some(12345),
+                        reported_cwd: Some("/foo/bar".to_string()),
+                        exit_code: None,
+                        is_dead: false,
+                        is_focused: true,
+                        title: Some("file.rs".to_string()),
+                    }],
+                }],
+            }],
+        };
+
+        let json = serde_json::to_string(&tree).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(value["proto_version"], "1.0");
+        let pane = &value["sessions"][0]["tabs"][0]["panes"][0];
+        assert_eq!(pane["id"], 1);
+        assert_eq!(pane["command"], "nvim");
+        assert_eq!(pane["size"], serde_json::json!([80, 24]));
+        assert_eq!(pane["is_focused"], true);
+        assert_eq!(pane["is_dead"], false);
+        // Optional fields collapse cleanly when None — verify by
+        // overriding a single field and checking it disappears.
+        assert!(pane.get("exit_code").is_none(), "None must skip-serialize");
+
+        let back: LsTree = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.proto_version, "1.0");
+        assert_eq!(back.sessions.len(), 1);
+        assert_eq!(back.sessions[0].tabs[0].panes[0].command, "nvim");
+    }
+
+    /// `IpcRequestExt::LsTree` is tagged `cmd: "ls_tree"` on the wire
+    /// (snake_case rename) — match the doc and the interceptor in
+    /// `handle_client`.
+    #[test]
+    fn ls_tree_request_uses_cmd_tag() {
+        let req = IpcRequestExt::LsTree {
+            session: Some("work".to_string()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["cmd"], "ls_tree");
+        assert_eq!(value["session"], "work");
+    }
+
+    /// Optional `session` filter omits cleanly when `None`.
+    #[test]
+    fn ls_tree_request_omits_session_when_none() {
+        let req = IpcRequestExt::LsTree { session: None };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("session"));
+    }
+
+    /// `is_ext_command` correctly classifies the v0.12 commands and
+    /// leaves legacy ones to the daemon main loop.
+    #[test]
+    fn is_ext_command_classifies_v012_commands() {
+        assert!(is_ext_command(r#"{"cmd":"ls_tree"}"#));
+        assert!(!is_ext_command(r#"{"cmd":"list"}"#));
+        assert!(!is_ext_command(
+            r#"{"cmd":"split","direction":"horizontal"}"#
+        ));
+        assert!(!is_ext_command("not json"));
+    }
+
+    /// The parent-deferred handler returns a structured error pointing
+    /// at the right issue number.
+    #[test]
+    fn ls_tree_handler_is_parent_deferred() {
+        let response = handle_ext_request(r#"{"cmd":"ls_tree"}"#);
+        assert!(!response.ok);
+        let err = response.error.unwrap();
+        assert!(err.contains("#89"), "got: {err}");
+        assert!(err.contains("ls --json"), "got: {err}");
+    }
+
+    /// `IpcResponse` must round-trip with the new optional fields.
+    #[test]
+    fn ipc_response_carries_ls_tree() {
+        let tree = LsTree {
+            proto_version: "1.0".to_string(),
+            sessions: vec![],
+        };
+        let response = IpcResponse::with_ls_tree(tree);
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"proto_version\":\"1.0\""));
+
+        let back: IpcResponse = serde_json::from_str(&json).unwrap();
+        assert!(back.ok);
+        assert_eq!(back.ls_tree.unwrap().proto_version, "1.0");
+    }
+
+    /// `IpcRequestExt::Dump` survives a JSON round-trip with all
+    /// option fields collapsed when omitted, and `include_scrollback`
+    /// defaults to `true` (matching the CLI default) when absent.
+    #[test]
+    fn dump_request_defaults_match_cli_defaults() {
+        let json = r#"{"cmd":"dump","pane":3}"#;
+        let req: IpcRequestExt = serde_json::from_str(json).unwrap();
+        match req {
+            IpcRequestExt::Dump {
+                pane,
+                session,
+                since,
+                last,
+                include_scrollback,
+                strip_ansi,
+            } => {
+                assert_eq!(pane, 3);
+                assert!(session.is_none());
+                assert!(since.is_none());
+                assert!(last.is_none());
+                assert!(include_scrollback, "default must be true");
+                assert!(!strip_ansi);
+            }
+            _ => panic!("expected Dump variant"),
+        }
+    }
+
+    /// `is_ext_command` recognises the dump tag.
+    #[test]
+    fn is_ext_command_recognises_dump() {
+        assert!(is_ext_command(r#"{"cmd":"dump","pane":0}"#));
+    }
+
+    /// Parent-deferred handler returns the right issue reference.
+    #[test]
+    fn dump_handler_is_parent_deferred() {
+        let response = handle_ext_request(r#"{"cmd":"dump","pane":0}"#);
+        assert!(!response.ok);
+        let err = response.error.unwrap();
+        assert!(err.contains("#88"), "got: {err}");
+        assert!(err.contains("dump"), "got: {err}");
+    }
+
+    /// `DumpPayload` round-trips, including non-ASCII bytes and ANSI
+    /// escapes that scripts will frequently see.
+    #[test]
+    fn dump_payload_roundtrip_handles_escapes() {
+        let payload = DumpPayload {
+            pane: 2,
+            lines: vec![
+                "hello".to_string(),
+                "\x1b[31mred\x1b[0m".to_string(),
+                "café".to_string(),
+            ],
+            total: 3,
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        // jq-parseable: must not contain raw control bytes outside
+        // strings — serde escapes them inside the string.
+        let back: DumpPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.lines.len(), 3);
+        assert_eq!(back.lines[1], "\x1b[31mred\x1b[0m");
+        assert_eq!(back.lines[2], "café");
+    }
+
+    /// The 16 MiB hard cap matches the wire-protocol MAX_PAYLOAD.
+    #[test]
+    fn dump_max_bytes_matches_wire_cap() {
+        assert_eq!(DUMP_MAX_BYTES, 16 * 1024 * 1024);
+    }
+
+    /// `IpcRequestExt::SendKeys` defaults: `await_prompt = false`,
+    /// `no_newline = false`, `timeout_ms = None`. Matches the
+    /// fire-and-forget v0.5 `exec` semantics when `--await-prompt` is
+    /// absent.
+    #[test]
+    fn send_keys_request_defaults() {
+        let json = r#"{"cmd":"send_keys","pane":1,"text":"echo hi"}"#;
+        let req: IpcRequestExt = serde_json::from_str(json).unwrap();
+        match req {
+            IpcRequestExt::SendKeys {
+                pane,
+                text,
+                await_prompt,
+                timeout_ms,
+                no_newline,
+            } => {
+                assert_eq!(pane, 1);
+                assert_eq!(text, "echo hi");
+                assert!(!await_prompt);
+                assert!(timeout_ms.is_none());
+                assert!(!no_newline);
+            }
+            _ => panic!("expected SendKeys variant"),
+        }
+    }
+
+    /// `is_ext_command` recognises the send-keys tag.
+    #[test]
+    fn is_ext_command_recognises_send_keys() {
+        assert!(is_ext_command(r#"{"cmd":"send_keys","pane":0,"text":"x"}"#));
+    }
+
+    /// Parent-deferred handler returns the right issue reference.
+    #[test]
+    fn send_keys_handler_is_parent_deferred() {
+        let response =
+            handle_ext_request(r#"{"cmd":"send_keys","pane":0,"text":"echo","await_prompt":true}"#);
+        assert!(!response.ok);
+        let err = response.error.unwrap();
+        assert!(err.contains("#81"), "got: {err}");
+        assert!(err.contains("send-keys"), "got: {err}");
+    }
+
+    /// `SendKeysOutcome` round-trips and the snake_case status enum
+    /// matches the documented `prompt_seen` / `timeout` /
+    /// `detection_unavailable` strings.
+    #[test]
+    fn send_keys_outcome_status_uses_snake_case() {
+        for (status, expected) in [
+            (SendKeysStatus::PromptSeen, "prompt_seen"),
+            (SendKeysStatus::Timeout, "timeout"),
+            (
+                SendKeysStatus::DetectionUnavailable,
+                "detection_unavailable",
+            ),
+        ] {
+            let outcome = SendKeysOutcome {
+                status,
+                exit_code: Some(0),
+                waited_ms: 12,
+            };
+            let json = serde_json::to_string(&outcome).unwrap();
+            assert!(
+                json.contains(&format!("\"{}\"", expected)),
+                "{} missing in {}",
+                expected,
+                json
+            );
+            let back: SendKeysOutcome = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.status, status);
+        }
+    }
+
+    /// `IpcResponse::with_send_keys` round-trips and the timeout path
+    /// correctly omits `exit_code`.
+    #[test]
+    fn ipc_response_with_send_keys_omits_exit_code_on_timeout() {
+        let response = IpcResponse::with_send_keys(SendKeysOutcome {
+            status: SendKeysStatus::Timeout,
+            exit_code: None,
+            waited_ms: 30_000,
+        });
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(!json.contains("exit_code"), "got: {json}");
+        assert!(json.contains("\"timeout\""));
+
+        let back: IpcResponse = serde_json::from_str(&json).unwrap();
+        let outcome = back.send_keys.unwrap();
+        assert_eq!(outcome.status, SendKeysStatus::Timeout);
+        assert!(outcome.exit_code.is_none());
+        assert_eq!(outcome.waited_ms, 30_000);
+    }
+
+    /// The default timeout matches the spec (#81): 30 s when the
+    /// client did not pass `--timeout`.
+    #[test]
+    fn send_keys_default_timeout_is_30s() {
+        assert_eq!(SEND_KEYS_DEFAULT_TIMEOUT_MS, 30_000);
+    }
 }

@@ -1,21 +1,15 @@
+[theme]
 name = "solarized-dark"
-description = "Solarized Dark palette by Ethan Schoonover"
-
-bg              = { r =   0, g =  43, b =  54 }
-focus_bg        = { r =   7, g =  54, b =  66 }
-lbl_fg          = { r = 147, g = 161, b = 161 }
-accent          = { r =  38, g = 139, b = 210 }
-warn_fg         = { r = 220, g =  50, b =  47 }
-sec_fg          = { r = 101, g = 123, b = 131 }
-dim_fg          = { r =  88, g = 110, b = 117 }
-div_fg          = { r =  20, g =  60, b =  72 }
-status_bg       = { r =   7, g =  54, b =  66 }
-status_fg       = { r = 238, g = 232, b = 213 }
-hint_fg         = { r = 147, g = 161, b = 161 }
-broadcast_color = { r = 203, g =  75, b =  22 }
-muted_fg        = { r = 101, g = 123, b = 131 }
-border_color    = { r =  88, g = 110, b = 117 }
-active_color    = { r =  42, g = 161, b = 152 }
-close_color     = { r = 220, g =  50, b =  47 }
-drag_color      = { r = 181, g = 137, b =   0 }
-dead_fg         = { r =  88, g = 110, b = 117 }
+fg = "#93a1a1"
+bg = "#002b36"
+border = "#586e75"
+border_active = "#268bd2"
+status_bg = "#002b36"
+status_fg = "#93a1a1"
+tab_active_bg = "#268bd2"
+tab_active_fg = "#002b36"
+tab_inactive_fg = "#657b83"
+selection = "#073642"
+search_match = "#b58900"
+broadcast_indicator = "#dc322f"
+copy_mode_indicator = "#859900"

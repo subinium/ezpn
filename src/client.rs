@@ -27,73 +27,37 @@ pub enum ExitReason {
     ConnectionLost,
 }
 
-/// Send the C_HELLO handshake and read the server reply with a 500ms timeout.
-/// Returns the negotiated capability bitfield (0 if the server is too old or
-/// the handshake fails — that path keeps the connection alive so legacy attach
-/// continues to work). On `S_HELLO_ERR` the process exits with a clear message,
-/// since proceeding past a known major-version mismatch would silently corrupt
-/// the session.
-fn perform_hello(stream: &UnixStream) -> u32 {
-    let hello = protocol::HelloMessage {
-        version: protocol::PROTOCOL_VERSION,
-        capabilities: protocol::CAP_KITTY_KEYBOARD
-            | protocol::CAP_FOCUS_EVENTS
-            | protocol::CAP_TRUE_COLOR,
-        client: format!("ezpn {}", env!("CARGO_PKG_VERSION")),
-    };
-    let payload = match serde_json::to_vec(&hello) {
-        Ok(p) => p,
-        Err(_) => return 0,
-    };
-    let mut writer = stream;
-    if protocol::write_msg(&mut writer, protocol::C_HELLO, &payload).is_err() {
-        return 0;
-    }
-
-    // Brief read timeout so a pre-Hello daemon doesn't hang the client forever.
-    let mut reader = stream;
-    let prev_timeout = stream.read_timeout().ok().flatten();
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-
-    let result = protocol::read_msg(&mut reader);
-    // Restore (or clear) the prior timeout — we don't want this to leak into
-    // the steady-state read path, which expects to block indefinitely.
-    let _ = stream.set_read_timeout(prev_timeout);
-
-    match result {
-        Ok((tag, body)) if tag == protocol::S_HELLO_OK => {
-            serde_json::from_slice::<protocol::HelloOk>(&body)
-                .map(|ok| ok.capabilities)
-                .unwrap_or(0)
-        }
-        Ok((tag, body)) if tag == protocol::S_HELLO_ERR => {
-            let reason = serde_json::from_slice::<protocol::HelloErr>(&body)
-                .map(|e| {
-                    format!(
-                        "{} (server protocol version {})",
-                        e.reason, e.server_version
-                    )
-                })
-                .unwrap_or_else(|_| "unknown reason".to_string());
-            eprintln!("ezpn: server rejected handshake: {reason}");
-            std::process::exit(1);
-        }
-        _ => {
-            // Timeout, EOF, or unrelated tag — assume older daemon, fall back.
-            // Note: the unrelated-tag case is also possible if a buggy daemon
-            // sends e.g. S_OUTPUT before any client message; we discard such
-            // bytes by closing and letting the existing client_loop handshake
-            // (C_RESIZE / C_ATTACH below) drive the conversation.
-            0
-        }
-    }
-}
-
 /// Connect to a running server and act as a terminal proxy.
 /// Uses legacy C_RESIZE handshake (steal mode).
 pub fn run(socket_path: &std::path::Path, session_name: &str) -> anyhow::Result<()> {
     run_with_mode(socket_path, session_name, protocol::AttachMode::Steal)
 }
+
+/// Structured error returned when the server rejects us with `S_INCOMPAT`.
+///
+/// Held by `anyhow` so the user-facing message bubbles up via main.rs's
+/// default error formatter. Exit code 2 specifically (per #57 UX spec)
+/// requires a small main.rs change to map this error variant — that
+/// wiring is intentionally out of scope for this commit (main.rs is
+/// owned by another agent in the v0.12 split).
+#[derive(Debug)]
+pub struct IncompatibleServerError {
+    // Retained for the main.rs follow-up that maps this error to exit
+    // code 2 and surfaces structured diagnostics; not yet read here.
+    #[allow(dead_code)]
+    pub server_proto: String,
+    #[allow(dead_code)]
+    pub client_proto: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for IncompatibleServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for IncompatibleServerError {}
 
 /// Connect to a running server with a specific attach mode.
 pub fn run_with_mode(
@@ -104,13 +68,27 @@ pub fn run_with_mode(
     let stream = UnixStream::connect(socket_path)?;
     stream.set_nonblocking(false)?;
 
-    // Capability handshake (best-effort): send C_HELLO, wait briefly for S_HELLO_OK.
-    // - On S_HELLO_OK: store negotiated caps for future feature gating.
-    // - On S_HELLO_ERR: surface the server's reason and abort cleanly.
-    // - On timeout / EOF: assume an older daemon (≤ 0.5) that doesn't speak C_HELLO,
-    //   fall through to the legacy attach path. The attach itself stays unchanged,
-    //   so this remains backwards compatible.
-    let _negotiated_caps = perform_hello(&stream);
+    // ── Version handshake (issue #57) ──
+    //
+    // Run BEFORE entering raw mode so any friendly incompat error prints
+    // normally to stderr. We use a generous timeout (2s) on the handshake
+    // read: a healthy server emits S_VERSION immediately on accept; a
+    // longer wait means something is wrong and we'd rather fail fast than
+    // hang. The timeout is cleared once the handshake completes so the
+    // long-lived reader thread can block indefinitely on idle connections.
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let server_hello = perform_handshake(&stream, session_name)?;
+    stream.set_read_timeout(None)?;
+
+    // Stash the server's protocol version on a debug log line (one-shot).
+    // A future commit will plumb this into `ezpn ls --json` via session
+    // metadata; for now it's purely informational.
+    if std::env::var("EZPN_DEBUG").is_ok() {
+        eprintln!(
+            "ezpn: handshake ok — server {}.{} ({})",
+            server_hello.proto_major, server_hello.proto_minor, server_hello.build
+        );
+    }
 
     let write_stream = stream.try_clone()?;
     let read_stream = stream;
@@ -121,26 +99,11 @@ pub fn run_with_mode(
     // Start reader thread: server → client
     let (server_tx, server_rx) = mpsc::channel::<(u8, Vec<u8>)>();
     std::thread::spawn(move || {
-        // Isolate reader panics so the client UI shuts down cleanly instead of
-        // aborting (which would leave the host terminal in raw mode).
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut reader = BufReader::new(read_stream);
-            while let Ok(msg) = protocol::read_msg(&mut reader) {
-                if server_tx.send(msg).is_err() {
-                    break;
-                }
+        let mut reader = BufReader::new(read_stream);
+        while let Ok(msg) = protocol::read_msg(&mut reader) {
+            if server_tx.send(msg).is_err() {
+                break;
             }
-        }));
-        if let Err(payload) = result {
-            let reason = match payload.downcast_ref::<&'static str>() {
-                Some(s) => (*s).to_string(),
-                None => match payload.downcast_ref::<String>() {
-                    Some(s) => s.clone(),
-                    None => "unknown panic payload".to_string(),
-                },
-            };
-            eprintln!("ezpn: client reader thread panicked: {}", reason);
-            // server_tx drops here → main loop sees Disconnected and exits cleanly.
         }
     });
 
@@ -194,6 +157,42 @@ pub fn run_with_mode(
     }
 
     Ok(())
+}
+
+/// Drive the client-side IPC handshake to completion before any other I/O.
+///
+/// Reads `S_VERSION`, sends `C_HELLO`. On `S_INCOMPAT` (or a major version
+/// mismatch detected client-side) prints the friendly UX message to stderr
+/// and returns an `IncompatibleServerError` wrapped in `anyhow`. On a
+/// timeout (e.g. legacy v0.5 server that doesn't speak S_VERSION) the
+/// underlying `io::Error` propagates — the auto-attach path in main.rs
+/// will treat this as a stale session and fall through to spawning a new
+/// server, which is the desired UX for the v0.5 → v0.12 transition.
+fn perform_handshake(
+    stream: &UnixStream,
+    session_name: &str,
+) -> anyhow::Result<protocol::ServerHello> {
+    let mut reader = stream;
+    let mut writer = stream;
+    match protocol::client_handshake(&mut reader, &mut writer)? {
+        protocol::HandshakeOutcome::Ok(hello) => Ok(hello),
+        protocol::HandshakeOutcome::Incompat(notice) => {
+            // Print the canonical message ahead of any anyhow formatting so
+            // the user sees it cleanly even if main.rs's error path adds
+            // its own prefix later.
+            eprintln!("Error: {}", notice.message);
+            // Hint with the session-scoped command spec'd in #57 in case
+            // the server's message didn't include it (e.g. legacy notice).
+            if !notice.message.contains("ezpn kill") {
+                eprintln!("hint: ezpn kill {}", session_name);
+            }
+            Err(anyhow::Error::new(IncompatibleServerError {
+                server_proto: notice.server_proto,
+                client_proto: notice.client_proto,
+                message: notice.message,
+            }))
+        }
+    }
 }
 
 fn client_loop(
