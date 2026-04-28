@@ -866,7 +866,7 @@ mod tests {
         // After substitution, argv must STILL have exactly 3 elements;
         // the third is the literal payload value.
         let p = payload(&[("user_var", "; rm -rf ~")]);
-        let exec = vec![
+        let exec = [
             "sh".to_string(),
             "-c".to_string(),
             "${user_var}".to_string(),
