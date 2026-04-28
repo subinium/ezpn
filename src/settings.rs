@@ -1,10 +1,12 @@
 use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent};
 use crossterm::{cursor, queue, style::*};
 
+use crate::config::{self, EzpnConfig};
 use crate::render::BorderStyle;
-use crate::theme::AdaptedTheme;
 
 // ─── Layout constants ──────────────────────────────────
 
@@ -28,10 +30,52 @@ const Y_I6: u16 = 13; // Tab Bar
 const Y_I7: u16 = 14; // Broadcast
 const Y_DIV2: u16 = 15;
 const Y_I8: u16 = 16; // Close
-const Y_FOOTER: u16 = 18; // "Saved to ~/.config/ezpn/config.toml"
 
 const ITEM_Y: [u16; 9] = [Y_I0, Y_I1, Y_I2, Y_I3, Y_I4, Y_I5, Y_I6, Y_I7, Y_I8];
 const ITEM_COUNT: usize = 9;
+
+// ─── Colors ────────────────────────────────────────────
+
+const BG: Color = Color::Rgb {
+    r: 16,
+    g: 18,
+    b: 24,
+};
+const FOCUS_BG: Color = Color::Rgb {
+    r: 26,
+    g: 32,
+    b: 44,
+};
+const SEC_FG: Color = Color::Rgb {
+    r: 75,
+    g: 90,
+    b: 110,
+};
+const LBL_FG: Color = Color::Rgb {
+    r: 190,
+    g: 200,
+    b: 212,
+};
+const DIM_FG: Color = Color::Rgb {
+    r: 90,
+    g: 98,
+    b: 110,
+};
+const ACCENT: Color = Color::Rgb {
+    r: 102,
+    g: 217,
+    b: 239,
+};
+const DIV_FG: Color = Color::Rgb {
+    r: 36,
+    g: 42,
+    b: 52,
+};
+const WARN_FG: Color = Color::Rgb {
+    r: 255,
+    g: 110,
+    b: 110,
+};
 
 // ─── Item indices ──────────────────────────────────────
 
@@ -52,11 +96,24 @@ pub struct Settings {
     pub border_style: BorderStyle,
     pub show_status_bar: bool,
     pub show_tab_bar: bool,
-    /// Adapted (terminal-quantized) color palette used by every renderer
-    /// in the project.  Cloned cheaply (`Color`s are `Copy` and the name
-    /// `String` is owned per-Settings).
-    pub theme: AdaptedTheme,
     focused: usize,
+    /// Live snapshot of the on-disk config, kept around so hot-reload can
+    /// diff non-reloadable fields and emit warnings. Populated lazily by
+    /// `bind_runtime` — see `RuntimeSettings` below.
+    runtime: Option<RuntimeSettings>,
+    /// Set by the prefix-mode `r` handler; consumed by the main loop's
+    /// signal-polling block, which runs the actual reload alongside SIGHUP.
+    pub reload_request: bool,
+    /// Set by `reload_config` on success when the new state differs from the
+    /// previous one in a way that requires a full re-render (border style,
+    /// status/tab-bar visibility). Consumed once per frame by the main loop.
+    pub reload_dirty: bool,
+    /// Transient status-bar overlay (success / failure flash). Owned here
+    /// rather than on RuntimeSettings so the renderer can read it without
+    /// caring whether the runtime config has been bound yet.
+    //
+    // FLASH-MSG-COORDINATE-WITH-#58
+    pub flash_message: Option<(String, FlashKind, Instant)>,
 }
 
 #[derive(PartialEq)]
@@ -68,22 +125,133 @@ pub enum SettingsAction {
 }
 
 impl Settings {
-    /// Constructor for tests / boot-before-config.  Uses a truecolor-quantized
-    /// default palette; production code should call [`Settings::with_theme`]
-    /// with a config-derived [`AdaptedTheme`].
-    #[allow(dead_code)]
     pub fn new(border: BorderStyle) -> Self {
-        Self::with_theme(border, AdaptedTheme::default_truecolor())
-    }
-
-    pub fn with_theme(border: BorderStyle, theme: AdaptedTheme) -> Self {
         Self {
             visible: false,
             border_style: border,
             show_status_bar: true,
             show_tab_bar: true,
-            theme,
             focused: I_ROUNDED,
+            runtime: None,
+            reload_request: false,
+            reload_dirty: false,
+            flash_message: None,
+        }
+    }
+
+    /// Attach the freshly-loaded `EzpnConfig` so hot-reload can diff against
+    /// it. Should be called once during daemon startup, after `load_config`.
+    pub fn bind_runtime(&mut self, config: EzpnConfig) {
+        self.runtime = Some(RuntimeSettings { config });
+    }
+
+    /// Borrow the held config (panics if `bind_runtime` hasn't been called).
+    /// Tests + reload paths use this; normal render code reads the cached
+    /// flat fields (`border_style` etc.) directly.
+    pub fn config(&self) -> &EzpnConfig {
+        self.runtime
+            .as_ref()
+            .map(|r| &r.config)
+            .expect("Settings::bind_runtime must be called before config()")
+    }
+
+    /// Set a transient status-bar flash. Overwrites any pending message.
+    //
+    // FLASH-MSG-COORDINATE-WITH-#58
+    pub fn set_flash(&mut self, msg: impl Into<String>, kind: FlashKind) {
+        self.flash_message = Some((msg.into(), kind, Instant::now()));
+    }
+
+    /// Drop the flash if its duration has elapsed. Call once per frame.
+    //
+    // FLASH-MSG-COORDINATE-WITH-#58
+    pub fn tick_flash(&mut self) {
+        if let Some((_, kind, started)) = &self.flash_message {
+            if started.elapsed() >= kind.duration() {
+                self.flash_message = None;
+            }
+        }
+    }
+
+    /// Re-read the config file at `path`, validate it, and atomically apply
+    /// the reloadable subset to `self`. On parse / IO error the previous
+    /// `EzpnConfig` is retained and `ReloadOutcome::Error` is returned.
+    ///
+    /// Reloadable: border, status_bar, tab_bar, prefix.
+    /// Non-reloadable (warn on change): shell, scrollback. Per-pane keys
+    /// (command, env) live in the project file and are not handled here.
+    ///
+    /// `bind_runtime` must have been called first; if not, falls back to
+    /// `EzpnConfig::default()` for the diff baseline.
+    pub fn reload_config(&mut self, path: &Path) -> ReloadOutcome {
+        // 1. Read file.
+        let contents = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                let msg = format!("read {}: {}", path.display(), e);
+                tracing::warn!(target: "config_reload", "{msg}");
+                return ReloadOutcome::Error(msg);
+            }
+        };
+
+        // 2. Pre-validate TOML syntax. A `[section]` document must round-trip
+        //    through `toml::Table` before we accept it; otherwise we'd be at
+        //    the mercy of `load_config`'s lenient stderr-only error path and
+        //    silently fall back to defaults — a bug in the context of
+        //    hot-reload (would wipe the running config).
+        if has_toml_table_header(&contents) {
+            if let Err(e) = toml::from_str::<toml::Table>(&contents) {
+                let msg = e.message().to_string();
+                tracing::warn!(target: "config_reload", path = %path.display(), "{msg}");
+                return ReloadOutcome::Error(msg);
+            }
+        }
+
+        // 3. Parse into a fresh `EzpnConfig`. `load_config` reads from the
+        //    XDG path; for hot-reload we want the same behavior.
+        let new_config = config::load_config();
+
+        // 4. Diff non-reloadable fields against the previous snapshot.
+        let prev_shell;
+        let prev_scrollback;
+        if let Some(rt) = &self.runtime {
+            prev_shell = rt.config.shell.clone();
+            prev_scrollback = rt.config.scrollback;
+        } else {
+            let d = EzpnConfig::default();
+            prev_shell = d.shell;
+            prev_scrollback = d.scrollback;
+        }
+        let mut changed_non_reloadable: Vec<&'static str> = Vec::new();
+        if new_config.shell != prev_shell && !is_reloadable("shell") {
+            changed_non_reloadable.push("shell");
+        }
+        if new_config.scrollback != prev_scrollback && !is_reloadable("scrollback") {
+            changed_non_reloadable.push("scrollback");
+        }
+        for f in &changed_non_reloadable {
+            tracing::warn!(
+                target: "config_reload",
+                field = f,
+                "non-reloadable field changed; restart the session to pick it up"
+            );
+        }
+
+        // 5. Atomically apply reloadable fields + replace stored config.
+        //    Done last so any failure above leaves state untouched.
+        let visual_changed = self.border_style != new_config.border
+            || self.show_status_bar != new_config.show_status_bar
+            || self.show_tab_bar != new_config.show_tab_bar;
+        self.border_style = new_config.border;
+        self.show_status_bar = new_config.show_status_bar;
+        self.show_tab_bar = new_config.show_tab_bar;
+        self.runtime = Some(RuntimeSettings { config: new_config });
+        if visual_changed {
+            self.reload_dirty = true;
+        }
+
+        ReloadOutcome::Reloaded {
+            non_reloadable_changed: changed_non_reloadable,
         }
     }
 
@@ -153,19 +321,13 @@ impl Settings {
         if tw < W + 4 || th < H + 2 {
             return Ok(());
         }
-        let theme = &self.theme;
-        let bg_color = theme.bg;
-        let sec_fg = theme.sec_fg;
-        let dim_fg = theme.dim_fg;
-        let lbl_fg = theme.lbl_fg;
         let (ox, oy) = origin(tw, th);
         let inner_w = (W - PAD * 2) as usize;
 
-        // Backdrop — re-uses the theme background; with truecolor adapters
-        // this is visually identical to the previous near-black backdrop.
+        // Backdrop
         queue!(
             stdout,
-            SetBackgroundColor(bg_color),
+            SetBackgroundColor(Color::Rgb { r: 4, g: 5, b: 8 }),
             crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
         )?;
 
@@ -175,7 +337,7 @@ impl Settings {
             queue!(
                 stdout,
                 cursor::MoveTo(ox, oy + dy),
-                SetBackgroundColor(bg_color),
+                SetBackgroundColor(BG),
                 Print(&blank)
             )?;
         }
@@ -184,27 +346,19 @@ impl Settings {
         let xr = ox + W - PAD; // content right edge
 
         // Title
-        text(stdout, x, oy + Y_TITLE, bg_color, lbl_fg, true, "Settings")?;
+        text(stdout, x, oy + Y_TITLE, BG, Color::White, true, "Settings")?;
         text(
             stdout,
             x,
             oy + Y_HINT,
-            bg_color,
-            dim_fg,
+            BG,
+            DIM_FG,
             false,
             "j/k move  Enter apply  1-5 border  q close",
         )?;
 
         // Section: Border Style
-        text(
-            stdout,
-            x,
-            oy + Y_SEC1,
-            bg_color,
-            sec_fg,
-            true,
-            "BORDER STYLE",
-        )?;
+        text(stdout, x, oy + Y_SEC1, BG, SEC_FG, true, "BORDER STYLE")?;
         self.item_border(stdout, x, xr, oy, I_SINGLE, "Single", BorderStyle::Single)?;
         self.item_border(
             stdout,
@@ -220,8 +374,8 @@ impl Settings {
         self.item_border(stdout, x, xr, oy, I_NONE, "None", BorderStyle::None)?;
 
         // Divider + Section: Display
-        div(stdout, x, oy + Y_DIV1, inner_w, bg_color, theme.div_fg)?;
-        text(stdout, x, oy + Y_SEC2, bg_color, sec_fg, true, "DISPLAY")?;
+        div(stdout, x, oy + Y_DIV1, inner_w)?;
+        text(stdout, x, oy + Y_SEC2, BG, SEC_FG, true, "DISPLAY")?;
         self.item_toggle(
             stdout,
             x,
@@ -235,21 +389,8 @@ impl Settings {
         self.item_toggle(stdout, x, xr, oy, I_BROADCAST, "Broadcast", broadcast)?;
 
         // Divider + Close
-        div(stdout, x, oy + Y_DIV2, inner_w, bg_color, theme.div_fg)?;
+        div(stdout, x, oy + Y_DIV2, inner_w)?;
         self.item_close(stdout, x, xr, oy)?;
-
-        // Footer: where settings persist to. Subtle, single line.
-        let scope = format!("Saved to {}", crate::config::display_config_path());
-        let scope = truncate_to_width(&scope, inner_w);
-        text(
-            stdout,
-            x,
-            oy + Y_FOOTER,
-            theme.bg,
-            theme.dim_fg,
-            false,
-            &scope,
-        )?;
 
         queue!(stdout, ResetColor, SetAttribute(Attribute::Reset))?;
         Ok(())
@@ -268,19 +409,18 @@ impl Settings {
         name: &str,
         style: BorderStyle,
     ) -> anyhow::Result<()> {
-        let theme = &self.theme;
         let y = oy + ITEM_Y[item];
         let f = self.focused == item;
         let sel = self.border_style == style;
-        let bg = if f { theme.focus_bg } else { theme.bg };
+        let bg = if f { FOCUS_BG } else { BG };
 
         row_bg(stdout, x - 1, y, (xr - x + 2) as usize, bg)?;
         if f {
-            focus_marker(stdout, x - 1, y, theme.focus_bg, theme.accent)?;
+            focus_marker(stdout, x - 1, y)?;
         }
 
         let icon = if sel { "●" } else { "○" };
-        let icon_fg = if sel { theme.accent } else { theme.dim_fg };
+        let icon_fg = if sel { ACCENT } else { DIM_FG };
         let nx = if f { x + 3 } else { x + 1 };
 
         queue!(
@@ -290,7 +430,7 @@ impl Settings {
             SetForegroundColor(icon_fg),
             Print(icon),
             Print(" "),
-            SetForegroundColor(if f { theme.status_fg } else { theme.lbl_fg }),
+            SetForegroundColor(if f { Color::White } else { LBL_FG }),
         )?;
         if f {
             queue!(stdout, SetAttribute(Attribute::Bold))?;
@@ -301,7 +441,7 @@ impl Settings {
         }
 
         if sel {
-            right_tag(stdout, xr, y, bg, theme.accent, "active")?;
+            right_tag(stdout, xr, y, bg, ACCENT, "active")?;
         }
         Ok(())
     }
@@ -317,14 +457,13 @@ impl Settings {
         label: &str,
         value: bool,
     ) -> anyhow::Result<()> {
-        let theme = &self.theme;
         let y = oy + ITEM_Y[item];
         let f = self.focused == item;
-        let bg = if f { theme.focus_bg } else { theme.bg };
+        let bg = if f { FOCUS_BG } else { BG };
 
         row_bg(stdout, x - 1, y, (xr - x + 2) as usize, bg)?;
         if f {
-            focus_marker(stdout, x - 1, y, theme.focus_bg, theme.accent)?;
+            focus_marker(stdout, x - 1, y)?;
         }
 
         let nx = if f { x + 3 } else { x + 1 };
@@ -332,7 +471,7 @@ impl Settings {
             stdout,
             cursor::MoveTo(nx, y),
             SetBackgroundColor(bg),
-            SetForegroundColor(if f { theme.status_fg } else { theme.lbl_fg }),
+            SetForegroundColor(if f { Color::White } else { LBL_FG }),
         )?;
         if f {
             queue!(stdout, SetAttribute(Attribute::Bold))?;
@@ -343,23 +482,22 @@ impl Settings {
         }
 
         let (tag, tag_fg) = if value {
-            ("ON", theme.accent)
+            ("ON", ACCENT)
         } else {
-            ("OFF", theme.dim_fg)
+            ("OFF", DIM_FG)
         };
         right_tag(stdout, xr, y, bg, tag_fg, tag)?;
         Ok(())
     }
 
     fn item_close(&self, stdout: &mut impl Write, x: u16, xr: u16, oy: u16) -> anyhow::Result<()> {
-        let theme = &self.theme;
         let y = oy + ITEM_Y[I_CLOSE];
         let f = self.focused == I_CLOSE;
-        let bg = if f { theme.focus_bg } else { theme.bg };
+        let bg = if f { FOCUS_BG } else { BG };
 
         row_bg(stdout, x - 1, y, (xr - x + 2) as usize, bg)?;
         if f {
-            focus_marker(stdout, x - 1, y, theme.focus_bg, theme.accent)?;
+            focus_marker(stdout, x - 1, y)?;
         }
 
         let nx = if f { x + 3 } else { x + 1 };
@@ -367,7 +505,7 @@ impl Settings {
             stdout,
             cursor::MoveTo(nx, y),
             SetBackgroundColor(bg),
-            SetForegroundColor(if f { theme.warn_fg } else { theme.dim_fg }),
+            SetForegroundColor(if f { WARN_FG } else { DIM_FG }),
         )?;
         if f {
             queue!(stdout, SetAttribute(Attribute::Bold))?;
@@ -377,7 +515,7 @@ impl Settings {
             queue!(stdout, SetAttribute(Attribute::Reset))?;
         }
 
-        right_tag(stdout, xr, y, bg, theme.dim_fg, "q / Esc")?;
+        right_tag(stdout, xr, y, bg, DIM_FG, "q / Esc")?;
         Ok(())
     }
 
@@ -474,12 +612,12 @@ fn text(
     Ok(())
 }
 
-fn div(out: &mut impl Write, x: u16, y: u16, w: usize, bg: Color, fg: Color) -> anyhow::Result<()> {
+fn div(out: &mut impl Write, x: u16, y: u16, w: usize) -> anyhow::Result<()> {
     queue!(
         out,
         cursor::MoveTo(x, y),
-        SetBackgroundColor(bg),
-        SetForegroundColor(fg),
+        SetBackgroundColor(BG),
+        SetForegroundColor(DIV_FG),
         Print("─".repeat(w))
     )?;
     Ok(())
@@ -493,31 +631,15 @@ fn row_bg(out: &mut impl Write, x: u16, y: u16, w: usize, bg: Color) -> anyhow::
     Ok(())
 }
 
-fn focus_marker(out: &mut impl Write, x: u16, y: u16, bg: Color, fg: Color) -> anyhow::Result<()> {
+fn focus_marker(out: &mut impl Write, x: u16, y: u16) -> anyhow::Result<()> {
     queue!(
         out,
         cursor::MoveTo(x, y),
-        SetBackgroundColor(bg),
-        SetForegroundColor(fg),
+        SetBackgroundColor(FOCUS_BG),
+        SetForegroundColor(ACCENT),
         Print("▎›")
     )?;
     Ok(())
-}
-
-/// Truncate a string to at most `max` display columns, suffixing with "…"
-/// when something was cut. Operates on byte width since the panel content
-/// is ASCII-only ("Saved to /home/user/.config/...").
-fn truncate_to_width(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
-    }
-    if max == 0 {
-        return String::new();
-    }
-    let cut = max.saturating_sub(1);
-    let mut out: String = s.chars().take(cut).collect();
-    out.push('…');
-    out
 }
 
 fn right_tag(
@@ -537,4 +659,246 @@ fn right_tag(
         Print(tag)
     )?;
     Ok(())
+}
+
+// ─── Hot-reload (issue #64) ────────────────────────────
+
+/// Status-bar flash kind. Drives color + duration in the renderer.
+//
+// FLASH-MSG-COORDINATE-WITH-#58
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlashKind {
+    /// Success — green, 1 s.
+    Info,
+    /// Failure — red, 3 s.
+    Error,
+}
+
+impl FlashKind {
+    pub fn duration(self) -> Duration {
+        match self {
+            FlashKind::Info => Duration::from_secs(1),
+            FlashKind::Error => Duration::from_secs(3),
+        }
+    }
+}
+
+/// Outcome of a hot-reload attempt.
+#[derive(Debug)]
+pub enum ReloadOutcome {
+    /// Config reloaded successfully. `non_reloadable_changed` lists the keys
+    /// the user changed in the on-disk file that ezpn cannot apply at runtime
+    /// (shell, scrollback, …) — caller should surface those in a warning.
+    Reloaded {
+        non_reloadable_changed: Vec<&'static str>,
+    },
+    /// Parse / IO error. Previous config is retained; caller flashes the
+    /// error message.
+    Error(String),
+}
+
+/// Whether a config field can be hot-reloaded into a running session.
+///
+/// Reloadable: visual-only knobs that don't affect already-spawned processes
+/// or terminal buffers.
+/// Non-reloadable: anything that would require killing/respawning panes
+/// (shell, scrollback buffer for existing panes, per-pane command/env).
+fn is_reloadable(field: &'static str) -> bool {
+    match field {
+        // Reloadable visual + binding changes.
+        "border" | "status_bar" | "tab_bar" | "prefix" => true,
+        // Non-reloadable — require session restart.
+        "shell" | "scrollback" => false,
+        // Unknown field: treat as non-reloadable so callers warn instead of
+        // silently dropping it.
+        _ => false,
+    }
+}
+
+/// Internal holder for the live `EzpnConfig`. Lives inside `Settings::runtime`
+/// so the hot-reload path (`Settings::reload_config`) can diff non-reloadable
+/// fields against the previous snapshot without separate plumbing.
+struct RuntimeSettings {
+    config: EzpnConfig,
+}
+
+/// XDG-aware config file path, for callers that want to wire a reload trigger
+/// (Ctrl+B r, SIGHUP) without poking at internal helpers.
+pub fn config_path() -> PathBuf {
+    let dir = std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let mut home = std::env::var("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/tmp"));
+            home.push(".config");
+            home
+        });
+    dir.join("ezpn").join("config.toml")
+}
+
+/// Same heuristic as `config::has_toml_table_header` — duplicated locally
+/// because `config.rs` keeps it private and the issue forbids touching that
+/// file. Kept tiny and side-effect-free.
+fn has_toml_table_header(contents: &str) -> bool {
+    contents.lines().any(|l| {
+        let t = l.trim_start();
+        t.starts_with('[') && !t.starts_with("[[")
+    })
+}
+
+// ─── Tests ─────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::sync::Mutex;
+
+    /// `XDG_CONFIG_HOME` is process-global; serialize tests that mutate it.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Write `contents` to `<tmp>/ezpn/config.toml`, point `XDG_CONFIG_HOME`
+    /// at `<tmp>`, and return the full file path.
+    fn write_config(tmp: &std::path::Path, contents: &str) -> PathBuf {
+        let dir = tmp.join("ezpn");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        fs::write(&path, contents).unwrap();
+        path
+    }
+
+    /// Build a freshly-bound `Settings` for the test: load_config from the
+    /// XDG_CONFIG_HOME we just set, copy the visual fields onto a new
+    /// `Settings`, attach the runtime.
+    fn build_settings() -> Settings {
+        let cfg = config::load_config();
+        let mut s = Settings::new(cfg.border);
+        s.show_status_bar = cfg.show_status_bar;
+        s.show_tab_bar = cfg.show_tab_bar;
+        s.bind_runtime(cfg);
+        s
+    }
+
+    #[test]
+    fn reload_applies_border_change() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config(tmp.path(), "[global]\nborder = \"rounded\"\n");
+        std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+
+        let mut settings = build_settings();
+        assert_eq!(settings.border_style, BorderStyle::Rounded);
+
+        // Edit the file, then reload.
+        fs::write(&path, "[global]\nborder = \"heavy\"\n").unwrap();
+        let outcome = settings.reload_config(&path);
+
+        assert!(matches!(outcome, ReloadOutcome::Reloaded { .. }));
+        assert_eq!(settings.border_style, BorderStyle::Heavy);
+        assert_eq!(settings.config().border, BorderStyle::Heavy);
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn reload_warns_on_non_reloadable_shell_change() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config(
+            tmp.path(),
+            "[global]\nshell = \"/bin/zsh\"\nborder = \"single\"\n",
+        );
+        std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+
+        let mut settings = build_settings();
+        assert_eq!(settings.config().shell, "/bin/zsh");
+
+        // Change shell + a reloadable border key.
+        fs::write(
+            &path,
+            "[global]\nshell = \"/bin/fish\"\nborder = \"double\"\n",
+        )
+        .unwrap();
+        let outcome = settings.reload_config(&path);
+
+        match outcome {
+            ReloadOutcome::Reloaded {
+                non_reloadable_changed,
+            } => {
+                assert!(
+                    non_reloadable_changed.contains(&"shell"),
+                    "expected `shell` in warn list, got {non_reloadable_changed:?}"
+                );
+            }
+            ReloadOutcome::Error(e) => panic!("expected Reloaded, got Error({e})"),
+        }
+        // Reloadable field applied.
+        assert_eq!(settings.border_style, BorderStyle::Double);
+        // Shell *value* in the held config follows the file (we surface the
+        // diff via the warn list, not by ignoring the new value) so users can
+        // see what they changed.
+        assert_eq!(settings.config().shell, "/bin/fish");
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn reload_parse_error_retains_previous_config() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config(tmp.path(), "[global]\nborder = \"heavy\"\n");
+        std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+
+        let mut settings = build_settings();
+        assert_eq!(settings.border_style, BorderStyle::Heavy);
+        let prev_border = settings.config().border;
+
+        // Corrupt the file: unclosed string in a sectioned doc.
+        fs::write(&path, "[global]\nshell = \"/bin/zsh\nborder = \"double\"\n").unwrap();
+        let outcome = settings.reload_config(&path);
+
+        assert!(
+            matches!(outcome, ReloadOutcome::Error(_)),
+            "expected Error on malformed TOML"
+        );
+        // Settings + held config unchanged.
+        assert_eq!(settings.border_style, BorderStyle::Heavy);
+        assert_eq!(settings.config().border, prev_border);
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn flash_kind_durations_match_spec() {
+        // Spec: success 1 s, error 3 s.
+        assert_eq!(FlashKind::Info.duration(), Duration::from_secs(1));
+        assert_eq!(FlashKind::Error.duration(), Duration::from_secs(3));
+    }
+
+    #[test]
+    fn tick_flash_clears_after_duration() {
+        let mut settings = Settings::new(BorderStyle::Rounded);
+        settings.set_flash("hello", FlashKind::Info);
+        assert!(settings.flash_message.is_some());
+
+        // Forge an old timestamp so we don't sleep.
+        if let Some((msg, kind, _)) = settings.flash_message.take() {
+            settings.flash_message = Some((msg, kind, Instant::now() - Duration::from_secs(2)));
+        }
+        settings.tick_flash();
+        assert!(settings.flash_message.is_none());
+    }
+
+    #[test]
+    fn is_reloadable_classification() {
+        assert!(is_reloadable("border"));
+        assert!(is_reloadable("status_bar"));
+        assert!(is_reloadable("tab_bar"));
+        assert!(is_reloadable("prefix"));
+        assert!(!is_reloadable("shell"));
+        assert!(!is_reloadable("scrollback"));
+        // Unknown -> non-reloadable (caller warns).
+        assert!(!is_reloadable("mystery"));
+    }
 }

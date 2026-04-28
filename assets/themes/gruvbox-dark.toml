@@ -1,21 +1,15 @@
+[theme]
 name = "gruvbox-dark"
-description = "Retro warm dark palette inspired by morhetz/gruvbox"
-
-bg              = { r =  29, g =  32, b =  33 }
-focus_bg        = { r =  50, g =  48, b =  47 }
-lbl_fg          = { r = 235, g = 219, b = 178 }
-accent          = { r = 250, g = 189, b =  47 }
-warn_fg         = { r = 251, g =  73, b =  52 }
-sec_fg          = { r = 168, g = 153, b = 132 }
-dim_fg          = { r = 124, g = 111, b = 100 }
-div_fg          = { r =  60, g =  56, b =  54 }
-status_bg       = { r =  40, g =  40, b =  40 }
-status_fg       = { r = 235, g = 219, b = 178 }
-hint_fg         = { r = 189, g = 174, b = 147 }
-broadcast_color = { r = 254, g = 128, b =  25 }
-muted_fg        = { r = 124, g = 111, b = 100 }
-border_color    = { r = 102, g =  92, b =  84 }
-active_color    = { r = 142, g = 192, b = 124 }
-close_color     = { r = 204, g =  36, b =  29 }
-drag_color      = { r = 215, g = 153, b =  33 }
-dead_fg         = { r = 124, g = 111, b = 100 }
+fg = "#ebdbb2"
+bg = "#282828"
+border = "#665c54"
+border_active = "#83a598"
+status_bg = "#1d2021"
+status_fg = "#a89984"
+tab_active_bg = "#83a598"
+tab_active_fg = "#1d2021"
+tab_inactive_fg = "#665c54"
+selection = "#3c3836"
+search_match = "#fabd2f"
+broadcast_indicator = "#fb4934"
+copy_mode_indicator = "#b8bb26"

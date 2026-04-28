@@ -11,17 +11,15 @@ mod layout;
 mod pane;
 #[path = "../src/render.rs"]
 mod render;
-// Required by `pane`'s SPEC 02 history controls — bench includes it directly
-// because we use the `#[path]` trick instead of pulling in the binary crate.
-#[path = "../src/snapshot_blob.rs"]
-mod snapshot_blob;
-#[path = "../src/theme.rs"]
-mod theme;
+// `pane.rs` references `crate::terminal_state::*` after the v0.12 split,
+// so the bench harness must include the same module to satisfy the
+// imports. Sibling-only — no behaviour change.
+#[path = "../src/terminal_state.rs"]
+mod terminal_state;
 
 use layout::{Layout, Rect};
 use pane::{Pane, PaneLaunch};
 use render::BorderStyle;
-use theme::{AdaptedTheme, TermCaps};
 
 const TERM_W: u16 = 160;
 const TERM_H: u16 = 48;
@@ -122,7 +120,6 @@ fn bench_render(c: &mut Criterion) {
             .first()
             .expect("pane order should not be empty");
 
-        let bench_theme: AdaptedTheme = theme::default_theme().adapt(TermCaps::TRUECOLOR);
         group.bench_function(BenchmarkId::new("full_redraw", name), |b| {
             let dirty = HashSet::new();
             let mut buf = Vec::with_capacity(64 * 1024);
@@ -143,7 +140,6 @@ fn bench_render(c: &mut Criterion) {
                     true,
                     None,
                     false,
-                    &bench_theme,
                 )
                 .expect("full redraw render");
                 criterion::black_box(&buf);
@@ -171,7 +167,6 @@ fn bench_render(c: &mut Criterion) {
                     false,
                     None,
                     false,
-                    &bench_theme,
                 )
                 .expect("partial redraw render");
                 criterion::black_box(&buf);

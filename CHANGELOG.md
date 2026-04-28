@@ -9,6 +9,116 @@ Entries are written in **functional-only style**: every bullet describes an obse
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-04-28 — Multiplexer foundations + terminal protocol modernisation
+
+44-issue mega-release. Code lands as modules and self-contained
+subsystems; a subset of server runtime wiring is intentionally deferred
+to v0.12.1 (see "Deferred wiring" below).
+
+### Foundations
+- POSIX signal handling for the daemon (SIGTERM graceful save, SIGHUP
+  reload trigger, SIGCHLD reaper, SIGUSR1 state dump). Refs #56.
+- IPC protocol version handshake (`S_VERSION` / `C_HELLO` /
+  `S_INCOMPAT`) with structured incompatibility messages and a
+  legacy-client first-byte detector. Refs #57.
+- Command palette dispatch wired through a typed action vocabulary —
+  `:split-window`, `:kill-pane`, `:new-window`, `:select-pane`,
+  `:resize-pane`, `:swap-pane`, `:select-layout`, `:set-option`,
+  `:display-message`. Refs #58.
+- `src/main.rs` 3000 LOC → 137 LOC; carved into `cli.rs`, `attach.rs`,
+  `bootstrap.rs`. Refs #59.
+- `src/server.rs` 2900 LOC → 6 focused modules (`mod.rs`,
+  `connection.rs`, `input_modes.rs`, `actions.rs`, `mouse.rs`,
+  `render_glue.rs`). Refs #60.
+- Hand-rolled `key=value` parser replaced with the `toml` crate, line/
+  column-aware error messages, deprecation warning for legacy flat
+  format. Refs #61.
+- Daemon integration test harness (`tests/integration/`,
+  `EZPN_TEST_SOCKET_DIR` override). Refs #62.
+- `.ezpn.toml` env interpolation (`$VAR` / `${VAR:-default}` /
+  `${VAR:?err}`), `.env.local` merge, `${secret:KEY}` indirection
+  through a 0600-only secrets file. Refs #63.
+- Settings hot-reload via `Ctrl+B r` and SIGHUP. Atomic apply. Refs #64.
+- IPC socket security: `umask(0o077)`, post-bind chmod 0600 + UID
+  re-stat, SO_PEERCRED / LOCAL_PEERCRED, `--socket abstract` flag,
+  secrets file 0600 verification. Refs #65.
+- `tracing` + `tracing-subscriber` + `tracing-appender` daemon
+  observability with rotating logs and panic crash dumper. Refs #66.
+
+### Memory & persistence
+- vt100 strategy RFC (`docs/rfcs/0001-vt100-strategy.md`). Refs #72.
+- `[global] scrollback_bytes` + `scrollback_eviction` config keys.
+  Runtime eviction shim deferred (see below). Refs #67 #68 #71.
+- Snapshot v3 schema with optional `scrollback: Option<ScrollbackBlob>`,
+  opt-in `[global] persist_scrollback = false`, per-pane override.
+  Byte-compat with v2 readers. Refs #69.
+- `ezpn upgrade-snapshot <path> [--out PATH] [--force]` CLI. v1/v2/v3
+  reader window. Refs #70.
+
+### Terminal protocol
+- DECSET 2026 synchronized output — per-pane reference-counted bracket
+  depth, EOF force-close. Refs #73.
+- Full Kitty keyboard protocol per-pane stack. Refs #74.
+- OSC 7 cwd intercept with 30 s freshness window. Refs #75.
+- OSC 8 hyperlinks pass-through. Refs #76.
+- OSC 4 / 10 / 11 / 12 colour-query responses. Refs #77.
+- Per-pane `PaneTerminalState` consolidating bracketed-paste, focus,
+  mouse modes. Refs #78.
+- OSC 52 paste-injection guard: `[clipboard] osc52_set/get/max_bytes`
+  with `confirm` set / `deny` get defaults. Refs #79.
+- Status bar / tab bar partial-redraw helpers. Refs #80.
+
+### Scripting & UX
+- `ezpn-ctl send-keys --await-prompt` ack mode (OSC 133 D). Refs #81.
+- `ezpn-ctl events --format json` newline-delimited subscription stream.
+  Backpressure: 1000-event bounded queue. Refs #82.
+- Hooks system (`[[hooks]]`): 11 frozen v1 events, argv-array exec
+  only, 5 s timeout, async fire-and-forget. Refs #83.
+- User-defined keymap (`[keymap.<table>]`): 26-action frozen v1
+  vocabulary. Refs #84.
+- Theme system + 5 built-ins (`ezpn-dark`, `ezpn-light`,
+  `solarized-dark`, `gruvbox-dark`, `nord`). Refs #85.
+- Native fuzzy command palette (`nucleo-matcher`). Refs #86.
+- Status-bar declarative segments (`[status_bar]` left/right
+  placeholders). Refs #87.
+- `ezpn-ctl dump --pane`. Refs #88.
+- `ezpn-ctl ls --json` — frozen v1 session/tab/pane tree. Refs #89.
+
+### Polish
+- `Layout::break_pane` / `join_pane` primitives. Refs #90.
+- Named copy buffers (`BufferStore`). Cap 100 buffers / 16 MiB. Refs #91.
+- Clipboard fallback chain — `wl-copy / xclip / xsel / pbcopy`
+  detection. Refs #92.
+- Opt-in cell-grid render diff (feature `render-diff`). Refs #93.
+- Test pyramid: property + fuzz + coverage gate. Refs #94.
+- Soak test harness (`tests/soak/run.sh`). Refs #95.
+- Perf regression suite — 4 criterion benches + `bench.yml` CI gate.
+  Refs #99.
+
+### v1.0.0-rc.1 prep
+- Cut-order tracker (#96).
+- IPC SemVer freeze (`docs/protocol/v1.md`). Refs #97.
+- Documentation audit: 7 new `docs/` pages + locale README sync. Refs #98.
+
+### Deferred wiring (v0.12.1)
+The following modules ship as code but require server runtime wiring:
+DECSET 2026 host coalescer (#73), Kitty kbd flag replay (#74), OSC 52
+confirm prompt UI (#79), hook fire sites + keymap dispatch (#83 #84),
+theme/status-bar/fuzzy palette render integration (#85 #86 #87),
+OSC 133 plumbing on `Pane` + send-keys/dump/ls server handlers
+(#81 #88 #89), scrollback shim runtime + buffer hookup + status/tabs
+dirty producers + event bus producers (#67 #68 #71 #91 #92 #80 #82).
+
+### Note on history
+This release was developed on a fork of v0.5.0 in parallel with the
+v0.6 → v0.11.1 mainline. Where the two diverged on the same issue
+spec (hooks, send-keys, events, keymap, theme, palette), the v0.12.0
+implementation supersedes the v0.6–v0.11 attempts. Snapshot v1/v2
+files continue to load via the `ezpn upgrade-snapshot` migration path.
+
+### Test totals
+- **405 tests passing** (380 main bin + 25 ezpn-ctl bin), 0 failed.
+
 ## [0.11.1] — 2026-04-26 — Security & correctness hotfixes
 
 ### Security

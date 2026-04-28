@@ -1,0 +1,38 @@
+[package]
+name = "ezpn-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+
+# Path-mounted: we copy the source files we want to fuzz directly via
+# `#[path]` inside the targets so the fuzz crate stays free of `ezpn`'s
+# transitive deps (portable-pty, crossterm, etc.). Each fuzz target
+# declares only what it needs.
+
+[workspace]
+# Standalone — not a member of the parent workspace.
+
+# `cargo fuzz` requires release-mode debug for sanitizer integration.
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "protocol_decode"
+path = "fuzz_targets/protocol_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snapshot_decode"
+path = "fuzz_targets/snapshot_decode.rs"
+test = false
+doc = false
+bench = false

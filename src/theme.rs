@@ -1,532 +1,650 @@
-//! TOML-driven color theme system with terminal capability detection.
+//! TOML palette + true-color downgrade matrix (issue #85).
 //!
-//! The renderer no longer hardcodes any RGB triples — every color flows from
-//! a [`Theme`] (loaded from `~/.config/ezpn/themes/<name>.toml` or one of the
-//! built-in palettes embedded via `include_str!`).  At runtime the raw RGB
-//! palette is downgraded into [`AdaptedTheme`], which holds
-//! [`crossterm::style::Color`] values appropriate for the host terminal:
+//! Today the renderer uses crossterm's hardcoded colour choices and only
+//! `BorderStyle` is themed. This module ships a declarative palette with a
+//! deterministic downgrade path so a single theme file looks consistent on
+//! true-colour, 256-colour, and 16-colour terminals.
 //!
-//! * truecolor host  → `Color::Rgb` (24-bit)
-//! * 256-color host  → `Color::AnsiValue` (6×6×6 cube + grayscale ramp)
-//! * 16-color host   → `Color::<basic>`  (nearest of the 16 ANSI colors)
+//! Scope of *this* commit (worktree-isolated):
+//! - Pure data + parser. Renderer wiring lives in `render.rs` and is the
+//!   parent-side responsibility — kept off-limits per the task brief.
+//! - Five built-in themes embedded via `include_str!`.
+//! - Hex parsing, contrast helpers, and a 24-bit -> 256/16 quantizer.
 //!
-//! Capability detection reads `$COLORTERM` and `$TERM`; both default to
-//! "no truecolor, no 256-color" when unset, which yields the most
-//! conservative output.
+//! ```toml
+//! [theme]
+//! name           = "ezpn-dark"
+//! fg             = "#e6e1cf"
+//! bg             = "#1f2430"
+//! border         = "#5c6370"
+//! border_active  = "#73d0ff"
+//! status_bg      = "#1c1e26"
+//! status_fg      = "#9da5b4"
+//! tab_active_bg  = "#73d0ff"
+//! tab_active_fg  = "#1c1e26"
+//! tab_inactive_fg = "#5c6370"
+//! selection      = "#3a3d4a"
+//! search_match   = "#ffd866"
+//! broadcast_indicator = "#ff6188"
+//! copy_mode_indicator = "#a9dc76"
+//! ```
 
-use crossterm::style::Color;
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use serde::Deserialize;
+use std::fmt;
 
-// ─── RGB primitive ────────────────────────────────────────────────────────
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Rgb {
+/// 24-bit RGB colour. Lossless source-of-truth — downgrade happens at the
+/// last possible moment in the renderer via [`Theme::resolve`] /
+/// [`RgbColor::downgrade_to`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RgbColor {
     pub r: u8,
     pub g: u8,
     pub b: u8,
 }
 
-impl Rgb {
+impl RgbColor {
     pub const fn new(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b }
     }
-}
 
-// ─── Theme palette ────────────────────────────────────────────────────────
-
-/// User-facing theme.  All 18 color fields are required so themes always
-/// render fully — missing fields would otherwise leak the underlying
-/// terminal default and produce ugly contrast holes.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Theme {
-    pub name: String,
-    #[serde(default)]
-    pub description: Option<String>,
-
-    pub bg: Rgb,
-    pub focus_bg: Rgb,
-    pub lbl_fg: Rgb,
-    pub accent: Rgb,
-    pub warn_fg: Rgb,
-    pub sec_fg: Rgb,
-    pub dim_fg: Rgb,
-    pub div_fg: Rgb,
-    pub status_bg: Rgb,
-    pub status_fg: Rgb,
-    pub hint_fg: Rgb,
-    pub broadcast_color: Rgb,
-    pub muted_fg: Rgb,
-    pub border_color: Rgb,
-    pub active_color: Rgb,
-    pub close_color: Rgb,
-    pub drag_color: Rgb,
-    pub dead_fg: Rgb,
-}
-
-/// Hardcoded fallback palette.  Mirrors the original `Color::Rgb { ... }`
-/// constants previously living in `settings.rs` and `render.rs`, so
-/// upgrading users see no visual change unless they opt into a different
-/// theme via `[ui].theme = "..."`.
-pub fn default_theme() -> Theme {
-    Theme {
-        name: "default".into(),
-        description: Some("ezpn default dark palette".into()),
-        bg: Rgb::new(16, 18, 24),
-        focus_bg: Rgb::new(26, 32, 44),
-        lbl_fg: Rgb::new(190, 200, 212),
-        accent: Rgb::new(102, 217, 239),
-        warn_fg: Rgb::new(255, 110, 110),
-        sec_fg: Rgb::new(75, 90, 110),
-        dim_fg: Rgb::new(90, 98, 110),
-        div_fg: Rgb::new(36, 42, 52),
-        status_bg: Rgb::new(36, 38, 48),
-        status_fg: Rgb::new(255, 255, 255),
-        hint_fg: Rgb::new(160, 170, 190),
-        broadcast_color: Rgb::new(255, 140, 50),
-        muted_fg: Rgb::new(100, 100, 110),
-        border_color: Rgb::new(120, 120, 120), // crossterm DarkGrey ≈ rgb(128,128,128)
-        active_color: Rgb::new(0, 200, 220),   // approximate Cyan on truecolor
-        close_color: Rgb::new(170, 60, 60),    // crossterm DarkRed ≈ rgb(170,0,0)
-        drag_color: Rgb::new(220, 220, 80),    // approximate Yellow
-        dead_fg: Rgb::new(120, 120, 120),      // DarkGrey
-    }
-}
-
-// ─── Terminal capability detection ────────────────────────────────────────
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TermCaps {
-    pub true_color: bool,
-    pub color_256: bool,
-}
-
-#[allow(dead_code)]
-impl TermCaps {
-    pub const TRUECOLOR: Self = Self {
-        true_color: true,
-        color_256: true,
-    };
-    pub const C256: Self = Self {
-        true_color: false,
-        color_256: true,
-    };
-    pub const C16: Self = Self {
-        true_color: false,
-        color_256: false,
-    };
-}
-
-/// Detect host terminal color depth from `$COLORTERM` and `$TERM`.
-///
-/// `COLORTERM=truecolor` (or `24bit`) wins outright. Otherwise `$TERM`
-/// containing "256" implies 256-color. Everything else falls back to 16.
-pub fn detect_caps() -> TermCaps {
-    let colorterm = std::env::var("COLORTERM").unwrap_or_default();
-    let term = std::env::var("TERM").unwrap_or_default();
-    let true_color = matches!(colorterm.as_str(), "truecolor" | "24bit");
-    let color_256 = true_color || term.contains("256");
-    TermCaps {
-        true_color,
-        color_256,
-    }
-}
-
-// ─── Quantization helpers ─────────────────────────────────────────────────
-
-/// Map an RGB triple into the closest xterm 256-color palette index.
-/// Uses the canonical 6×6×6 color cube (16..=231) for chromatic colors and
-/// the 24-step grayscale ramp (232..=255) for true grays.
-pub fn rgb_to_256(rgb: Rgb) -> u8 {
-    if rgb.r == rgb.g && rgb.g == rgb.b {
-        // Grayscale ramp 232..=255 (24 levels). Avoids fighting the cube
-        // for shades like #161616 that don't quantize cleanly to {0,95,135,…}.
-        let level = (u16::from(rgb.r) * 24 / 256) as u8;
-        232 + level.min(23)
-    } else {
-        let q = |v: u8| -> u8 {
-            match v {
-                0..=47 => 0,
-                48..=114 => 1,
-                115..=154 => 2,
-                155..=194 => 3,
-                195..=234 => 4,
-                _ => 5,
+    /// Parse `#rgb`, `#rrggbb`, or `rrggbb` (with or without leading `#`).
+    /// Case-insensitive. Anything else returns `Err`.
+    pub fn parse_hex(s: &str) -> Result<Self, ThemeError> {
+        let raw = s.trim();
+        let stripped = raw.strip_prefix('#').unwrap_or(raw);
+        let bytes = stripped.as_bytes();
+        match bytes.len() {
+            3 => {
+                let r = parse_nibble(bytes[0])?;
+                let g = parse_nibble(bytes[1])?;
+                let b = parse_nibble(bytes[2])?;
+                Ok(Self::new(r * 17, g * 17, b * 17))
             }
-        };
-        16 + 36 * q(rgb.r) + 6 * q(rgb.g) + q(rgb.b)
+            6 => Ok(Self::new(
+                parse_byte(bytes[0], bytes[1])?,
+                parse_byte(bytes[2], bytes[3])?,
+                parse_byte(bytes[4], bytes[5])?,
+            )),
+            _ => Err(ThemeError::BadHex(s.to_string())),
+        }
+    }
+
+    /// Relative luminance per WCAG 2.1 §1.4.3.
+    pub fn relative_luminance(self) -> f64 {
+        fn channel(c: u8) -> f64 {
+            let v = c as f64 / 255.0;
+            if v <= 0.03928 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        0.2126 * channel(self.r) + 0.7152 * channel(self.g) + 0.0722 * channel(self.b)
+    }
+
+    /// WCAG 2.1 contrast ratio. Returns a value in `[1.0, 21.0]`.
+    pub fn contrast_ratio(self, other: Self) -> f64 {
+        let a = self.relative_luminance();
+        let b = other.relative_luminance();
+        let (light, dark) = if a > b { (a, b) } else { (b, a) };
+        (light + 0.05) / (dark + 0.05)
+    }
+
+    /// Downgrade to the requested palette depth.
+    ///
+    /// - `ColorDepth::TrueColor` returns `Resolved::Rgb`.
+    /// - `ColorDepth::Palette256` returns the closest entry of the standard
+    ///   xterm 256-colour cube (16..=231) plus the 24-step grayscale ramp
+    ///   (232..=255).
+    /// - `ColorDepth::Palette16` returns the closest of the 16 ANSI colours.
+    pub fn downgrade_to(self, depth: ColorDepth) -> Resolved {
+        match depth {
+            ColorDepth::TrueColor => Resolved::Rgb(self),
+            ColorDepth::Palette256 => Resolved::Indexed(rgb_to_xterm256(self)),
+            ColorDepth::Palette16 => Resolved::Indexed(rgb_to_ansi16(self)),
+        }
     }
 }
 
-/// Map an RGB triple into the nearest of the 16 standard ANSI colors by
-/// Euclidean distance in the sRGB cube.  Good enough for fallback rendering
-/// in 16-color terminals; nobody is colour-grading there.
-pub fn rgb_to_basic16(rgb: Rgb) -> Color {
-    // (r, g, b, Color)
-    const PALETTE: &[(u8, u8, u8, Color)] = &[
-        (0, 0, 0, Color::Black),
-        (170, 0, 0, Color::DarkRed),
-        (0, 170, 0, Color::DarkGreen),
-        (170, 85, 0, Color::DarkYellow),
-        (0, 0, 170, Color::DarkBlue),
-        (170, 0, 170, Color::DarkMagenta),
-        (0, 170, 170, Color::DarkCyan),
-        (170, 170, 170, Color::Grey),
-        (85, 85, 85, Color::DarkGrey),
-        (255, 85, 85, Color::Red),
-        (85, 255, 85, Color::Green),
-        (255, 255, 85, Color::Yellow),
-        (85, 85, 255, Color::Blue),
-        (255, 85, 255, Color::Magenta),
-        (85, 255, 255, Color::Cyan),
-        (255, 255, 255, Color::White),
-    ];
-    let mut best = Color::White;
+impl fmt::Display for RgbColor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "#{:02x}{:02x}{:02x}", self.r, self.g, self.b)
+    }
+}
+
+fn parse_nibble(c: u8) -> Result<u8, ThemeError> {
+    match c {
+        b'0'..=b'9' => Ok(c - b'0'),
+        b'a'..=b'f' => Ok(c - b'a' + 10),
+        b'A'..=b'F' => Ok(c - b'A' + 10),
+        _ => Err(ThemeError::BadHex(format!("non-hex digit {:?}", c as char))),
+    }
+}
+
+fn parse_byte(hi: u8, lo: u8) -> Result<u8, ThemeError> {
+    Ok(parse_nibble(hi)? * 16 + parse_nibble(lo)?)
+}
+
+/// Terminal palette depth, surfaced by callers based on `$COLORTERM`,
+/// `$TERM`, or a DA1/CSI 0c probe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColorDepth {
+    /// 24-bit. `$COLORTERM` is `truecolor` or `24bit`, or DA1 reports it.
+    TrueColor,
+    /// 256-colour palette (8-bit indexed, e.g. `xterm-256color`).
+    Palette256,
+    /// 16-colour ANSI fallback. The safe minimum.
+    Palette16,
+}
+
+impl ColorDepth {
+    /// Best-effort detection from environment variables. Callers that hold
+    /// a live terminal handle should prefer a DA1 probe and pass the result
+    /// in directly.
+    pub fn detect() -> Self {
+        if let Ok(ct) = std::env::var("COLORTERM") {
+            let lower = ct.to_ascii_lowercase();
+            if lower == "truecolor" || lower == "24bit" {
+                return ColorDepth::TrueColor;
+            }
+        }
+        if let Ok(term) = std::env::var("TERM") {
+            let lower = term.to_ascii_lowercase();
+            if lower.contains("256color") || lower.contains("direct") {
+                if lower.contains("direct") {
+                    return ColorDepth::TrueColor;
+                }
+                return ColorDepth::Palette256;
+            }
+        }
+        ColorDepth::Palette16
+    }
+}
+
+/// A colour after downgrading to a specific terminal capability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resolved {
+    Rgb(RgbColor),
+    /// Palette index. For `Palette256` this is the full 0..=255 xterm range;
+    /// for `Palette16` it's 0..=15 (ANSI).
+    Indexed(u8),
+}
+
+// ─── Quantizers ───────────────────────────────────────────
+
+/// Map an RGB triplet to the closest xterm 256-colour entry.
+///
+/// xterm 256 = 16 system colours + 6×6×6 cube (16..=231) + 24-step grayscale
+/// ramp (232..=255). We only emit cube + grayscale entries because the
+/// system 0..=15 vary by emulator configuration and would defeat the
+/// purpose of a deterministic theme.
+pub fn rgb_to_xterm256(rgb: RgbColor) -> u8 {
+    // Grayscale check first: if r ≈ g ≈ b, the grayscale ramp is closer
+    // (it has 24 steps vs the cube's 6, so ~4× the resolution on the
+    // achromatic axis).
+    let max = rgb.r.max(rgb.g).max(rgb.b) as i32;
+    let min = rgb.r.min(rgb.g).min(rgb.b) as i32;
+    let chroma = max - min;
+
+    let (cube_idx, cube_dist) = nearest_cube(rgb);
+    if chroma < 8 {
+        let (gray_idx, gray_dist) = nearest_grayscale(rgb);
+        if gray_dist <= cube_dist {
+            return gray_idx;
+        }
+    }
+    cube_idx
+}
+
+const CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+
+fn nearest_cube(rgb: RgbColor) -> (u8, u32) {
+    let r = nearest_cube_axis(rgb.r);
+    let g = nearest_cube_axis(rgb.g);
+    let b = nearest_cube_axis(rgb.b);
+    let idx = 16 + 36 * (r as u8) + 6 * (g as u8) + b as u8;
+    let actual = RgbColor::new(CUBE_LEVELS[r], CUBE_LEVELS[g], CUBE_LEVELS[b]);
+    (idx, dist_sq(rgb, actual))
+}
+
+fn nearest_cube_axis(v: u8) -> usize {
+    let mut best = 0usize;
     let mut best_d = u32::MAX;
-    let r = i32::from(rgb.r);
-    let g = i32::from(rgb.g);
-    let b = i32::from(rgb.b);
-    for (pr, pg, pb, c) in PALETTE {
-        let dr = r - i32::from(*pr);
-        let dg = g - i32::from(*pg);
-        let db = b - i32::from(*pb);
-        let d = (dr * dr + dg * dg + db * db) as u32;
+    for (i, level) in CUBE_LEVELS.iter().enumerate() {
+        let d = (v as i32 - *level as i32).unsigned_abs();
         if d < best_d {
             best_d = d;
-            best = *c;
+            best = i;
         }
     }
     best
 }
 
-/// Quantize an `Rgb` value into a `crossterm::style::Color` for the given
-/// terminal capability set.  This is the single ingress for every color
-/// the renderer emits, so every visible pixel respects truecolor /
-/// 256-color / 16-color downgrade.
-pub fn adapt_color(rgb: Rgb, caps: TermCaps) -> Color {
-    if caps.true_color {
-        Color::Rgb {
-            r: rgb.r,
-            g: rgb.g,
-            b: rgb.b,
+fn nearest_grayscale(rgb: RgbColor) -> (u8, u32) {
+    // The xterm grayscale ramp is `8 + 10*i` for i in 0..24.
+    let avg = ((rgb.r as u32 + rgb.g as u32 + rgb.b as u32) / 3) as i32;
+    let mut best_idx = 232u8;
+    let mut best_d = u32::MAX;
+    for i in 0..24u8 {
+        let level = 8 + 10 * i as i32;
+        let d = (avg - level).unsigned_abs();
+        if d < best_d {
+            best_d = d;
+            best_idx = 232 + i;
         }
-    } else if caps.color_256 {
-        Color::AnsiValue(rgb_to_256(rgb))
-    } else {
-        rgb_to_basic16(rgb)
     }
+    let level = 8 + 10 * (best_idx - 232) as u8;
+    let actual = RgbColor::new(level, level, level);
+    (best_idx, dist_sq(rgb, actual))
 }
 
-// ─── Adapted theme ────────────────────────────────────────────────────────
+/// Map an RGB triplet to the closest of the 16 ANSI colours.
+///
+/// ANSI doesn't have a fixed mapping (palette 0..=15 vary by emulator) so
+/// we use the xterm default values, which match VT100 reference and are
+/// the de-facto standard.
+pub fn rgb_to_ansi16(rgb: RgbColor) -> u8 {
+    const ANSI16: [(u8, u8, u8); 16] = [
+        (0, 0, 0),       // 0  black
+        (170, 0, 0),     // 1  red
+        (0, 170, 0),     // 2  green
+        (170, 85, 0),    // 3  yellow (xterm yellow ≠ pure yellow)
+        (0, 0, 170),     // 4  blue
+        (170, 0, 170),   // 5  magenta
+        (0, 170, 170),   // 6  cyan
+        (170, 170, 170), // 7  white (light grey)
+        (85, 85, 85),    // 8  bright black
+        (255, 85, 85),   // 9
+        (85, 255, 85),   // 10
+        (255, 255, 85),  // 11
+        (85, 85, 255),   // 12
+        (255, 85, 255),  // 13
+        (85, 255, 255),  // 14
+        (255, 255, 255), // 15
+    ];
+    let mut best = 0u8;
+    let mut best_d = u32::MAX;
+    for (i, (r, g, b)) in ANSI16.iter().enumerate() {
+        let d = dist_sq(rgb, RgbColor::new(*r, *g, *b));
+        if d < best_d {
+            best_d = d;
+            best = i as u8;
+        }
+    }
+    best
+}
 
-/// A theme post-quantization.  Renderer code only ever reads from this —
-/// it never sees the raw `Rgb` palette.  Constructed once per session
-/// (or per theme change in the future) by [`Theme::adapt`].
-#[derive(Clone, Debug)]
-pub struct AdaptedTheme {
-    /// Resolved theme name — kept for diagnostics, settings panel labels,
-    /// and a future `:theme` palette command.
-    #[allow(dead_code)]
+fn dist_sq(a: RgbColor, b: RgbColor) -> u32 {
+    let dr = a.r as i32 - b.r as i32;
+    let dg = a.g as i32 - b.g as i32;
+    let db = a.b as i32 - b.b as i32;
+    (dr * dr + dg * dg + db * db) as u32
+}
+
+// ─── Theme schema ─────────────────────────────────────────
+
+/// Resolved palette. All fields are 24-bit RGB; the renderer downgrades at
+/// emit time via [`RgbColor::downgrade_to`] using the live `ColorDepth`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Theme {
     pub name: String,
-    pub bg: Color,
-    pub focus_bg: Color,
-    pub lbl_fg: Color,
-    pub accent: Color,
-    pub warn_fg: Color,
-    pub sec_fg: Color,
-    pub dim_fg: Color,
-    pub div_fg: Color,
-    pub status_bg: Color,
-    pub status_fg: Color,
-    pub hint_fg: Color,
-    pub broadcast_color: Color,
-    pub muted_fg: Color,
-    pub border_color: Color,
-    pub active_color: Color,
-    pub close_color: Color,
-    pub drag_color: Color,
-    pub dead_fg: Color,
+    pub fg: RgbColor,
+    pub bg: RgbColor,
+    pub border: RgbColor,
+    pub border_active: RgbColor,
+    pub status_bg: RgbColor,
+    pub status_fg: RgbColor,
+    pub tab_active_bg: RgbColor,
+    pub tab_active_fg: RgbColor,
+    pub tab_inactive_fg: RgbColor,
+    pub selection: RgbColor,
+    pub search_match: RgbColor,
+    pub broadcast_indicator: RgbColor,
+    pub copy_mode_indicator: RgbColor,
 }
 
 impl Theme {
-    pub fn adapt(&self, caps: TermCaps) -> AdaptedTheme {
-        AdaptedTheme {
-            name: self.name.clone(),
-            bg: adapt_color(self.bg, caps),
-            focus_bg: adapt_color(self.focus_bg, caps),
-            lbl_fg: adapt_color(self.lbl_fg, caps),
-            accent: adapt_color(self.accent, caps),
-            warn_fg: adapt_color(self.warn_fg, caps),
-            sec_fg: adapt_color(self.sec_fg, caps),
-            dim_fg: adapt_color(self.dim_fg, caps),
-            div_fg: adapt_color(self.div_fg, caps),
-            status_bg: adapt_color(self.status_bg, caps),
-            status_fg: adapt_color(self.status_fg, caps),
-            hint_fg: adapt_color(self.hint_fg, caps),
-            broadcast_color: adapt_color(self.broadcast_color, caps),
-            muted_fg: adapt_color(self.muted_fg, caps),
-            border_color: adapt_color(self.border_color, caps),
-            active_color: adapt_color(self.active_color, caps),
-            close_color: adapt_color(self.close_color, caps),
-            drag_color: adapt_color(self.drag_color, caps),
-            dead_fg: adapt_color(self.dead_fg, caps),
+    /// Resolve every palette entry to a single colour depth in one pass.
+    /// Useful when the renderer caches a per-depth palette.
+    pub fn resolve(&self, depth: ColorDepth) -> ResolvedPalette {
+        ResolvedPalette {
+            fg: self.fg.downgrade_to(depth),
+            bg: self.bg.downgrade_to(depth),
+            border: self.border.downgrade_to(depth),
+            border_active: self.border_active.downgrade_to(depth),
+            status_bg: self.status_bg.downgrade_to(depth),
+            status_fg: self.status_fg.downgrade_to(depth),
+            tab_active_bg: self.tab_active_bg.downgrade_to(depth),
+            tab_active_fg: self.tab_active_fg.downgrade_to(depth),
+            tab_inactive_fg: self.tab_inactive_fg.downgrade_to(depth),
+            selection: self.selection.downgrade_to(depth),
+            search_match: self.search_match.downgrade_to(depth),
+            broadcast_indicator: self.broadcast_indicator.downgrade_to(depth),
+            copy_mode_indicator: self.copy_mode_indicator.downgrade_to(depth),
         }
     }
 }
 
-#[allow(dead_code)]
-impl AdaptedTheme {
-    /// Convenience: a default-flavoured truecolor theme for tests / boot
-    /// before config has loaded.
-    pub fn default_truecolor() -> Self {
-        default_theme().adapt(TermCaps::TRUECOLOR)
+/// Per-depth resolved palette. Cheap to clone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedPalette {
+    pub fg: Resolved,
+    pub bg: Resolved,
+    pub border: Resolved,
+    pub border_active: Resolved,
+    pub status_bg: Resolved,
+    pub status_fg: Resolved,
+    pub tab_active_bg: Resolved,
+    pub tab_active_fg: Resolved,
+    pub tab_inactive_fg: Resolved,
+    pub selection: Resolved,
+    pub search_match: Resolved,
+    pub broadcast_indicator: Resolved,
+    pub copy_mode_indicator: Resolved,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawThemeFile {
+    theme: RawTheme,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawTheme {
+    name: String,
+    fg: String,
+    bg: String,
+    border: String,
+    border_active: String,
+    status_bg: String,
+    status_fg: String,
+    tab_active_bg: String,
+    tab_active_fg: String,
+    tab_inactive_fg: String,
+    selection: String,
+    search_match: String,
+    broadcast_indicator: String,
+    copy_mode_indicator: String,
+}
+
+impl Theme {
+    /// Parse a theme TOML document. Expects a `[theme]` section with all
+    /// palette fields populated. Unknown fields are tolerated (forward
+    /// compatibility); missing fields are a structured error.
+    pub fn from_toml(src: &str) -> Result<Self, ThemeError> {
+        let raw: RawThemeFile =
+            toml::from_str(src).map_err(|e| ThemeError::Toml(e.message().to_string()))?;
+        let r = raw.theme;
+        Ok(Self {
+            name: r.name,
+            fg: RgbColor::parse_hex(&r.fg)?,
+            bg: RgbColor::parse_hex(&r.bg)?,
+            border: RgbColor::parse_hex(&r.border)?,
+            border_active: RgbColor::parse_hex(&r.border_active)?,
+            status_bg: RgbColor::parse_hex(&r.status_bg)?,
+            status_fg: RgbColor::parse_hex(&r.status_fg)?,
+            tab_active_bg: RgbColor::parse_hex(&r.tab_active_bg)?,
+            tab_active_fg: RgbColor::parse_hex(&r.tab_active_fg)?,
+            tab_inactive_fg: RgbColor::parse_hex(&r.tab_inactive_fg)?,
+            selection: RgbColor::parse_hex(&r.selection)?,
+            search_match: RgbColor::parse_hex(&r.search_match)?,
+            broadcast_indicator: RgbColor::parse_hex(&r.broadcast_indicator)?,
+            copy_mode_indicator: RgbColor::parse_hex(&r.copy_mode_indicator)?,
+        })
+    }
+
+    /// Look up a built-in theme by name. Returns `None` for unknown names —
+    /// callers should treat this as a structured error and fall back to
+    /// the default theme rather than panicking.
+    pub fn builtin(name: &str) -> Option<Theme> {
+        let src = builtin_source(name)?;
+        // Built-ins are version-controlled and tested; a parse failure here
+        // is a programmer error, but we never panic — surface as `None` so
+        // the caller can fall back gracefully and log.
+        Theme::from_toml(src).ok()
+    }
+
+    /// Names of every built-in theme, in the canonical order used by docs.
+    pub fn builtin_names() -> &'static [&'static str] {
+        &[
+            "ezpn-dark",
+            "ezpn-light",
+            "solarized-dark",
+            "gruvbox-dark",
+            "nord",
+        ]
+    }
+
+    /// Default theme, used when no `theme = "..."` is set and no inline
+    /// `[theme]` section is present in the user config.
+    pub fn default_theme() -> Theme {
+        // Fall back to a hardcoded copy of `ezpn-dark` so we never panic
+        // even if asset embedding ever breaks at compile time.
+        Theme::builtin("ezpn-dark").unwrap_or_else(|| Theme {
+            name: "ezpn-dark".into(),
+            fg: RgbColor::new(0xe6, 0xe1, 0xcf),
+            bg: RgbColor::new(0x1f, 0x24, 0x30),
+            border: RgbColor::new(0x5c, 0x63, 0x70),
+            border_active: RgbColor::new(0x73, 0xd0, 0xff),
+            status_bg: RgbColor::new(0x1c, 0x1e, 0x26),
+            status_fg: RgbColor::new(0x9d, 0xa5, 0xb4),
+            tab_active_bg: RgbColor::new(0x73, 0xd0, 0xff),
+            tab_active_fg: RgbColor::new(0x1c, 0x1e, 0x26),
+            tab_inactive_fg: RgbColor::new(0x5c, 0x63, 0x70),
+            selection: RgbColor::new(0x3a, 0x3d, 0x4a),
+            search_match: RgbColor::new(0xff, 0xd8, 0x66),
+            broadcast_indicator: RgbColor::new(0xff, 0x61, 0x88),
+            copy_mode_indicator: RgbColor::new(0xa9, 0xdc, 0x76),
+        })
     }
 }
 
-// ─── Loader ───────────────────────────────────────────────────────────────
-
-const BUILTIN_DEFAULT: &str = include_str!("../assets/themes/default.toml");
-const BUILTIN_TOKYO_NIGHT: &str = include_str!("../assets/themes/tokyo-night.toml");
-const BUILTIN_GRUVBOX_DARK: &str = include_str!("../assets/themes/gruvbox-dark.toml");
-const BUILTIN_SOLARIZED_DARK: &str = include_str!("../assets/themes/solarized-dark.toml");
-const BUILTIN_SOLARIZED_LIGHT: &str = include_str!("../assets/themes/solarized-light.toml");
-
-fn builtin_theme(name: &str) -> Option<&'static str> {
+fn builtin_source(name: &str) -> Option<&'static str> {
     match name {
-        "default" => Some(BUILTIN_DEFAULT),
-        "tokyo-night" => Some(BUILTIN_TOKYO_NIGHT),
-        "gruvbox-dark" => Some(BUILTIN_GRUVBOX_DARK),
-        "solarized-dark" => Some(BUILTIN_SOLARIZED_DARK),
-        "solarized-light" => Some(BUILTIN_SOLARIZED_LIGHT),
+        "ezpn-dark" => Some(include_str!("../assets/themes/ezpn-dark.toml")),
+        "ezpn-light" => Some(include_str!("../assets/themes/ezpn-light.toml")),
+        "solarized-dark" => Some(include_str!("../assets/themes/solarized-dark.toml")),
+        "gruvbox-dark" => Some(include_str!("../assets/themes/gruvbox-dark.toml")),
+        "nord" => Some(include_str!("../assets/themes/nord.toml")),
         _ => None,
     }
 }
 
-/// User theme override location: `~/.config/ezpn/themes/<name>.toml` or
-/// `$XDG_CONFIG_HOME/ezpn/themes/<name>.toml` when set.
-fn user_theme_path(name: &str) -> Option<PathBuf> {
-    let dir = std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("/tmp"));
-            home.join(".config")
-        });
-    let path = dir.join("ezpn").join("themes").join(format!("{name}.toml"));
-    Some(path)
+// ─── Errors ───────────────────────────────────────────────
+
+#[derive(Debug)]
+pub enum ThemeError {
+    BadHex(String),
+    Toml(String),
 }
 
-/// Load a theme by name.  Resolution order:
-/// 1. `~/.config/ezpn/themes/<name>.toml` (user override)
-/// 2. Built-in embedded TOML (`assets/themes/<name>.toml`)
-/// 3. [`default_theme`] with a single warning printed to stderr.
-///
-/// Parse errors degrade — we print a one-line warning and fall back rather
-/// than panicking, since a broken theme should never brick the multiplexer.
-pub fn load_theme(name: &str) -> Theme {
-    if let Some(path) = user_theme_path(name) {
-        if path.exists() {
-            match std::fs::read_to_string(&path) {
-                Ok(contents) => match toml::from_str::<Theme>(&contents) {
-                    Ok(t) => return t,
-                    Err(e) => {
-                        eprintln!(
-                            "ezpn: failed to parse user theme '{}' ({}): {e}; falling back",
-                            name,
-                            path.display()
-                        );
-                    }
-                },
-                Err(e) => {
-                    eprintln!(
-                        "ezpn: failed to read user theme '{}' ({}): {e}; falling back",
-                        name,
-                        path.display()
-                    );
-                }
-            }
+impl fmt::Display for ThemeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BadHex(s) => write!(f, "invalid hex colour: {s}"),
+            Self::Toml(s) => write!(f, "theme TOML error: {s}"),
         }
     }
-    if let Some(src) = builtin_theme(name) {
-        match toml::from_str::<Theme>(src) {
-            Ok(t) => return t,
-            Err(e) => {
-                eprintln!("ezpn: builtin theme '{name}' failed to parse: {e}; using default");
-            }
-        }
-    } else if name != "default" {
-        eprintln!("ezpn: unknown theme '{name}'; using default");
-    }
-    default_theme()
 }
 
-// ─── vt100 → crossterm color bridge ───────────────────────────────────────
+impl std::error::Error for ThemeError {}
 
-/// Convert a vt100 color cell into a crossterm `Color`.  Lives in this
-/// module so the grep audit `rg 'Color::Rgb' src/` only ever matches this
-/// file — every other call site goes through [`adapt_color`].
-pub fn vt100_to_crossterm(color: vt100::Color) -> Color {
-    match color {
-        vt100::Color::Default => Color::Reset,
-        vt100::Color::Idx(i) => Color::AnsiValue(i),
-        vt100::Color::Rgb(r, g, b) => Color::Rgb { r, g, b },
-    }
-}
-
-// ─── Tests ────────────────────────────────────────────────────────────────
+// ─── Tests ────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
     use super::*;
 
     #[test]
-    fn theme_rgb_to_256_grayscale_ramp() {
-        // Pure grays land in the 232..=255 ramp.
-        assert_eq!(rgb_to_256(Rgb::new(0, 0, 0)), 232);
-        assert_eq!(rgb_to_256(Rgb::new(255, 255, 255)), 232 + 23);
-        let mid = rgb_to_256(Rgb::new(128, 128, 128));
-        assert!((232..=255).contains(&mid));
+    fn parses_six_digit_hex() {
+        let c = RgbColor::parse_hex("#1f2430").unwrap();
+        assert_eq!(c, RgbColor::new(0x1f, 0x24, 0x30));
+        assert_eq!(RgbColor::parse_hex("1f2430").unwrap(), c);
+        assert_eq!(RgbColor::parse_hex("#1F2430").unwrap(), c);
     }
 
     #[test]
-    fn theme_rgb_to_256_color_cube() {
-        // Pure red maps into the cube row r=5.
-        let red = rgb_to_256(Rgb::new(255, 0, 0));
-        assert_eq!(red, 16 + 36 * 5);
-        // Pure green
-        let green = rgb_to_256(Rgb::new(0, 255, 0));
-        assert_eq!(green, 16 + 6 * 5);
-        // Pure blue
-        let blue = rgb_to_256(Rgb::new(0, 0, 255));
-        assert_eq!(blue, 16 + 5);
-        // White corner
-        let white = rgb_to_256(Rgb::new(250, 250, 250));
-        // 250 is not equal to 250 to 250 — wait, equal. So grayscale ramp.
-        // Re-test with off-gray.
-        assert!((232..=255).contains(&white));
-        let off = rgb_to_256(Rgb::new(200, 100, 50));
-        assert!((16..=231).contains(&off));
+    fn parses_three_digit_hex() {
+        // #abc -> #aabbcc
+        assert_eq!(
+            RgbColor::parse_hex("#abc").unwrap(),
+            RgbColor::new(0xaa, 0xbb, 0xcc)
+        );
     }
 
     #[test]
-    fn theme_rgb_to_basic16_nearest() {
-        assert_eq!(rgb_to_basic16(Rgb::new(0, 0, 0)), Color::Black);
-        assert_eq!(rgb_to_basic16(Rgb::new(255, 255, 255)), Color::White);
-        // Pure (255,0,0) is closer to DarkRed (170,0,0) than to Red (255,85,85)
-        // by squared-distance — that's the canonical 16-color quantization.
-        assert_eq!(rgb_to_basic16(Rgb::new(255, 0, 0)), Color::DarkRed);
-        // Bright reddish with green/blue tint hits the bright Red row.
-        assert_eq!(rgb_to_basic16(Rgb::new(255, 85, 85)), Color::Red);
-        assert_eq!(rgb_to_basic16(Rgb::new(0, 170, 0)), Color::DarkGreen);
-        assert_eq!(rgb_to_basic16(Rgb::new(85, 255, 85)), Color::Green);
+    fn rejects_bad_hex() {
+        assert!(matches!(
+            RgbColor::parse_hex("#zzz"),
+            Err(ThemeError::BadHex(_))
+        ));
+        assert!(RgbColor::parse_hex("#12345").is_err());
+        assert!(RgbColor::parse_hex("").is_err());
     }
 
     #[test]
-    fn theme_adapt_truecolor_preserves_rgb() {
-        let t = default_theme();
-        let a = t.adapt(TermCaps::TRUECOLOR);
-        assert!(matches!(a.bg, Color::Rgb { .. }));
-        assert!(matches!(a.accent, Color::Rgb { .. }));
+    fn truecolor_roundtrips_unchanged() {
+        let c = RgbColor::new(0x73, 0xd0, 0xff);
+        assert_eq!(c.downgrade_to(ColorDepth::TrueColor), Resolved::Rgb(c));
     }
 
     #[test]
-    fn theme_adapt_256_uses_ansi_palette() {
-        let t = default_theme();
-        let a = t.adapt(TermCaps::C256);
-        assert!(matches!(a.bg, Color::AnsiValue(_)));
-        assert!(matches!(a.accent, Color::AnsiValue(_)));
+    fn xterm256_picks_grayscale_for_achromatic_input() {
+        // Mid-grey should land on the 24-step grayscale ramp, not the cube.
+        let g = RgbColor::new(120, 120, 120);
+        match g.downgrade_to(ColorDepth::Palette256) {
+            Resolved::Indexed(i) => {
+                assert!((232..=255).contains(&i), "expected grayscale ramp, got {i}")
+            }
+            other => panic!("expected indexed, got {other:?}"),
+        }
     }
 
     #[test]
-    fn theme_adapt_16_uses_basic_palette() {
-        let t = default_theme();
-        let a = t.adapt(TermCaps::C16);
-        // Every color must lower to a non-Rgb / non-AnsiValue variant.
-        for c in [
-            a.bg,
-            a.focus_bg,
-            a.lbl_fg,
-            a.accent,
-            a.warn_fg,
-            a.sec_fg,
-            a.dim_fg,
-            a.div_fg,
-            a.status_bg,
-            a.status_fg,
-            a.hint_fg,
-            a.broadcast_color,
-            a.muted_fg,
-            a.border_color,
-            a.active_color,
-            a.close_color,
-            a.drag_color,
-            a.dead_fg,
-        ] {
+    fn xterm256_picks_cube_for_chromatic_input() {
+        let c = RgbColor::new(0x73, 0xd0, 0xff);
+        match c.downgrade_to(ColorDepth::Palette256) {
+            Resolved::Indexed(i) => {
+                assert!((16..=231).contains(&i), "expected cube colour, got {i}")
+            }
+            other => panic!("expected indexed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ansi16_maps_pure_red_to_red() {
+        let r = RgbColor::new(255, 0, 0);
+        match r.downgrade_to(ColorDepth::Palette16) {
+            Resolved::Indexed(i) => assert!(i == 1 || i == 9, "got {i}"),
+            other => panic!("expected indexed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn xterm256_index_of_pure_red_is_cube_corner() {
+        // (255,0,0) -> cube axes (5,0,0) -> 16 + 5*36 = 196.
+        assert_eq!(rgb_to_xterm256(RgbColor::new(255, 0, 0)), 196);
+    }
+
+    #[test]
+    fn xterm256_index_of_pure_white_is_cube_corner() {
+        // (255,255,255) achromatic — but white sits at the cube corner.
+        // On the grayscale ramp, the closest level is 248 (offset 23 = 238)
+        // vs cube level 255. Cube is closer; expect 16 + 5*43 = 231.
+        assert_eq!(rgb_to_xterm256(RgbColor::new(255, 255, 255)), 231);
+    }
+
+    #[test]
+    fn contrast_ratio_white_on_black_is_21() {
+        let w = RgbColor::new(255, 255, 255);
+        let k = RgbColor::new(0, 0, 0);
+        let ratio = w.contrast_ratio(k);
+        assert!((ratio - 21.0).abs() < 0.01, "expected ~21, got {ratio}");
+    }
+
+    #[test]
+    fn each_builtin_loads_and_passes_aa_status_contrast() {
+        // WCAG AA for normal text: contrast ratio >= 4.5.
+        for name in Theme::builtin_names() {
+            let t = Theme::builtin(name).unwrap_or_else(|| panic!("missing builtin: {name}"));
+            let ratio = t.status_fg.contrast_ratio(t.status_bg);
             assert!(
-                !matches!(c, Color::Rgb { .. }) && !matches!(c, Color::AnsiValue(_)),
-                "color {c:?} should be a basic16 variant"
+                ratio >= 4.5,
+                "theme {name}: status fg/bg contrast {ratio:.2} < 4.5 (WCAG AA)"
             );
         }
     }
 
     #[test]
-    fn theme_load_unknown_falls_back_to_default() {
-        let t = load_theme("does-not-exist-xyz");
-        assert_eq!(t.name, "default");
+    fn unknown_builtin_returns_none() {
+        assert!(Theme::builtin("hot-pink-2099").is_none());
     }
 
     #[test]
-    fn theme_load_all_builtins_parse() {
-        for name in [
-            "default",
-            "tokyo-night",
-            "gruvbox-dark",
-            "solarized-dark",
-            "solarized-light",
+    fn from_toml_rejects_missing_field() {
+        // No `selection`.
+        let src = r##"
+            [theme]
+            name = "x"
+            fg = "#ffffff"
+            bg = "#000000"
+            border = "#888888"
+            border_active = "#aaaaaa"
+            status_bg = "#111111"
+            status_fg = "#eeeeee"
+            tab_active_bg = "#222222"
+            tab_active_fg = "#ffffff"
+            tab_inactive_fg = "#777777"
+            search_match = "#ffd700"
+            broadcast_indicator = "#ff0000"
+            copy_mode_indicator = "#00ff00"
+        "##;
+        assert!(matches!(Theme::from_toml(src), Err(ThemeError::Toml(_))));
+    }
+
+    #[test]
+    fn from_toml_rejects_bad_hex() {
+        let src = r##"
+            [theme]
+            name = "x"
+            fg = "not a colour"
+            bg = "#000000"
+            border = "#888888"
+            border_active = "#aaaaaa"
+            status_bg = "#111111"
+            status_fg = "#eeeeee"
+            tab_active_bg = "#222222"
+            tab_active_fg = "#ffffff"
+            tab_inactive_fg = "#777777"
+            selection = "#333333"
+            search_match = "#ffd700"
+            broadcast_indicator = "#ff0000"
+            copy_mode_indicator = "#00ff00"
+        "##;
+        assert!(matches!(Theme::from_toml(src), Err(ThemeError::BadHex(_))));
+    }
+
+    #[test]
+    fn default_theme_never_panics() {
+        let t = Theme::default_theme();
+        assert_eq!(t.name, "ezpn-dark");
+    }
+
+    #[test]
+    fn resolve_runs_for_every_depth() {
+        let t = Theme::default_theme();
+        for depth in [
+            ColorDepth::TrueColor,
+            ColorDepth::Palette256,
+            ColorDepth::Palette16,
         ] {
-            let t = load_theme(name);
-            // Builtins must round-trip without falling back to default
-            // (except the default itself).
-            if name != "default" {
-                assert_ne!(
-                    t.name, "default",
-                    "builtin theme '{name}' fell back to default — TOML invalid?"
-                );
+            let r = t.resolve(depth);
+            // Sanity: at least the bg and fg are populated.
+            match (r.fg, r.bg) {
+                (
+                    Resolved::Rgb(_) | Resolved::Indexed(_),
+                    Resolved::Rgb(_) | Resolved::Indexed(_),
+                ) => {}
             }
-        }
-    }
-
-    #[test]
-    fn theme_corrupt_user_theme_falls_back() {
-        // Use a tempdir as XDG_CONFIG_HOME so we don't pollute the user.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let themes = dir.path().join("ezpn").join("themes");
-        std::fs::create_dir_all(&themes).unwrap();
-        std::fs::write(themes.join("broken.toml"), "this = is not = valid toml @@@").unwrap();
-        // Save / restore the env var so other tests aren't affected.
-        let prev = std::env::var("XDG_CONFIG_HOME").ok();
-        std::env::set_var("XDG_CONFIG_HOME", dir.path());
-        let t = load_theme("broken");
-        match prev {
-            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
-        assert_eq!(t.name, "default");
-    }
-
-    #[test]
-    fn theme_adapt_preserves_logical_structure() {
-        // adapt() must never drop a field; every Rgb should yield some Color.
-        let t = default_theme();
-        let a = t.adapt(TermCaps::TRUECOLOR);
-        // Cheap structural check: name + a few canonical fields are populated.
-        assert_eq!(a.name, t.name);
-        // accent should be visibly different from bg in any cap mode.
-        for caps in [TermCaps::TRUECOLOR, TermCaps::C256, TermCaps::C16] {
-            let a = t.adapt(caps);
-            assert_ne!(format!("{:?}", a.bg), format!("{:?}", a.accent));
         }
     }
 }

@@ -198,53 +198,99 @@ impl Layout {
         }
     }
 
-    /// SPEC 12 — extract the leaf identified by `target_id` from the tree
-    /// and collapse the parent split into the surviving sibling. Returns
-    /// `Some(target_id)` on success, or `None` if the target is unknown
-    /// or the only leaf in the tree (caller should detect via
-    /// `pane_count() == 1` and turn this into a tab close instead).
+    // ── break-pane / join-pane primitives (#90) ───────────────────
+    //
+    // These mutate only the layout tree. The caller is responsible for
+    // moving the actual `Pane` (PTY fd, vt100 parser, scrollback) between
+    // tabs — see the integration TODO in server.rs/bootstrap.rs. The
+    // layout-tree mutations preserve pane IDs, which is the contract that
+    // lets the PTY survive the move.
+
+    /// Construct a fresh single-pane layout owning `pane_id`. Used on the
+    /// destination side of `break-pane` to seed a new tab around an
+    /// already-spawned pane without minting a new id.
     ///
-    /// Tree surgery cases (sibling = leaf, sibling = split, only-leaf)
-    /// are handled by `remove_node` already; this just wraps it.
-    /// Unwired in v0.11 batch — IPC dispatcher lands in follow-up.
-    #[allow(dead_code)]
-    pub fn detach(&mut self, target_id: usize) -> Option<usize> {
+    /// `next_id_hint` should be `pane_id + 1` (or any value > `pane_id`)
+    /// so that subsequent splits in the new tab don't collide with ids
+    /// from the donor tab.
+    pub fn singleton(pane_id: usize, next_id_hint: usize) -> Self {
+        let next_id = next_id_hint.max(pane_id + 1);
+        Layout {
+            root: LayoutNode::Leaf { id: pane_id },
+            next_id,
+        }
+    }
+
+    /// Detach a leaf from this layout, collapsing the parent split.
+    /// Returns `Some(pane_id)` when the leaf was extracted, `None` if the
+    /// leaf isn't in the tree or it's the only remaining pane (the source
+    /// tab must be destroyed by the caller in that case).
+    ///
+    /// Does NOT renumber surviving panes — `pane_ids()` simply omits the
+    /// detached id afterwards.
+    pub fn detach_leaf(&mut self, target_id: usize) -> Option<usize> {
         if self.pane_count() <= 1 {
             return None;
         }
         if !contains(&self.root, target_id) {
             return None;
         }
-        if self.remove(target_id) {
-            Some(target_id)
-        } else {
-            None
+        let old = std::mem::take(&mut self.root);
+        // remove_node returns Some(new_root) when the leaf had a sibling
+        // (the parent split collapses). It returns None only when the
+        // entire tree was the single targeted leaf, which we've already
+        // ruled out above.
+        match remove_node(old, target_id) {
+            Some(new_root) => {
+                self.root = new_root;
+                Some(target_id)
+            }
+            None => None,
         }
     }
 
-    /// SPEC 12 — insert `new_id` next to `target_id` as a new split.
-    /// Unlike `split` (which always equalises and always places the new
-    /// id in `second`), this lets the caller pick the direction, ratio,
-    /// and which slot (first vs second) the new leaf occupies. Returns
-    /// `false` if `target_id` is not in the tree. Unwired in v0.11 batch.
-    #[allow(dead_code)]
-    pub fn insert_pane(
-        &mut self,
-        new_id: usize,
-        target_id: usize,
-        direction: Direction,
-        place_after: bool,
-        ratio: f32,
-    ) -> bool {
-        if !contains(&self.root, target_id) {
+    /// Sole-pane variant: detach the only pane, leaving the layout empty.
+    /// Returns `Some(pane_id)` when the layout had exactly one leaf and
+    /// that leaf was `target_id`. Caller must destroy this layout's tab
+    /// after the call (the layout is now in an invalid empty state).
+    pub fn detach_sole_leaf(&mut self, target_id: usize) -> Option<usize> {
+        if self.pane_count() != 1 {
+            return None;
+        }
+        match &self.root {
+            LayoutNode::Leaf { id } if *id == target_id => Some(target_id),
+            _ => None,
+        }
+    }
+
+    /// Attach an existing pane (already spawned, with its id preserved)
+    /// to this layout by splitting `anchor_id` along `dir`. The attached
+    /// pane is placed in the *second* slot of the new split, mirroring
+    /// `split` but using a caller-provided id instead of minting one.
+    ///
+    /// Returns `true` on success. Fails if `anchor_id` isn't a leaf in
+    /// the tree or if `incoming_id` already exists in the tree (id
+    /// collision — caller must remap before calling).
+    pub fn attach_pane(&mut self, anchor_id: usize, incoming_id: usize, dir: Direction) -> bool {
+        if !contains(&self.root, anchor_id) {
             return false;
         }
-        let r = ratio.clamp(0.1, 0.9);
+        if contains(&self.root, incoming_id) {
+            return false;
+        }
         let old = std::mem::take(&mut self.root);
-        self.root = insert_node(old, target_id, new_id, direction, place_after, r);
-        // Bump next_id past `new_id` so a future `split()` does not collide.
-        self.next_id = self.next_id.max(new_id + 1);
+        self.root = split_node(old, anchor_id, incoming_id, dir);
+        // Bump next_id past the incoming id to avoid future collisions.
+        if incoming_id >= self.next_id {
+            self.next_id = incoming_id + 1;
+        }
+        self.equalize();
         true
+    }
+
+    /// Quick check: does `pane_id` exist as a leaf in this layout?
+    pub fn contains_pane(&self, pane_id: usize) -> bool {
+        contains(&self.root, pane_id)
     }
 
     /// Find which separator is at screen position (for drag-to-resize).
@@ -441,51 +487,14 @@ fn collect_rects(node: &LayoutNode, area: &Rect, out: &mut HashMap<usize, Rect>)
     }
 }
 
-/// Smallest cell width any leaf pane is allowed to occupy. A pane below
-/// this becomes useless (the border + a single content column squeezes
-/// shells into infinite reflow) and several render paths assume at least
-/// this much space exists. Issue #17.
-pub const MIN_PANE_W: u16 = 3;
-
-/// Smallest cell height any leaf pane is allowed to occupy. Same rationale
-/// as [`MIN_PANE_W`].
-pub const MIN_PANE_H: u16 = 2;
-
-/// Returns true when `area` has enough room to hold a separator plus two
-/// MIN-sized children along `dir`. Callers can pre-check before invoking
-/// [`Layout::split`] and surface a "pane too small" message instead of
-/// silently producing a degenerate split.
-#[allow(dead_code)] // wired up by command-palette / split keybindings in a follow-up
-pub fn can_split(area: &Rect, dir: Direction) -> bool {
-    // `> 2*MIN + 0` instead of `>= 2*MIN + 1` so clippy's int_plus_one
-    // lint stays quiet without sacrificing the check (`a >= b+1` ≡ `a > b`).
-    match dir {
-        Direction::Horizontal => area.w > 2 * MIN_PANE_W,
-        Direction::Vertical => area.h > 2 * MIN_PANE_H,
-    }
-}
-
 pub fn split_area(area: &Rect, dir: Direction, ratio: f32) -> (Rect, Rect) {
     match dir {
         Direction::Horizontal => {
             let usable = area.w.saturating_sub(1); // 1 cell for separator
             if usable < 2 {
-                // Not enough room for two children. Hand the caller back the
-                // whole area as the first pane and an explicit zero-width
-                // second so render code can detect / skip it. This branch is
-                // only reachable from snapshot restore on tiny terminals;
-                // interactive splits are guarded by `can_split`.
                 return (area.clone(), Rect { w: 0, ..*area });
             }
-            // Clamp so both children stay at or above MIN_PANE_W when the
-            // area can afford it. For the corner case `usable < 2*MIN_PANE_W`
-            // (e.g. 5-col terminal), `clamp(min, max)` requires `min <= max`
-            // — so we use the pre-existing `[1, usable-1]` floor in that
-            // narrow window. Both children may be below MIN there, but
-            // nothing crashes; a follow-up will surface a UI warning.
-            let lo = MIN_PANE_W.min(usable.saturating_sub(MIN_PANE_W));
-            let hi = (usable.saturating_sub(MIN_PANE_W)).max(lo);
-            let fw = ((usable as f32 * ratio).round() as u16).clamp(lo.max(1), hi.max(1));
+            let fw = ((usable as f32 * ratio).round() as u16).clamp(1, usable - 1);
             let sw = usable - fw;
             (
                 Rect { w: fw, ..*area },
@@ -501,9 +510,7 @@ pub fn split_area(area: &Rect, dir: Direction, ratio: f32) -> (Rect, Rect) {
             if usable < 2 {
                 return (area.clone(), Rect { h: 0, ..*area });
             }
-            let lo = MIN_PANE_H.min(usable.saturating_sub(MIN_PANE_H));
-            let hi = (usable.saturating_sub(MIN_PANE_H)).max(lo);
-            let fh = ((usable as f32 * ratio).round() as u16).clamp(lo.max(1), hi.max(1));
+            let fh = ((usable as f32 * ratio).round() as u16).clamp(1, usable - 1);
             let sh = usable - fh;
             (
                 Rect { h: fh, ..*area },
@@ -676,55 +683,6 @@ fn split_node(node: LayoutNode, target: usize, new_id: usize, dir: Direction) ->
             ratio,
             first: Box::new(split_node(*first, target, new_id, dir)),
             second: Box::new(split_node(*second, target, new_id, dir)),
-        },
-        other => other,
-    }
-}
-
-/// SPEC 12 — split walker that respects caller-chosen `place_after` and
-/// `ratio`. Mirrors `split_node` but does not auto-equalise.
-#[allow(dead_code)]
-fn insert_node(
-    node: LayoutNode,
-    target: usize,
-    new_id: usize,
-    dir: Direction,
-    place_after: bool,
-    ratio: f32,
-) -> LayoutNode {
-    match node {
-        LayoutNode::Leaf { id } if id == target => {
-            let target_leaf = Box::new(LayoutNode::Leaf { id });
-            let new_leaf = Box::new(LayoutNode::Leaf { id: new_id });
-            let (first, second) = if place_after {
-                (target_leaf, new_leaf)
-            } else {
-                (new_leaf, target_leaf)
-            };
-            LayoutNode::Split {
-                direction: dir,
-                ratio,
-                first,
-                second,
-            }
-        }
-        LayoutNode::Split {
-            direction,
-            ratio: r,
-            first,
-            second,
-        } => LayoutNode::Split {
-            direction,
-            ratio: r,
-            first: Box::new(insert_node(*first, target, new_id, dir, place_after, ratio)),
-            second: Box::new(insert_node(
-                *second,
-                target,
-                new_id,
-                dir,
-                place_after,
-                ratio,
-            )),
         },
         other => other,
     }
@@ -935,41 +893,6 @@ mod tests {
     }
 
     #[test]
-    fn split_area_respects_min_pane_w() {
-        // Roomy split — both halves should be ≥ MIN_PANE_W
-        let area = Rect {
-            x: 0,
-            y: 0,
-            w: 80,
-            h: 24,
-        };
-        let (a, b) = super::split_area(&area, Direction::Horizontal, 0.5);
-        assert!(a.w >= super::MIN_PANE_W);
-        assert!(b.w >= super::MIN_PANE_W);
-
-        // Extreme ratio (0.01) used to collapse one side to 1 cell
-        let (a, b) = super::split_area(&area, Direction::Horizontal, 0.01);
-        assert!(a.w >= super::MIN_PANE_W);
-        assert!(b.w >= super::MIN_PANE_W);
-    }
-
-    #[test]
-    fn can_split_rejects_undersized_area() {
-        // 5 cols can't fit two 3-col panes plus a separator → reject
-        let tiny = Rect {
-            x: 0,
-            y: 0,
-            w: 5,
-            h: 24,
-        };
-        assert!(!super::can_split(&tiny, Direction::Horizontal));
-
-        // 7 cols (3 + 1 + 3) is the minimum that satisfies horizontal split
-        let just_enough = Rect { w: 7, ..tiny };
-        assert!(super::can_split(&just_enough, Direction::Horizontal));
-    }
-
-    #[test]
     fn remove_decreases_count() {
         let mut layout = Layout::from_grid(1, 2);
         assert_eq!(layout.pane_count(), 2);
@@ -1124,6 +1047,123 @@ mod tests {
         assert!(Layout::from_spec("10").is_err());
     }
 
+    // ── break-pane / join-pane (#90) ────────────────────────
+
+    #[test]
+    fn singleton_layout_has_one_leaf_with_given_id() {
+        let layout = Layout::singleton(42, 43);
+        assert_eq!(layout.pane_count(), 1);
+        assert_eq!(layout.pane_ids(), vec![42]);
+        assert!(layout.next_id > 42);
+    }
+
+    #[test]
+    fn singleton_next_id_hint_clamps_above_pane_id() {
+        // Hint smaller than pane_id is corrected upward to avoid future
+        // collisions when the new tab starts splitting.
+        let layout = Layout::singleton(99, 5);
+        assert!(layout.next_id > 99);
+    }
+
+    #[test]
+    fn detach_leaf_collapses_parent_split() {
+        let mut layout = Layout::from_grid(1, 3);
+        // ids: [0, 1, 2]
+        let detached = layout.detach_leaf(1);
+        assert_eq!(detached, Some(1));
+        assert_eq!(layout.pane_count(), 2);
+        let remaining = layout.pane_ids();
+        assert!(remaining.contains(&0));
+        assert!(remaining.contains(&2));
+        assert!(!remaining.contains(&1));
+    }
+
+    #[test]
+    fn detach_leaf_rejects_missing_id() {
+        let mut layout = Layout::from_grid(1, 2);
+        assert_eq!(layout.detach_leaf(99), None);
+        assert_eq!(layout.pane_count(), 2);
+    }
+
+    #[test]
+    fn detach_leaf_rejects_when_only_one_pane() {
+        let mut layout = Layout::from_grid(1, 1);
+        assert_eq!(layout.detach_leaf(0), None);
+        assert_eq!(layout.pane_count(), 1);
+    }
+
+    #[test]
+    fn detach_sole_leaf_succeeds_only_when_alone() {
+        let mut layout = Layout::from_grid(1, 1);
+        assert_eq!(layout.detach_sole_leaf(0), Some(0));
+
+        let mut multi = Layout::from_grid(1, 2);
+        assert_eq!(multi.detach_sole_leaf(0), None);
+    }
+
+    #[test]
+    fn attach_pane_adds_leaf_via_split() {
+        let mut layout = Layout::from_grid(1, 1);
+        // Existing leaf id=0; attach foreign pane id=42 alongside.
+        assert!(layout.attach_pane(0, 42, Direction::Horizontal));
+        assert_eq!(layout.pane_count(), 2);
+        let ids = layout.pane_ids();
+        assert!(ids.contains(&0));
+        assert!(ids.contains(&42));
+        assert!(layout.next_id > 42);
+    }
+
+    #[test]
+    fn attach_pane_rejects_missing_anchor() {
+        let mut layout = Layout::from_grid(1, 1);
+        assert!(!layout.attach_pane(99, 5, Direction::Vertical));
+    }
+
+    #[test]
+    fn attach_pane_rejects_id_collision() {
+        let mut layout = Layout::from_grid(1, 2);
+        // pane id=1 already in tree
+        assert!(!layout.attach_pane(0, 1, Direction::Horizontal));
+        assert_eq!(layout.pane_count(), 2);
+    }
+
+    #[test]
+    fn detach_then_attach_round_trips_pane_id() {
+        // Simulate break-pane / join-pane: pane id survives the move.
+        let mut donor = Layout::from_grid(1, 3); // ids [0,1,2]
+        let detached = donor.detach_leaf(1).unwrap();
+        assert_eq!(detached, 1);
+        assert_eq!(donor.pane_count(), 2);
+
+        // Receiving tab starts as a singleton with id=10
+        let mut receiver = Layout::singleton(10, 11);
+        assert!(receiver.attach_pane(10, detached, Direction::Horizontal));
+        assert_eq!(receiver.pane_count(), 2);
+        assert!(receiver.pane_ids().contains(&1));
+        assert!(receiver.pane_ids().contains(&10));
+    }
+
+    #[test]
+    fn contains_pane_reports_membership() {
+        let layout = Layout::from_grid(1, 2);
+        assert!(layout.contains_pane(0));
+        assert!(layout.contains_pane(1));
+        assert!(!layout.contains_pane(2));
+    }
+
+    #[test]
+    fn detach_invariant_pane_count_drops_by_one() {
+        // Stress: repeatedly detach until two remain.
+        let mut layout = Layout::from_grid(2, 3); // 6 panes
+        let ids = layout.pane_ids();
+        let mut count = layout.pane_count();
+        for &id in ids.iter().take(4) {
+            assert_eq!(layout.detach_leaf(id), Some(id));
+            count -= 1;
+            assert_eq!(layout.pane_count(), count);
+        }
+    }
+
     #[test]
     fn spec_presets() {
         let ide = Layout::from_spec("ide").unwrap();
@@ -1146,125 +1186,5 @@ mod tests {
 
         let trio = Layout::from_spec("trio").unwrap();
         assert_eq!(trio.pane_count(), 3); // 1/1:1
-    }
-
-    // ─── SPEC 12 — break-pane / join-pane ─────────────────────────
-
-    /// Case A from SPEC 12 §4.2: split with two leaves, detach one →
-    /// root collapses to the surviving sibling leaf.
-    #[test]
-    fn detach_collapses_to_leaf_sibling() {
-        let mut l = Layout::from_grid(2, 1);
-        let ids = l.pane_ids();
-        assert_eq!(ids.len(), 2);
-        assert_eq!(l.detach(ids[0]), Some(ids[0]));
-        assert_eq!(l.pane_count(), 1);
-        assert_eq!(l.pane_ids(), vec![ids[1]]);
-    }
-
-    /// Case B: split where one branch is a leaf, the other is a 2-leaf
-    /// split. Detach the leaf side; root becomes the entire sibling
-    /// subtree intact.
-    #[test]
-    fn detach_collapses_to_split_sibling() {
-        let mut l = Layout::from_grid(2, 1);
-        let ids = l.pane_ids();
-        // Split the second leaf so it becomes a 2-leaf subtree.
-        let new_id = l.split(ids[1], Direction::Vertical);
-        assert_eq!(l.pane_count(), 3);
-        // Detach the original first leaf. Root should now hold the
-        // 2-leaf subtree (ids[1] + new_id).
-        assert_eq!(l.detach(ids[0]), Some(ids[0]));
-        assert_eq!(l.pane_count(), 2);
-        let surviving: std::collections::HashSet<usize> = l.pane_ids().into_iter().collect();
-        assert!(surviving.contains(&ids[1]));
-        assert!(surviving.contains(&new_id));
-    }
-
-    /// Case C: 1-leaf tree → detach must refuse and leave the tree
-    /// untouched. Caller is expected to surface this as "cannot break
-    /// the only pane" error.
-    #[test]
-    fn detach_only_leaf_returns_none() {
-        let mut l = Layout::from_grid(1, 1);
-        let only = l.pane_ids()[0];
-        assert_eq!(l.detach(only), None);
-        assert_eq!(l.pane_count(), 1);
-        assert_eq!(l.pane_ids(), vec![only]);
-    }
-
-    #[test]
-    fn detach_unknown_id_returns_none() {
-        let mut l = Layout::from_grid(2, 2);
-        assert_eq!(l.detach(99_999), None);
-        assert_eq!(l.pane_count(), 4);
-    }
-
-    /// `insert_pane` against a leaf root: result is a Split node holding
-    /// both leaves with the requested direction + ratio.
-    #[test]
-    fn insert_pane_into_leaf_root() {
-        let mut l = Layout::from_grid(1, 1);
-        let target = l.pane_ids()[0];
-        let new_id = 999;
-        assert!(l.insert_pane(new_id, target, Direction::Horizontal, true, 0.5));
-        assert_eq!(l.pane_count(), 2);
-        let ids = l.pane_ids();
-        assert_eq!(ids.len(), 2);
-        assert!(ids.contains(&target));
-        assert!(ids.contains(&new_id));
-    }
-
-    #[test]
-    fn insert_pane_before_target_places_new_id_first() {
-        let mut l = Layout::from_grid(1, 1);
-        let target = l.pane_ids()[0];
-        let new_id = 999;
-        assert!(l.insert_pane(new_id, target, Direction::Horizontal, false, 0.4));
-        assert_eq!(l.pane_count(), 2);
-        // pane_ids() walks the tree in-order; with place_after=false the
-        // new id sits in the `first` slot, so it shows up before target.
-        let ids = l.pane_ids();
-        assert_eq!(ids[0], new_id);
-        assert_eq!(ids[1], target);
-    }
-
-    #[test]
-    fn insert_pane_unknown_target_returns_false() {
-        let mut l = Layout::from_grid(1, 1);
-        let before = l.pane_ids();
-        assert!(!l.insert_pane(999, 12345, Direction::Horizontal, true, 0.5));
-        assert_eq!(l.pane_ids(), before);
-    }
-
-    #[test]
-    fn insert_pane_clamps_ratio_to_safe_range() {
-        // The internal ratio is clamped to [0.1, 0.9]; we cannot read it
-        // back through the public API, but we can confirm the operation
-        // succeeds and produces 2 leaves regardless of the user's input.
-        let mut l = Layout::from_grid(1, 1);
-        let target = l.pane_ids()[0];
-        assert!(l.insert_pane(7, target, Direction::Vertical, true, -1.5));
-        assert_eq!(l.pane_count(), 2);
-        let mut l2 = Layout::from_grid(1, 1);
-        let target2 = l2.pane_ids()[0];
-        assert!(l2.insert_pane(8, target2, Direction::Vertical, true, 99.0));
-        assert_eq!(l2.pane_count(), 2);
-    }
-
-    /// Round-trip: detach a pane, then insert a NEW one back next to its
-    /// former neighbour. Pane count must return to the starting value
-    /// and both ids must coexist.
-    #[test]
-    fn detach_then_insert_restores_pane_count() {
-        let mut l = Layout::from_grid(2, 2);
-        let ids = l.pane_ids();
-        let detached = ids[0];
-        assert_eq!(l.detach(detached), Some(detached));
-        let after_detach = l.pane_count();
-        let target = l.pane_ids()[0];
-        let new_id = 1_000;
-        assert!(l.insert_pane(new_id, target, Direction::Horizontal, true, 0.5));
-        assert_eq!(l.pane_count(), after_detach + 1);
     }
 }

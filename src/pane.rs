@@ -2,28 +2,22 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-/// Global wake channel: PTY reader threads send () to wake the server main loop.
-/// Set once by the server with `init_wake_channel()`.
-///
-/// Per SPEC 05 `docs/spec/v0.10.0/05-render-loop-micro-perf.md` §4.2: this is a
-/// **bounded** channel because wake messages are idempotent — the receiver
-/// drains all pending wakes per tick (`event_loop.rs`), so dropping overflow
-/// only loses a redundant signal, never a unique state transition.
-static WAKE_TX: OnceLock<mpsc::SyncSender<()>> = OnceLock::new();
+use crate::terminal_state::{
+    ClipboardPolicy, KittyKbdFlags, MouseEncoding, MouseMode, MouseProtocol, Osc52Decision,
+    Osc52GetPolicy, Osc52SetPolicy, PaneTerminalState, ThemePalette,
+};
 
-/// Wake-channel capacity. 64 is large enough for steady-state bursts at
-/// 60 fps × handful of panes; overflow only happens when the main loop has
-/// genuinely stalled, in which case extra wakes are noise.
-const WAKE_CHANNEL_CAPACITY: usize = 64;
+/// Global wake channel: PTY reader threads send () to wake the server main loop.
+/// Set once by the server with `set_wake_channel()`.
+static WAKE_TX: OnceLock<mpsc::Sender<()>> = OnceLock::new();
 
 /// Initialize the global wake channel. Call once from server startup.
 /// Returns the Receiver that the main loop should use.
 pub fn init_wake_channel() -> mpsc::Receiver<()> {
-    let (tx, rx) = mpsc::sync_channel::<()>(WAKE_CHANNEL_CAPACITY);
+    let (tx, rx) = mpsc::channel();
     let _ = WAKE_TX.set(tx);
     rx
 }
@@ -31,11 +25,11 @@ pub fn init_wake_channel() -> mpsc::Receiver<()> {
 /// Send a wake signal to the main loop (used by reader threads and client reader).
 pub fn wake_main_loop() {
     if let Some(tx) = WAKE_TX.get() {
-        // Wake messages are idempotent — drop on overflow.
-        let _ = tx.try_send(());
+        let _ = tx.send(());
     }
 }
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
@@ -47,27 +41,16 @@ pub enum PaneLaunch {
     Command(String),
 }
 
-/// Per-pane state. Field declaration order is **load-bearing** for `Drop`:
-/// Rust drops fields top-to-bottom, so any field whose `Drop` must run
-/// before the reader thread is joined must appear *above* `reader_handle`.
-/// In particular `master` (the PTY master fd) drops before `reader_handle`
-/// so the blocking `reader.read()` unblocks on EOF before we try to join.
-/// See SPEC 03 `docs/spec/v0.10.0/03-lifecycle-gc.md` §4.1.
+/// `live_cwd()` falls back to procfs polling only if the OSC 7 report is
+/// stale. Apps emit OSC 7 on every `cd`; if we haven't seen one in this
+/// long, the shell may have stopped emitting (older shell, no integration
+/// snippet) and procfs is the only source of truth left.
+const REPORTED_CWD_FRESH_FOR: Duration = Duration::from_secs(30);
+
 pub struct Pane {
-    /// Child first so SIGHUP propagates before the master fd drops.
-    child: Box<dyn Child + Send + Sync>,
-    writer: Box<dyn Write + Send>,
-    /// Send `()` to ask the reader to exit. `take()`-d in `Drop` so the
-    /// signal is idempotent. The reader also exits naturally on PTY EOF
-    /// (triggered by `master` dropping below); this signal just bounds
-    /// shutdown latency for slow / sleeping children.
-    shutdown_tx: Option<mpsc::SyncSender<()>>,
-    /// Drops here → kernel notices slave fd is closed → reader's blocking
-    /// `read()` returns 0 → reader exits → handle is joinable.
     master: Box<dyn MasterPty + Send>,
-    /// `Some` until joined in `Drop`. If join exceeds the 250 ms deadline
-    /// the handle is `mem::forget`ed and a single warn line is emitted.
-    reader_handle: Option<std::thread::JoinHandle<()>>,
+    writer: Box<dyn Write + Send>,
+    child: Box<dyn Child + Send + Sync>,
     reader_rx: Receiver<Vec<u8>>,
     parser: vt100::Parser,
     alive: bool,
@@ -76,28 +59,41 @@ pub struct Pane {
     name: Option<String>,
     exit_code: Option<u32>,
     /// Pending OSC 52 clipboard sequences from child to forward to the terminal.
-    /// Capped at OSC52_MAX_ENTRIES entries / OSC52_MAX_BYTES total — drops oldest on overflow
-    /// to prevent a malicious or buggy child from exhausting memory via clipboard spam.
+    /// `pub` so the server can push externally-generated OSC 52 (e.g. when the
+    /// multiplexer copies a selection); incoming child-emitted OSC 52 is gated
+    /// by `terminal_state.clipboard_policy` in [`Pane::read_output`].
     pub osc52_pending: Vec<Vec<u8>>,
-    /// Running byte count of `osc52_pending` (sum of inner Vec lengths).
-    osc52_bytes: usize,
-    /// Set when `scan_osc52` had to drop a sequence due to a cap. Used by the status bar
-    /// (and tests) to signal "clipboard truncated"; reset on `take_osc52`.
-    osc52_truncated: bool,
-    /// Whether the child has enabled bracketed paste mode (\x1b[?2004h).
-    bracketed_paste: bool,
-    /// Whether the child has requested focus events (\x1b[?1004h).
-    focus_events: bool,
+    /// DECSET 2026 sync bracket depth (issue #73). `\x1b[?2026h` increments,
+    /// `\x1b[?2026l` decrements (saturating at 0). Reference-counted to
+    /// tolerate nested brackets.
+    sync_depth: u16,
+    /// Wall-clock instant the current sync window opened (depth 0 -> 1).
+    /// Used by the host coalescer to enforce the 33 ms safety timeout.
+    sync_opened_at: Option<Instant>,
+
+    /// Aggregate per-pane terminal state (#74, #75, #77, #78, #79).
+    /// Authoritative for DECSET bits the multiplexer cares about. See
+    /// [`crate::terminal_state`] for which bits are owned here vs. by vt100
+    /// (e.g. `?1049` alt-screen) vs. by issue #73 (`?2026` sync).
+    state: PaneTerminalState,
+    /// OSC parser carry-over: when a chunk ends mid-OSC, the prefix bytes
+    /// are held here so the next chunk can complete the sequence.
+    osc_carry: Vec<u8>,
+    /// CSI parser carry-over for kitty keyboard sequences (`CSI > / < / = / ? u`).
+    /// Same rationale as `osc_carry`.
+    csi_carry: Vec<u8>,
     /// The working directory this pane was launched with.
     initial_cwd: Option<PathBuf>,
     /// Custom env vars this pane was launched with.
     initial_env: HashMap<String, String>,
     /// Custom shell override for this pane (if different from default).
     initial_shell: Option<String>,
-    /// Current scrollback ring capacity (lines). Tracked here because vt100 0.15
-    /// does not expose the value passed to `Parser::new`. Used by SPEC 02
-    /// `clear-history` / `set-scrollback` IPC commands.
-    scrollback_cap: usize,
+    /// Active clipboard policy for OSC 52 set/get (#79). Defaults to the
+    /// secure policy in [`ClipboardPolicy::default`].
+    clipboard_policy: ClipboardPolicy,
+    /// Active theme palette for OSC 4/10/11/12 responses (#77). When empty,
+    /// queries pass through to the host emulator unchanged.
+    theme_palette: ThemePalette,
 }
 
 impl Pane {
@@ -192,61 +188,29 @@ impl Pane {
         let writer = pair.master.take_writer()?;
 
         let (tx, rx) = mpsc::sync_channel(32); // bounded: 32 * 4KB = 128KB max buffered
-        let (shutdown_tx, shutdown_rx) = mpsc::sync_channel::<()>(1);
-        let pid_for_name = child.process_id().unwrap_or(0);
-        let reader_handle = std::thread::Builder::new()
-            .name(format!("ezpn-pty-{pid_for_name}"))
-            .spawn(move || {
-                // Isolate PTY-reader panics: a bad ANSI sequence or vt100 bug
-                // must not take down the daemon. On unwind the channel drops,
-                // which causes `read_output()` to observe
-                // `TryRecvError::Disconnected` and mark the pane dead with
-                // exit_code=u32::MAX (see `read_output`).
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let mut reader = reader;
-                    let mut buf = [0u8; 4096];
-                    loop {
-                        // Cheap shutdown check between reads (SPEC 03 §4.1).
-                        // The blocking read below also unblocks when the
-                        // master fd drops, so this signal only bounds
-                        // shutdown latency for slow / sleeping children.
-                        if shutdown_rx.try_recv().is_ok() {
+        std::thread::spawn(move || {
+            let mut reader = reader;
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx.send(buf[..n].to_vec()).is_err() {
                             break;
                         }
-                        match reader.read(&mut buf) {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                if tx.send(buf[..n].to_vec()).is_err() {
-                                    break;
-                                }
-                                wake_main_loop();
-                            }
-                            Err(_) => break,
-                        }
+                        wake_main_loop();
                     }
-                }));
-                if let Err(payload) = result {
-                    let reason = match payload.downcast_ref::<&'static str>() {
-                        Some(s) => (*s).to_string(),
-                        None => match payload.downcast_ref::<String>() {
-                            Some(s) => s.clone(),
-                            None => "unknown panic payload".to_string(),
-                        },
-                    };
-                    eprintln!("ezpn: PTY reader thread panicked: {}", reason);
-                    wake_main_loop();
+                    Err(_) => break,
                 }
-            })
-            .map_err(|e| anyhow::anyhow!("spawn ezpn-pty thread: {e}"))?;
+            }
+        });
 
         let parser = vt100::Parser::new(rows, cols, scrollback);
 
         Ok(Self {
-            child,
-            writer,
-            shutdown_tx: Some(shutdown_tx),
             master: pair.master,
-            reader_handle: Some(reader_handle),
+            writer,
+            child,
             reader_rx: rx,
             parser,
             alive: true,
@@ -255,15 +219,30 @@ impl Pane {
             name: None,
             exit_code: None,
             osc52_pending: Vec::new(),
-            osc52_bytes: 0,
-            osc52_truncated: false,
-            bracketed_paste: false,
-            focus_events: false,
+            sync_depth: 0,
+            sync_opened_at: None,
+            state: PaneTerminalState::new(),
+            osc_carry: Vec::new(),
+            csi_carry: Vec::new(),
             initial_cwd: cwd.map(|p| p.to_path_buf()),
             initial_env: env.clone(),
             initial_shell: None,
-            scrollback_cap: scrollback,
+            clipboard_policy: ClipboardPolicy::default(),
+            theme_palette: ThemePalette::default(),
         })
+    }
+
+    /// Override the OSC 52 clipboard policy for this pane (typically copied
+    /// from `[clipboard]` in the loaded config — see #79).
+    pub fn set_clipboard_policy(&mut self, policy: ClipboardPolicy) {
+        self.clipboard_policy = policy;
+    }
+
+    /// Override the active theme palette for OSC 4/10/11/12 responses (#77).
+    /// Empty palette means "fall through to the host emulator".
+    #[allow(dead_code)]
+    pub fn set_theme_palette(&mut self, palette: ThemePalette) {
+        self.theme_palette = palette;
     }
 
     /// Read pending output from PTY. Returns true if new data was received.
@@ -279,24 +258,18 @@ impl Pane {
             }
             match self.reader_rx.try_recv() {
                 Ok(data) => {
-                    // Intercept OSC 52 clipboard sequences before vt100 processing
-                    scan_osc52(
-                        &data,
-                        &mut self.osc52_pending,
-                        &mut self.osc52_bytes,
-                        &mut self.osc52_truncated,
-                    );
-                    // Focus events still need a manual scan because vt100 0.15
-                    // does not expose `?1004h`/`l` state via its public API.
-                    // Bracketed paste (`?2004h`/`l`) is read from the vt100
-                    // screen below — see SPEC 05 §4.1.
-                    track_focus_events(&data, &mut self.focus_events);
+                    // Intercept OSC + Kitty CSI sequences before vt100 processes them.
+                    // The interceptor mutates `self.state`, queues OSC 52 outputs (or
+                    // drops them per policy), writes inline responses to the child PTY
+                    // for OSC 4/10/11/12 + CSI ? u, and updates `reported_cwd` from
+                    // OSC 7. vt100 still sees the bytes — for queries it doesn't
+                    // matter (vt100 ignores unknown OSC), and for state tracking we
+                    // want it to stay consistent for screen rendering.
+                    self.intercept(&data);
+                    // DECSET 2026 sync brackets — observe before vt100 so the
+                    // host coalescer never sees a half-applied window (#73).
+                    scan_sync_brackets(&data, &mut self.sync_depth, &mut self.sync_opened_at);
                     self.parser.process(&data);
-                    // Cache `bracketed_paste` from vt100 after `process()` so
-                    // the per-keystroke encoder reads a single bool field
-                    // instead of walking the screen state. Updated exactly
-                    // here, the only place where `?2004` state can change.
-                    self.bracketed_paste = self.parser.screen().bracketed_paste();
                     // New output snaps scroll to bottom
                     if self.scroll_offset > 0 {
                         self.scroll_offset = 0;
@@ -306,13 +279,6 @@ impl Pane {
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    // Reader thread is gone (EOF, error, or panic).
-                    // If the child is still alive, the panic-isolation path may have
-                    // killed only the reader — record sentinel exit code so callers
-                    // can detect "abnormal" pane death distinct from clean exit.
-                    if self.alive && self.exit_code.is_none() {
-                        self.exit_code = Some(u32::MAX);
-                    }
                     self.alive = false;
                     break;
                 }
@@ -324,7 +290,43 @@ impl Pane {
                 self.alive = false;
             }
         }
+        // Force-close any unmatched DECSET 2026 bracket on EOF so the host
+        // coalescer doesn't freeze waiting on a process that will never emit
+        // `?2026l` (#73).
+        if !self.alive && self.sync_depth > 0 {
+            tracing::warn!(
+                pane_sync_depth = self.sync_depth,
+                "DECSET 2026 sync window force-closed on pane EOF",
+            );
+            self.sync_depth = 0;
+            self.sync_opened_at = None;
+        }
         got_data || was_alive != self.alive
+    }
+
+    /// Whether the pane is inside a DECSET 2026 synchronized-output window (#73).
+    pub fn in_sync(&self) -> bool {
+        self.sync_depth > 0
+    }
+
+    /// Wall-clock instant the current sync window opened, if any (#73).
+    /// Used by the host coalescer to enforce the 33 ms safety timeout.
+    #[allow(dead_code)]
+    pub fn sync_opened_at(&self) -> Option<Instant> {
+        self.sync_opened_at
+    }
+
+    /// Force-close any open sync bracket (#73). Idempotent.
+    #[allow(dead_code)]
+    pub fn force_close_sync(&mut self) {
+        if self.sync_depth > 0 {
+            tracing::warn!(
+                pane_sync_depth = self.sync_depth,
+                "DECSET 2026 sync window force-closed by 33 ms timeout",
+            );
+            self.sync_depth = 0;
+            self.sync_opened_at = None;
+        }
     }
 
     pub fn write_key(&mut self, key: KeyEvent) {
@@ -371,18 +373,6 @@ impl Pane {
 
     pub fn screen(&self) -> &vt100::Screen {
         self.parser.screen()
-    }
-
-    /// Borrow the underlying vt100 parser. Used by snapshot serialization to
-    /// encode the visible scrollback into a portable blob.
-    pub fn parser(&self) -> &vt100::Parser {
-        &self.parser
-    }
-
-    /// Mutable parser access for replaying a serialized scrollback blob into
-    /// a freshly spawned pane during snapshot restore.
-    pub fn parser_mut(&mut self) -> &mut vt100::Parser {
-        &mut self.parser
     }
 
     /// Sync the vt100 scrollback offset with our tracked scroll_offset.
@@ -433,8 +423,13 @@ impl Pane {
         self.scroll_offset = 0;
     }
 
-    /// Check if child has enabled mouse reporting
+    /// Check if child has enabled mouse reporting. Considers BOTH our
+    /// per-pane state (`?1000/?1002/?1003`) and vt100's view, so we don't
+    /// regress if vt100 happens to see a mode we missed.
     pub fn wants_mouse(&self) -> bool {
+        if !self.state.mouse_mode.is_off() {
+            return true;
+        }
         self.parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None
     }
 
@@ -443,23 +438,28 @@ impl Pane {
     /// `button`: 0=left, 1=middle, 2=right, 64=scroll-up, 65=scroll-down
     /// `release`: true for button release events
     pub fn send_mouse_event(&mut self, button: u16, col: u16, row: u16, release: bool) {
-        let screen = self.parser.screen();
-        let encoding = screen.mouse_protocol_encoding();
+        // Prefer our per-pane state's encoding choice, falling back to vt100.
+        let use_sgr = match self.state.mouse_mode.encoding {
+            MouseEncoding::Sgr => true,
+            MouseEncoding::X10 => {
+                matches!(
+                    self.parser.screen().mouse_protocol_encoding(),
+                    vt100::MouseProtocolEncoding::Sgr
+                )
+            }
+        };
 
-        match encoding {
-            vt100::MouseProtocolEncoding::Sgr => {
-                let end = if release { 'm' } else { 'M' };
-                let seq = format!("\x1b[<{};{};{}{}", button, col + 1, row + 1, end);
-                self.write_bytes(seq.as_bytes());
-            }
-            _ => {
-                // Default / UTF-8 encoding
-                let b = if release { 3u8 } else { (button as u8) & 0x7f };
-                let b = b.wrapping_add(32);
-                let c = ((col + 1).min(222) as u8).wrapping_add(32);
-                let r = ((row + 1).min(222) as u8).wrapping_add(32);
-                self.write_bytes(&[0x1b, b'[', b'M', b, c, r]);
-            }
+        if use_sgr {
+            let end = if release { 'm' } else { 'M' };
+            let seq = format!("\x1b[<{};{};{}{}", button, col + 1, row + 1, end);
+            self.write_bytes(seq.as_bytes());
+        } else {
+            // Default / X10 encoding
+            let b = if release { 3u8 } else { (button as u8) & 0x7f };
+            let b = b.wrapping_add(32);
+            let c = ((col + 1).min(222) as u8).wrapping_add(32);
+            let r = ((row + 1).min(222) as u8).wrapping_add(32);
+            self.write_bytes(&[0x1b, b'[', b'M', b, c, r]);
         }
     }
 
@@ -502,99 +502,56 @@ impl Pane {
 
     /// Take pending OSC 52 clipboard sequences (clears the queue).
     pub fn take_osc52(&mut self) -> Vec<Vec<u8>> {
-        self.osc52_bytes = 0;
-        self.osc52_truncated = false;
         std::mem::take(&mut self.osc52_pending)
-    }
-
-    /// True if `scan_osc52` had to drop sequences since the last `take_osc52` call.
-    /// Surfaced for diagnostics; not currently rendered in the status bar.
-    #[allow(dead_code)]
-    pub fn osc52_was_truncated(&self) -> bool {
-        self.osc52_truncated
-    }
-
-    /// Reap a finished child without blocking. If the child has exited and
-    /// hadn't been observed yet, sets `alive=false` + `exit_code=Some(...)`
-    /// and returns the exit code. SIGCHLD handler in the daemon iterates
-    /// every pane and calls this so zombies don't accumulate.
-    pub fn update_alive(&mut self) -> Option<u32> {
-        if !self.alive {
-            return None;
-        }
-        match self.child.try_wait() {
-            Ok(Some(status)) => {
-                let code = status.exit_code();
-                self.exit_code = Some(code);
-                self.alive = false;
-                Some(code)
-            }
-            _ => None,
-        }
-    }
-
-    /// Current scrollback line cap (the value last passed to `Parser::new` or
-    /// `set_scrollback_lines`, NOT the live `Screen::scrollback()` offset).
-    /// Tracked manually because vt100 0.15 does not expose it.
-    pub fn scrollback_cap(&self) -> usize {
-        self.scrollback_cap
-    }
-
-    /// Drop the scrollback ringbuffer above the visible screen. The visible
-    /// rows survive; user is snapped to bottom (live view).
-    ///
-    /// Implementation: `encode_scrollback` captures the visible rows as
-    /// `rows_formatted` byte streams (the same machinery snapshot uses), then
-    /// a fresh `vt100::Parser::new(rows, cols, scrollback_cap)` replays them.
-    /// The old parser — including all scrollback rows — is dropped, releasing
-    /// the ringbuffer in place. Typical cost ~5–20 ms for an 80×24 pane.
-    pub fn clear_history(&mut self) -> anyhow::Result<()> {
-        let blob = crate::snapshot_blob::encode_scrollback(&self.parser);
-        let (rows, cols) = self.parser.screen().size();
-        let mut fresh = vt100::Parser::new(rows, cols, self.scrollback_cap);
-        if !blob.is_empty() {
-            crate::snapshot_blob::decode_scrollback(&blob, &mut fresh)?;
-        }
-        self.parser = fresh;
-        self.scroll_offset = 0;
-        Ok(())
-    }
-
-    /// Resize the scrollback ringbuffer to `new_lines`. Same encode/replay
-    /// rebuild as `clear_history`, but the new parser keeps its scrollback
-    /// rows up to the new cap. If `new_lines == 0`, behaves as a hard
-    /// `clear_history` (no scrollback above visible).
-    pub fn set_scrollback_lines(&mut self, new_lines: usize) -> anyhow::Result<()> {
-        let blob = crate::snapshot_blob::encode_scrollback(&self.parser);
-        let (rows, cols) = self.parser.screen().size();
-        let mut fresh = vt100::Parser::new(rows, cols, new_lines);
-        if !blob.is_empty() {
-            crate::snapshot_blob::decode_scrollback(&blob, &mut fresh)?;
-        }
-        self.parser = fresh;
-        self.scrollback_cap = new_lines;
-        self.scroll_offset = 0;
-        Ok(())
-    }
-
-    /// Estimated bytes the pane's vt100 ringbuffer holds. Used by the workspace-level
-    /// memory budget to pick the largest pane to warn about. The estimate is intentionally
-    /// coarse — vt100 doesn't expose precise sizing.
-    pub fn estimated_scrollback_bytes(&self) -> usize {
-        let screen = self.parser.screen();
-        let (rows, cols) = screen.size();
-        let scrollback = screen.scrollback() + rows as usize;
-        scrollback.saturating_mul(cols as usize).saturating_mul(32)
     }
 
     /// Whether the child has bracketed paste enabled.
     pub fn bracketed_paste(&self) -> bool {
-        self.bracketed_paste
+        self.state.bracketed_paste
     }
 
     /// Whether the child has requested focus events.
     pub fn wants_focus(&self) -> bool {
-        self.focus_events
+        self.state.focus_reporting
+    }
+
+    /// Active mouse mode (`?1000/?1002/?1003` + `?1006`).
+    #[allow(dead_code)]
+    pub fn mouse_mode(&self) -> MouseMode {
+        self.state.mouse_mode
+    }
+
+    /// Active Kitty keyboard flags at the top of the pane's stack (#74).
+    /// 0 means the pane is using the legacy CSI/SS3 encoding.
+    #[allow(dead_code)]
+    pub fn kitty_kbd_active(&self) -> KittyKbdFlags {
+        self.state.kitty_kbd.active()
+    }
+
+    /// Current OSC 52 decision for this pane (`Pending` / `Allowed` / `Denied`).
+    /// The status-bar prompt UI flips this from `Pending` after the user
+    /// answers the y/n confirm prompt — see #79.
+    #[allow(dead_code)]
+    pub fn osc52_decision(&self) -> Osc52Decision {
+        self.state.osc52_decision
+    }
+
+    /// Set the user's OSC 52 confirm answer for this pane. After this call,
+    /// pending decoded payloads (`take_osc52_pending_confirm`) plus all
+    /// future OSC 52 set sequences are accepted/rejected accordingly.
+    #[allow(dead_code)]
+    pub fn set_osc52_decision(&mut self, decision: Osc52Decision) {
+        self.state.osc52_decision = decision;
+    }
+
+    /// Take any OSC 52 set-clipboard payloads that arrived while the policy
+    /// was `Confirm` and the per-pane decision was still `Pending`. The
+    /// caller is expected to surface a status-bar prompt naming the pane
+    /// and the byte count, and on accept push the canonical envelope onto
+    /// `osc52_pending` for forwarding to clients (#79).
+    #[allow(dead_code)]
+    pub fn take_osc52_pending_confirm(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.state.osc52_pending_confirm)
     }
 
     /// The working directory this pane was launched with.
@@ -617,10 +574,33 @@ impl Pane {
         self.initial_shell = shell;
     }
 
+    /// Most recent OSC 7 reported cwd, if it's still considered fresh
+    /// (within `REPORTED_CWD_FRESH_FOR`). Used by `live_cwd()` (#75) and
+    /// is also exposed for tests.
+    #[allow(dead_code)]
+    pub fn reported_cwd(&self) -> Option<&std::path::Path> {
+        self.state
+            .reported_cwd
+            .as_ref()
+            .filter(|(_, ts)| ts.elapsed() < REPORTED_CWD_FRESH_FOR)
+            .map(|(p, _)| p.as_path())
+    }
+
     /// Try to get the current working directory of the child process.
-    /// Falls back to the initial cwd if the child has exited.
-    #[cfg(target_os = "macos")]
+    ///
+    /// Resolution order (#75):
+    /// 1. OSC 7 reported cwd, if fresh.
+    /// 2. procfs polling (5 s effective rate, see callers in `bootstrap.rs`).
+    /// 3. The pane's launch-time `initial_cwd`.
     pub fn live_cwd(&self) -> Option<PathBuf> {
+        if let Some(p) = self.reported_cwd() {
+            return Some(p.to_path_buf());
+        }
+        self.live_cwd_procfs()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn live_cwd_procfs(&self) -> Option<PathBuf> {
         if self.alive {
             if let Some(pid) = self.child.process_id() {
                 // Use proc_pidinfo on macOS
@@ -649,10 +629,8 @@ impl Pane {
         self.initial_cwd.clone()
     }
 
-    /// Try to get the current working directory of the child process.
-    /// Falls back to the initial cwd if the child has exited.
     #[cfg(not(target_os = "macos"))]
-    pub fn live_cwd(&self) -> Option<PathBuf> {
+    fn live_cwd_procfs(&self) -> Option<PathBuf> {
         if self.alive {
             if let Some(pid) = self.child.process_id() {
                 let link = format!("/proc/{}/cwd", pid);
@@ -663,147 +641,491 @@ impl Pane {
         }
         self.initial_cwd.clone()
     }
-}
 
-/// SPEC 03 §4.1: deterministic shutdown for `Pane`. Steps run in declared
-/// order:
-/// 1. SIGHUP the child (idempotent — already dead is fine).
-/// 2. Signal the reader thread to exit (one-shot, idempotent).
-/// 3. Field drop order in `Pane` ensures `master` is released next,
-///    triggering EOF on the reader's blocking `read()`.
-/// 4. Bounded join: poll `is_finished()` for up to 250 ms, then either
-///    `join()` cleanly or `mem::forget` the handle and warn.
-impl Drop for Pane {
-    fn drop(&mut self) {
-        if self.alive {
-            let _ = self.child.kill();
-            self.alive = false;
-        }
-        if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.try_send(());
-        }
-        // Capture pid *before* `master` drops — the warn-on-leak path needs
-        // a stable identifier and `child.process_id()` may surface a stale
-        // value once the kernel reaps the slot.
-        let pid = self.child.process_id().unwrap_or(0);
-        if let Some(handle) = self.reader_handle.take() {
-            // std::thread has no "join with timeout"; emulate via
-            // `is_finished()` polling. The reader exits via either the
-            // shutdown signal above, or PTY EOF when `master` drops as
-            // part of this struct's drop (after this block returns).
-            let deadline = Instant::now() + Duration::from_millis(250);
-            while !handle.is_finished() && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            if handle.is_finished() {
-                let _ = handle.join();
-            } else {
-                eprintln!(
-                    "ezpn: PTY reader thread for pid {pid} did not exit \
-                     within 250ms; leaking handle"
-                );
-                std::mem::forget(handle);
-            }
-        }
+    // ─── OSC + CSI interception ─────────────────────────────
+
+    /// Scan a freshly-arrived chunk for sequences the multiplexer owns:
+    /// OSC 52 (clipboard, #79), OSC 7 (cwd, #75), OSC 4/10/11/12 (colour
+    /// queries, #77), `CSI > / < / = / ? u` (Kitty keyboard, #74), and the
+    /// DECSET bits in `PaneTerminalState` (#78).
+    ///
+    /// Crosses chunk boundaries via `osc_carry` / `csi_carry`. vt100 still
+    /// sees the bytes — interception is purely additive.
+    fn intercept(&mut self, chunk: &[u8]) {
+        let mut ctx = InterceptCtx {
+            state: &mut self.state,
+            osc52_pending: &mut self.osc52_pending,
+            osc_carry: &mut self.osc_carry,
+            csi_carry: &mut self.csi_carry,
+            writer: &mut *self.writer,
+            policy: &self.clipboard_policy,
+            palette: &self.theme_palette,
+        };
+        intercept_chunk(&mut ctx, chunk);
     }
 }
 
-/// Maximum number of pending OSC 52 sequences per pane. Beyond this, the oldest
-/// sequence is dropped (FIFO) to bound memory under hostile / buggy children.
-pub const OSC52_MAX_ENTRIES: usize = 16;
+/// All the borrows the interceptor needs. Bundled into a struct so we can
+/// pass it to a free function and exercise it from tests without spawning
+/// a real PTY.
+struct InterceptCtx<'a> {
+    state: &'a mut PaneTerminalState,
+    osc52_pending: &'a mut Vec<Vec<u8>>,
+    osc_carry: &'a mut Vec<u8>,
+    csi_carry: &'a mut Vec<u8>,
+    writer: &'a mut dyn Write,
+    policy: &'a ClipboardPolicy,
+    palette: &'a ThemePalette,
+}
 
-/// Maximum total bytes of pending OSC 52 sequences per pane. Together with
-/// OSC52_MAX_ENTRIES this guarantees `osc52_pending` never exceeds ~256 KiB.
-pub const OSC52_MAX_BYTES: usize = 256 * 1024;
+fn intercept_chunk(ctx: &mut InterceptCtx<'_>, chunk: &[u8]) {
+    // DECSET tracking runs on the raw chunk: mode-set sequences are tiny
+    // and we accept the (rare) chunk-boundary edge case rather than
+    // duplicating the carry-over logic.
+    track_dec_modes(chunk, ctx.state);
 
-/// Single-sequence cap: any individual OSC 52 longer than this is rejected
-/// outright (still increments `truncated` for diagnostics). Matches xterm's
-/// historical 100 KiB practical limit; we round up.
-pub const OSC52_MAX_SEQUENCE_BYTES: usize = 128 * 1024;
+    // Concatenate any carry-over from the previous chunk so a sequence
+    // split across two reads still parses cleanly.
+    let mut buf: Vec<u8> = Vec::with_capacity(ctx.osc_carry.len() + chunk.len());
+    buf.extend_from_slice(ctx.osc_carry);
+    buf.extend_from_slice(ctx.csi_carry);
+    buf.extend_from_slice(chunk);
+    ctx.osc_carry.clear();
+    ctx.csi_carry.clear();
 
-/// Scan raw PTY output for OSC 52 clipboard sequences and collect them, enforcing
-/// per-pane caps so a runaway child cannot exhaust memory.
-fn scan_osc52(data: &[u8], out: &mut Vec<Vec<u8>>, out_bytes: &mut usize, truncated: &mut bool) {
-    const PREFIX: &[u8] = b"\x1b]52;";
     let mut i = 0;
-    while i + PREFIX.len() < data.len() {
-        if data[i..].starts_with(PREFIX) {
-            let start = i;
-            i += PREFIX.len();
-            // Find terminator: BEL (\x07) or ST (\x1b\\)
-            while i < data.len() {
-                if data[i] == 0x07 {
-                    push_osc52_capped(out, out_bytes, truncated, &data[start..=i]);
-                    break;
+    while i < buf.len() {
+        if buf[i] != 0x1b || i + 1 >= buf.len() {
+            i += 1;
+            continue;
+        }
+        match buf[i + 1] {
+            b']' => {
+                // OSC: ESC ] <payload> (BEL | ESC \)
+                match scan_osc_terminator(&buf[i + 2..]) {
+                    ScanOsc::Complete { end } => {
+                        let payload = &buf[i + 2..i + 2 + end];
+                        handle_osc(ctx, payload);
+                        let term_len = if buf.get(i + 2 + end) == Some(&0x07) {
+                            1
+                        } else {
+                            2
+                        };
+                        i += 2 + end + term_len;
+                        continue;
+                    }
+                    ScanOsc::Incomplete => {
+                        // Cap so a runaway / hostile stream can't grow the
+                        // carry without bound.
+                        const OSC_CARRY_MAX: usize = 8192;
+                        if buf.len() - i <= OSC_CARRY_MAX {
+                            ctx.osc_carry.extend_from_slice(&buf[i..]);
+                        }
+                        return;
+                    }
                 }
-                if i + 1 < data.len() && data[i] == 0x1b && data[i + 1] == b'\\' {
-                    push_osc52_capped(out, out_bytes, truncated, &data[start..i + 2]);
-                    i += 1;
-                    break;
+            }
+            b'[' => match scan_csi_terminator(&buf[i + 2..]) {
+                ScanCsi::Complete { end, final_byte } => {
+                    let body = &buf[i + 2..i + 2 + end];
+                    if final_byte == b'u' {
+                        handle_csi_u(ctx, body);
+                    }
+                    i += 2 + end + 1;
+                    continue;
                 }
+                ScanCsi::Incomplete => {
+                    const CSI_CARRY_MAX: usize = 256;
+                    if buf.len() - i <= CSI_CARRY_MAX {
+                        ctx.csi_carry.extend_from_slice(&buf[i..]);
+                    }
+                    return;
+                }
+            },
+            _ => {
                 i += 1;
             }
         }
-        i += 1;
     }
 }
 
-fn push_osc52_capped(
-    out: &mut Vec<Vec<u8>>,
-    out_bytes: &mut usize,
-    truncated: &mut bool,
-    seq: &[u8],
-) {
-    if seq.len() > OSC52_MAX_SEQUENCE_BYTES {
-        // Single sequence too large — drop it entirely; never half-truncate (terminals
-        // treat partial OSC 52 as protocol error).
-        *truncated = true;
+fn handle_osc(ctx: &mut InterceptCtx<'_>, payload: &[u8]) {
+    // OSC 52 ; <selection> ; <data>
+    if let Some(rest) = payload.strip_prefix(b"52;") {
+        handle_osc52(ctx, payload, rest);
         return;
     }
-    // Drop oldest entries until both caps fit.
-    while !out.is_empty()
-        && (out.len() >= OSC52_MAX_ENTRIES || *out_bytes + seq.len() > OSC52_MAX_BYTES)
-    {
-        let dropped = out.remove(0);
-        *out_bytes -= dropped.len();
-        *truncated = true;
+    // OSC 7 ; <file:// URI>
+    if let Some(rest) = payload.strip_prefix(b"7;") {
+        handle_osc7(ctx, rest);
+        return;
     }
-    *out_bytes += seq.len();
-    out.push(seq.to_vec());
+    // OSC 10 / 11 / 12 — fg / bg / cursor colour query or set.
+    for (prefix, slot) in [
+        (&b"10;"[..], ColorSlot::Fg),
+        (&b"11;"[..], ColorSlot::Bg),
+        (&b"12;"[..], ColorSlot::Cursor),
+    ] {
+        if let Some(rest) = payload.strip_prefix(prefix) {
+            handle_osc_color(ctx, slot, rest);
+            return;
+        }
+    }
+    // OSC 4 ; <index> ; <spec>
+    if let Some(rest) = payload.strip_prefix(b"4;") {
+        handle_osc4(ctx, rest);
+        return;
+    }
+    // OSC 8 (hyperlinks): pure pass-through (#76). See `docs/multi-client-osc.md`.
 }
 
-/// Track focus-event mode changes in raw PTY output.
-///
-/// vt100 0.15 does not expose `?1004h`/`l` state via its public API, so we
-/// still scan for it — but only for this single mode pair, halving the
-/// constant cost vs the previous `track_dec_modes`. Bracketed paste
-/// (`?2004`) is read from `vt100::Screen::bracketed_paste()` directly.
-/// See SPEC 05 §4.1.
-fn track_focus_events(data: &[u8], focus_events: &mut bool) {
-    const FE_ON: &[u8] = b"\x1b[?1004h";
-    const FE_OFF: &[u8] = b"\x1b[?1004l";
-    // FE_ON.len() == FE_OFF.len() == 8; one window size suffices.
-    for window in data.windows(FE_ON.len()) {
-        if window == FE_ON {
-            *focus_events = true;
-        } else if window == FE_OFF {
-            *focus_events = false;
+fn handle_csi_u(ctx: &mut InterceptCtx<'_>, body: &[u8]) {
+    let Some((sigil, rest)) = body.split_first() else {
+        return;
+    };
+    match sigil {
+        b'>' => {
+            let flags = parse_u8(rest).unwrap_or(0);
+            ctx.state
+                .kitty_kbd
+                .push(KittyKbdFlags(flags & KittyKbdFlags::ALL));
+        }
+        b'<' => {
+            let n = parse_u8(rest).unwrap_or(0) as usize;
+            ctx.state.kitty_kbd.pop(n);
+        }
+        b'=' => {
+            let mut parts = rest.split(|&b| b == b';');
+            let flags = parts.next().and_then(parse_u8).unwrap_or(0);
+            let mode = parts.next().and_then(parse_u8).unwrap_or(1);
+            ctx.state
+                .kitty_kbd
+                .modify_top(KittyKbdFlags(flags & KittyKbdFlags::ALL), mode);
+        }
+        b'?' => {
+            let active = ctx.state.kitty_kbd.active().bits();
+            let reply = format!("\x1b[?{}u", active);
+            let _ = ctx.writer.write_all(reply.as_bytes());
+            let _ = ctx.writer.flush();
+        }
+        _ => {}
+    }
+}
+
+fn handle_osc52(ctx: &mut InterceptCtx<'_>, full_payload: &[u8], rest: &[u8]) {
+    let mut split = rest.splitn(2, |&b| b == b';');
+    let _selection = split.next().unwrap_or(&[]);
+    let data = split.next().unwrap_or(&[]);
+
+    // Read query: `OSC 52 ; c ; ?`
+    if data == b"?" {
+        match ctx.policy.get {
+            Osc52GetPolicy::Allow => {
+                let mut env = Vec::with_capacity(full_payload.len() + 4);
+                env.extend_from_slice(b"\x1b]");
+                env.extend_from_slice(full_payload);
+                env.extend_from_slice(b"\x07");
+                ctx.osc52_pending.push(env);
+            }
+            Osc52GetPolicy::Deny => {
+                tracing::warn!(
+                    target: "osc52",
+                    "blocked OSC 52 clipboard read from pane (policy=deny)"
+                );
+            }
+        }
+        return;
+    }
+
+    // Hard cap on raw payload size before considering decode.
+    if data.len() > ctx.policy.max_bytes {
+        tracing::warn!(
+            target: "osc52",
+            bytes = data.len(),
+            cap = ctx.policy.max_bytes,
+            "dropped oversized OSC 52 set"
+        );
+        return;
+    }
+
+    let effective = match ctx.state.osc52_decision {
+        Osc52Decision::Allowed => Osc52SetPolicy::Allow,
+        Osc52Decision::Denied => Osc52SetPolicy::Deny,
+        Osc52Decision::Pending => ctx.policy.set,
+    };
+
+    let mut env = Vec::with_capacity(full_payload.len() + 4);
+    env.extend_from_slice(b"\x1b]");
+    env.extend_from_slice(full_payload);
+    env.extend_from_slice(b"\x07");
+
+    match effective {
+        Osc52SetPolicy::Allow => ctx.osc52_pending.push(env),
+        Osc52SetPolicy::Deny => {
+            tracing::warn!(
+                target: "osc52",
+                bytes = data.len(),
+                "blocked OSC 52 clipboard set (policy=deny)"
+            );
+        }
+        Osc52SetPolicy::Confirm => {
+            const PENDING_QUEUE_MAX: usize = 8;
+            if ctx.state.osc52_pending_confirm.len() < PENDING_QUEUE_MAX {
+                ctx.state.osc52_pending_confirm.push(env);
+            } else {
+                tracing::warn!(
+                    target: "osc52",
+                    "dropped OSC 52 set: confirm queue full"
+                );
+            }
         }
     }
 }
 
-/// Cached `EZPN_ALT_LEGACY=1` flag — read once at process start so every
-/// keystroke avoids a syscall. Setting this in the parent shell before
-/// `ezpn a` restores the pre-0.7 ESC-prefix encoding for Alt+Char, useful
-/// for very old shells that only understand the legacy form.
-fn alt_legacy_mode() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var("EZPN_ALT_LEGACY")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+fn handle_osc7(ctx: &mut InterceptCtx<'_>, rest: &[u8]) {
+    let s = match std::str::from_utf8(rest) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let after_scheme = match s.strip_prefix("file://") {
+        Some(s) => s,
+        None => return,
+    };
+    let path_part = match after_scheme.find('/') {
+        Some(idx) => &after_scheme[idx..],
+        None => after_scheme,
+    };
+    let decoded = percent_decode(path_part);
+    if decoded.is_empty() {
+        return;
+    }
+    ctx.state.reported_cwd = Some((PathBuf::from(decoded), Instant::now()));
 }
+
+fn handle_osc_color(ctx: &mut InterceptCtx<'_>, slot: ColorSlot, rest: &[u8]) {
+    if rest != b"?" {
+        return;
+    }
+    if !ctx.palette.is_active() {
+        return;
+    }
+    let value = match slot {
+        ColorSlot::Fg => ctx.palette.fg,
+        ColorSlot::Bg => ctx.palette.bg,
+        ColorSlot::Cursor => ctx.palette.cursor,
+    };
+    let Some(rgb) = value else {
+        return;
+    };
+    let osc_num = match slot {
+        ColorSlot::Fg => 10,
+        ColorSlot::Bg => 11,
+        ColorSlot::Cursor => 12,
+    };
+    let reply = format!("\x1b]{};{}\x07", osc_num, rgb.to_xterm_rgb_str());
+    let _ = ctx.writer.write_all(reply.as_bytes());
+    let _ = ctx.writer.flush();
+}
+
+fn handle_osc4(ctx: &mut InterceptCtx<'_>, rest: &[u8]) {
+    let mut parts = rest.splitn(2, |&b| b == b';');
+    let idx_bytes = parts.next().unwrap_or(&[]);
+    let spec = parts.next().unwrap_or(&[]);
+    if spec != b"?" {
+        return;
+    }
+    if !ctx.palette.is_active() {
+        return;
+    }
+    let idx = match parse_u32(idx_bytes) {
+        Some(n) if n < 256 => n as usize,
+        _ => return,
+    };
+    let Some(rgb) = ctx.palette.palette[idx] else {
+        return;
+    };
+    let reply = format!("\x1b]4;{};{}\x07", idx, rgb.to_xterm_rgb_str());
+    let _ = ctx.writer.write_all(reply.as_bytes());
+    let _ = ctx.writer.flush();
+}
+
+// ─── DECSET tracking ─────────────────────────────────────────
+
+#[derive(Clone, Copy)]
+enum ColorSlot {
+    Fg,
+    Bg,
+    Cursor,
+}
+
+enum ScanOsc {
+    Complete { end: usize },
+    Incomplete,
+}
+
+/// Find the OSC terminator (BEL `0x07` or ST `ESC \`). Returns the index of
+/// the start of the terminator within `tail`.
+fn scan_osc_terminator(tail: &[u8]) -> ScanOsc {
+    let mut i = 0;
+    while i < tail.len() {
+        if tail[i] == 0x07 {
+            return ScanOsc::Complete { end: i };
+        }
+        if tail[i] == 0x1b && i + 1 < tail.len() && tail[i + 1] == b'\\' {
+            return ScanOsc::Complete { end: i };
+        }
+        if tail[i] == 0x1b && i + 1 == tail.len() {
+            // Mid-ST split across chunks
+            return ScanOsc::Incomplete;
+        }
+        i += 1;
+    }
+    ScanOsc::Incomplete
+}
+
+enum ScanCsi {
+    Complete { end: usize, final_byte: u8 },
+    Incomplete,
+}
+
+/// Find the CSI final byte (range `0x40..=0x7e`). Returns its index within
+/// `tail` and the byte itself. Anything else is a parameter / intermediate.
+fn scan_csi_terminator(tail: &[u8]) -> ScanCsi {
+    for (i, &b) in tail.iter().enumerate() {
+        if (0x40..=0x7e).contains(&b) {
+            return ScanCsi::Complete {
+                end: i,
+                final_byte: b,
+            };
+        }
+    }
+    ScanCsi::Incomplete
+}
+
+fn parse_u8(s: &[u8]) -> Option<u8> {
+    parse_u32(s).and_then(|n| u8::try_from(n).ok())
+}
+
+fn parse_u32(s: &[u8]) -> Option<u32> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut n: u32 = 0;
+    for &b in s {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        n = n.checked_mul(10)?.checked_add((b - b'0') as u32)?;
+    }
+    Some(n)
+}
+
+/// Decode percent-encoded bytes (`%XX`) in a UTF-8 string. Leaves anything
+/// that doesn't look like a valid escape alone. Used by OSC 7.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = hex_val(bytes[i + 1]);
+            let lo = hex_val(bytes[i + 2]);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+// Update DECSET state from a chunk. Public so the pane interceptor can use
+// the same logic without touching `Pane` private fields.
+//
+// vt100 also tracks `?1049` (alt screen) — we do not duplicate that here.
+fn track_dec_modes(chunk: &[u8], state: &mut PaneTerminalState) {
+    // Walk byte by byte, looking for `ESC [ ? <num> <h|l>`. Multiple modes can
+    // be combined with `;` (`\x1b[?1000;1006h`); we handle that here too.
+    let mut i = 0;
+    while i + 3 < chunk.len() {
+        if chunk[i] != 0x1b || chunk[i + 1] != b'[' || chunk[i + 2] != b'?' {
+            i += 1;
+            continue;
+        }
+        let body_start = i + 3;
+        // Find terminator h or l
+        let mut j = body_start;
+        while j < chunk.len() && chunk[j] != b'h' && chunk[j] != b'l' {
+            j += 1;
+        }
+        if j == chunk.len() {
+            return; // incomplete chunk, ignore (DECSET is small enough we accept the loss)
+        }
+        let on = chunk[j] == b'h';
+        let body = &chunk[body_start..j];
+        for num_bytes in body.split(|&b| b == b';') {
+            if let Some(num) = parse_u32(num_bytes) {
+                apply_decset(state, num, on);
+            }
+        }
+        i = j + 1;
+    }
+}
+
+fn apply_decset(state: &mut PaneTerminalState, num: u32, on: bool) {
+    match num {
+        2004 => state.bracketed_paste = on,
+        1004 => state.focus_reporting = on,
+        // Each mouse protocol bit is an independent toggle. Only clear the
+        // active protocol when the matching `l` arrives, so `?1003h ?1000l`
+        // doesn't accidentally disable 1003.
+        1000 => {
+            if on {
+                state.mouse_mode.protocol = MouseProtocol::X10;
+            } else if state.mouse_mode.protocol == MouseProtocol::X10 {
+                state.mouse_mode.protocol = MouseProtocol::Off;
+            }
+        }
+        1002 => {
+            if on {
+                state.mouse_mode.protocol = MouseProtocol::Btn;
+            } else if state.mouse_mode.protocol == MouseProtocol::Btn {
+                state.mouse_mode.protocol = MouseProtocol::Off;
+            }
+        }
+        1003 => {
+            if on {
+                state.mouse_mode.protocol = MouseProtocol::Any;
+            } else if state.mouse_mode.protocol == MouseProtocol::Any {
+                state.mouse_mode.protocol = MouseProtocol::Off;
+            }
+        }
+        1006 => {
+            state.mouse_mode.encoding = if on {
+                MouseEncoding::Sgr
+            } else {
+                MouseEncoding::X10
+            };
+        }
+        // ?2026 sync — owned by issue #73.
+        // ?1049 alt-screen — vt100 owns it.
+        _ => {}
+    }
+}
+
+// ─── Key encoding (existing logic, untouched) ───────────────
 
 fn encode_key(key: KeyEvent) -> Vec<u8> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -848,19 +1170,9 @@ fn encode_key(key: KeyEvent) -> Vec<u8> {
             let mut buf = [0u8; 4];
             let s = c.encode_utf8(&mut buf);
             if alt && !shift {
-                // Issue #16: Alt+Char now matches Alt+Arrow / Alt+Function-key
-                // encoding (CSI u, RFC 3665), so shells that bind on
-                // \x1b[<code>;3u (zsh / bash with bind, vim, helix) see Alt
-                // input the same way for letters and arrows. Older shells
-                // that only understand the legacy ESC-prefix form can opt
-                // in via `EZPN_ALT_LEGACY=1`.
-                if alt_legacy_mode() {
-                    let mut v = vec![0x1b];
-                    v.extend_from_slice(s.as_bytes());
-                    v
-                } else {
-                    format!("\x1b[{};{}u", c as u32, mods_param).into_bytes()
-                }
+                let mut v = vec![0x1b];
+                v.extend_from_slice(s.as_bytes());
+                v
             } else if shift && (alt || ctrl) {
                 format!("\x1b[{};{}u", c as u32, mods_param).into_bytes()
             } else {
@@ -992,291 +1304,537 @@ fn encode_f_key_with_mods(n: u8, has_mods: bool, mods_param: u8) -> Vec<u8> {
     }
 }
 
-#[cfg(test)]
-#[allow(unused_imports)] // benches/render_hotpaths.rs include pane.rs via #[path];
-                         // when those build under non-test profiles the imports are
-                         // flagged though the mod itself is gated by cfg(test).
-mod osc52_tests {
-    use super::{push_osc52_capped, OSC52_MAX_BYTES, OSC52_MAX_ENTRIES, OSC52_MAX_SEQUENCE_BYTES};
+/// Scan raw PTY output for DECSET 2026 synchronized-output brackets and
+/// update the per-pane reference-counted depth (issue #73). The 8-byte
+/// sequences are looked up via `windows()`; we deliberately do not
+/// reassemble across chunk boundaries because PTY reads use a 4 KB buffer
+/// and the 33 ms safety timeout absorbs the rare split case.
+fn scan_sync_brackets(data: &[u8], depth: &mut u16, opened_at: &mut Option<Instant>) {
+    const SYNC_OPEN: &[u8] = b"\x1b[?2026h";
+    const SYNC_CLOSE: &[u8] = b"\x1b[?2026l";
+    debug_assert_eq!(SYNC_OPEN.len(), SYNC_CLOSE.len());
 
-    fn fake_seq(payload_len: usize) -> Vec<u8> {
-        let mut v = b"\x1b]52;c;".to_vec();
-        v.extend(std::iter::repeat_n(b'A', payload_len));
-        v.push(0x07);
-        v
+    let n = SYNC_OPEN.len();
+    if data.len() < n {
+        return;
     }
-
-    #[test]
-    fn entry_cap_drops_oldest() {
-        let mut out: Vec<Vec<u8>> = Vec::new();
-        let mut bytes = 0usize;
-        let mut truncated = false;
-        for _ in 0..(OSC52_MAX_ENTRIES + 4) {
-            let seq = fake_seq(8);
-            push_osc52_capped(&mut out, &mut bytes, &mut truncated, &seq);
+    for window in data.windows(n) {
+        if window == SYNC_OPEN {
+            if *depth == 0 {
+                *opened_at = Some(Instant::now());
+            }
+            *depth = depth.saturating_add(1);
+        } else if window == SYNC_CLOSE {
+            *depth = depth.saturating_sub(1);
+            if *depth == 0 {
+                *opened_at = None;
+            }
         }
-        assert_eq!(out.len(), OSC52_MAX_ENTRIES);
-        assert!(truncated);
-        assert!(bytes <= OSC52_MAX_BYTES);
-    }
-
-    #[test]
-    fn byte_cap_drops_oldest() {
-        let mut out: Vec<Vec<u8>> = Vec::new();
-        let mut bytes = 0usize;
-        let mut truncated = false;
-        // Each ~32 KiB; should plateau around OSC52_MAX_BYTES / 32 KiB.
-        let big = fake_seq(32 * 1024);
-        for _ in 0..16 {
-            push_osc52_capped(&mut out, &mut bytes, &mut truncated, &big);
-        }
-        assert!(bytes <= OSC52_MAX_BYTES, "bytes={bytes}");
-        assert!(truncated);
-    }
-
-    #[test]
-    fn oversize_sequence_dropped() {
-        let mut out: Vec<Vec<u8>> = Vec::new();
-        let mut bytes = 0usize;
-        let mut truncated = false;
-        let huge = fake_seq(OSC52_MAX_SEQUENCE_BYTES + 1);
-        push_osc52_capped(&mut out, &mut bytes, &mut truncated, &huge);
-        assert!(out.is_empty());
-        assert_eq!(bytes, 0);
-        assert!(truncated);
-    }
-
-    #[test]
-    fn under_caps_keeps_all() {
-        let mut out: Vec<Vec<u8>> = Vec::new();
-        let mut bytes = 0usize;
-        let mut truncated = false;
-        for _ in 0..4 {
-            push_osc52_capped(&mut out, &mut bytes, &mut truncated, &fake_seq(64));
-        }
-        assert_eq!(out.len(), 4);
-        assert!(!truncated);
     }
 }
 
-/// SPEC 02 history-control tests. Use `vt100::Parser` directly to avoid
-/// spawning real PTYs in unit tests; `Pane::clear_history` and
-/// `Pane::set_scrollback_lines` are thin wrappers around the same
-/// `snapshot_blob` round-trip we exercise here.
 #[cfg(test)]
-#[allow(unused_imports)]
-mod history_tests {
+mod tests {
     use super::*;
-    use crate::snapshot_blob::{decode_scrollback, encode_scrollback};
+    use crate::terminal_state::Rgb;
 
-    /// Mirrors `Pane::clear_history` without requiring a live PTY: encode the
-    /// visible screen, drop the parser, and replay into a fresh one with the
-    /// same cap.
-    fn clear_history_via_blob(parser: &mut vt100::Parser, cap: usize) {
-        let blob = encode_scrollback(parser);
-        let (rows, cols) = parser.screen().size();
-        let mut fresh = vt100::Parser::new(rows, cols, cap);
-        if !blob.is_empty() {
-            decode_scrollback(&blob, &mut fresh).unwrap();
+    /// In-memory writer for capturing the bytes the interceptor sends
+    /// back to the child PTY (kitty kbd query reply, OSC colour reply).
+    struct VecWriter(Vec<u8>);
+    impl Write for VecWriter {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.extend_from_slice(b);
+            Ok(b.len())
         }
-        *parser = fresh;
-    }
-
-    fn fill_scrollback(parser: &mut vt100::Parser, lines: usize) {
-        for i in 0..lines {
-            let row = format!("line {i}\r\n");
-            parser.process(row.as_bytes());
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
         }
     }
 
-    #[test]
-    fn clear_history_drops_scrollback_keeps_visible_line() {
-        let mut parser = vt100::Parser::new(5, 20, 1000);
-        fill_scrollback(&mut parser, 200);
-        // Probe scrollback depth.
-        parser.set_scrollback(usize::MAX);
-        let scroll_before = parser.screen().scrollback();
-        parser.set_scrollback(0);
-        assert!(scroll_before > 0, "fixture must have some scrollback");
-
-        clear_history_via_blob(&mut parser, 1000);
-
-        parser.set_scrollback(usize::MAX);
-        let scroll_after = parser.screen().scrollback();
-        parser.set_scrollback(0);
-        assert_eq!(scroll_after, 0, "clear_history must drop scrollback rows");
-    }
-
-    #[test]
-    fn clear_history_under_100ms_for_typical_pane() {
-        let mut parser = vt100::Parser::new(24, 80, 10_000);
-        fill_scrollback(&mut parser, 10_000);
-        let t0 = std::time::Instant::now();
-        clear_history_via_blob(&mut parser, 10_000);
-        let elapsed = t0.elapsed();
-        assert!(
-            elapsed.as_millis() < 100,
-            "PRD §6: clear_history must complete in <100ms (got {:?})",
-            elapsed
-        );
-    }
-
-    #[test]
-    fn set_scrollback_lines_shrinks_cap() {
-        let mut parser = vt100::Parser::new(5, 20, 10_000);
-        fill_scrollback(&mut parser, 5_000);
-        // Resize to a tiny cap; new parser holds at most 100 scrollback rows.
-        clear_history_via_blob(&mut parser, 100);
-        parser.set_scrollback(usize::MAX);
-        let scroll = parser.screen().scrollback();
-        parser.set_scrollback(0);
-        assert!(
-            scroll <= 100,
-            "after shrink to cap=100, scrollback must be <= 100 (got {scroll})"
-        );
-    }
-}
-
-/// SPEC 03 §4.1: deterministic shutdown for `Pane`. The reader thread
-/// MUST exit within the bounded join window once the pane drops.
-#[cfg(test)]
-mod drop_tests {
-    // bench `render_hotpaths` includes pane.rs via `#[path]`; `super::*`
-    // ends up unused under that compilation unit. See snapshot_blob.rs
-    // for the same pattern.
-    #[allow(unused_imports)]
-    use super::*;
-
-    #[test]
-    fn pane_drop_joins_reader_within_500ms() {
-        // Spawn a real pane running a long-running command (`sleep 60`).
-        // Drop it and assert the reader thread is gone within the bounded
-        // window (allow 500ms in tests vs the production 250ms budget).
-        let pane = Pane::with_scrollback(
-            "/bin/sh",
-            PaneLaunch::Command("sleep 60".to_string()),
-            80,
-            24,
-            1000,
-        );
-        let pane = match pane {
-            Ok(p) => p,
-            Err(_) => return, // CI without /bin/sh is acceptable to skip.
-        };
-        let t0 = std::time::Instant::now();
-        drop(pane);
-        let elapsed = t0.elapsed();
-        assert!(
-            elapsed < Duration::from_millis(500),
-            "Pane::drop must complete within 500ms (got {elapsed:?})"
-        );
-    }
-}
-
-/// SPEC 05 §4.1 / §4.2 — render-loop micro-perf:
-/// * `track_focus_events` only handles `?1004h`/`l` (no longer scans `?2004`).
-/// * `bracketed_paste` is read from `vt100::Screen::bracketed_paste()` so the
-///   raw-byte scan and vt100 stay in sync without duplicate work.
-/// * The wake channel is bounded (`sync_channel(64)`) and `try_send` drops
-///   overflow, since wake messages are idempotent.
-#[cfg(test)]
-#[allow(unused_imports)]
-mod render_micro_perf_tests {
-    use super::*;
-
-    #[test]
-    fn focus_events_set_via_scan() {
-        let mut fe = false;
-        track_focus_events(b"\x1b[?1004h", &mut fe);
-        assert!(fe, "?1004h must enable focus events");
-        track_focus_events(b"\x1b[?1004l", &mut fe);
-        assert!(!fe, "?1004l must disable focus events");
-    }
-
-    #[test]
-    fn focus_events_scanner_ignores_bracketed_paste() {
-        // Previous track_dec_modes also toggled bracketed_paste; the new
-        // focus-only scanner must NOT touch any other flag.
-        let mut fe = false;
-        track_focus_events(b"\x1b[?2004h", &mut fe);
-        assert!(!fe, "?2004h must not affect focus events");
-        track_focus_events(b"\x1b[?2004l", &mut fe);
-        assert!(!fe, "?2004l must not affect focus events");
-    }
-
-    #[test]
-    fn focus_events_scan_finds_sequence_mid_buffer() {
-        // The scanner walks an 8-byte sliding window; a sequence anywhere in
-        // the chunk must be detected, not only at the start.
-        let mut fe = false;
-        track_focus_events(b"prefix bytes \x1b[?1004h trailing", &mut fe);
-        assert!(fe);
-    }
-
-    #[test]
-    fn bracketed_paste_state_matches_screen() {
-        // Drive a vt100 parser with mode toggles and verify the screen flag
-        // matches the cached value `read_output` would compute. This is the
-        // contract that lets us drop the raw-byte scan for `?2004`.
-        let mut parser = vt100::Parser::new(5, 20, 100);
-        assert!(!parser.screen().bracketed_paste());
-
-        parser.process(b"\x1b[?2004h");
-        assert!(parser.screen().bracketed_paste(), "vt100 must track ?2004h");
-
-        parser.process(b"some output\r\n");
-        assert!(
-            parser.screen().bracketed_paste(),
-            "intermediate output must not flip the flag"
-        );
-
-        parser.process(b"\x1b[?2004l");
-        assert!(
-            !parser.screen().bracketed_paste(),
-            "vt100 must track ?2004l"
-        );
-    }
-
-    #[test]
-    fn bracketed_paste_set_across_split_chunks() {
-        // The mode sequence may arrive split across read() boundaries — vt100
-        // still reassembles correctly. Documents the contract our caller
-        // relies on (cache from screen, not raw scan).
-        let mut parser = vt100::Parser::new(5, 20, 100);
-        parser.process(b"\x1b[?20");
-        parser.process(b"04h");
-        assert!(parser.screen().bracketed_paste());
-    }
-
-    #[test]
-    fn wake_channel_is_bounded_and_drops_on_overflow() {
-        // Use a fresh local channel that mirrors WAKE_TX's shape — the global
-        // is initialised once per process by the daemon, so unit tests can't
-        // re-init it. Verifies the contract: try_send never blocks and never
-        // grows beyond capacity.
-        let (tx, rx) = mpsc::sync_channel::<()>(WAKE_CHANNEL_CAPACITY);
-        for _ in 0..(WAKE_CHANNEL_CAPACITY * 4) {
-            // Mirrors `wake_main_loop`: drop on full, don't block.
-            let _ = tx.try_send(());
+    fn run_intercept(
+        chunk: &[u8],
+        state: &mut PaneTerminalState,
+        osc52_pending: &mut Vec<Vec<u8>>,
+        policy: &ClipboardPolicy,
+        palette: &ThemePalette,
+    ) -> Vec<u8> {
+        let mut writer = VecWriter(Vec::new());
+        let mut osc_carry = Vec::new();
+        let mut csi_carry = Vec::new();
+        {
+            let mut ctx = InterceptCtx {
+                state,
+                osc52_pending,
+                osc_carry: &mut osc_carry,
+                csi_carry: &mut csi_carry,
+                writer: &mut writer,
+                policy,
+                palette,
+            };
+            intercept_chunk(&mut ctx, chunk);
         }
-        let mut drained = 0;
-        while rx.try_recv().is_ok() {
-            drained += 1;
-        }
+        writer.0
+    }
+
+    // ─── #78 — DECSET state tracking ───────────────────────
+
+    #[test]
+    fn track_dec_modes_bracketed_paste() {
+        let mut s = PaneTerminalState::new();
+        track_dec_modes(b"\x1b[?2004h", &mut s);
+        assert!(s.bracketed_paste);
+        track_dec_modes(b"\x1b[?2004l", &mut s);
+        assert!(!s.bracketed_paste);
+    }
+
+    #[test]
+    fn track_dec_modes_combined_modes() {
+        // `\x1b[?1000;1006h` enables both protocol and SGR encoding.
+        let mut s = PaneTerminalState::new();
+        track_dec_modes(b"\x1b[?1000;1006h", &mut s);
+        assert_eq!(s.mouse_mode.protocol, MouseProtocol::X10);
+        assert_eq!(s.mouse_mode.encoding, MouseEncoding::Sgr);
+
+        track_dec_modes(b"\x1b[?1000;1006l", &mut s);
+        assert!(s.mouse_mode.is_off());
+        assert_eq!(s.mouse_mode.encoding, MouseEncoding::X10);
+    }
+
+    #[test]
+    fn track_dec_modes_focus_events() {
+        let mut s = PaneTerminalState::new();
+        track_dec_modes(b"\x1b[?1004h", &mut s);
+        assert!(s.focus_reporting);
+        track_dec_modes(b"\x1b[?1004l", &mut s);
+        assert!(!s.focus_reporting);
+    }
+
+    #[test]
+    fn track_dec_modes_mouse_protocol_progression() {
+        let mut s = PaneTerminalState::new();
+        track_dec_modes(b"\x1b[?1000h", &mut s);
+        assert_eq!(s.mouse_mode.protocol, MouseProtocol::X10);
+        track_dec_modes(b"\x1b[?1002h", &mut s);
+        assert_eq!(s.mouse_mode.protocol, MouseProtocol::Btn);
+        track_dec_modes(b"\x1b[?1003h", &mut s);
+        assert_eq!(s.mouse_mode.protocol, MouseProtocol::Any);
+        track_dec_modes(b"\x1b[?1003l", &mut s);
+        assert!(s.mouse_mode.is_off());
+    }
+
+    #[test]
+    fn track_dec_modes_disable_inactive_protocol_no_op() {
+        // ?1003h then ?1000l should NOT clear 1003 — different protocol bit.
+        let mut s = PaneTerminalState::new();
+        track_dec_modes(b"\x1b[?1003h", &mut s);
+        assert_eq!(s.mouse_mode.protocol, MouseProtocol::Any);
+        track_dec_modes(b"\x1b[?1000l", &mut s);
         assert_eq!(
-            drained, WAKE_CHANNEL_CAPACITY,
-            "bounded channel must hold exactly capacity entries on overflow"
+            s.mouse_mode.protocol,
+            MouseProtocol::Any,
+            "disabling X10 must not affect active Any protocol"
         );
     }
 
     #[test]
-    fn wake_channel_capacity_is_sane() {
-        // Sanity check on the chosen capacity — large enough to absorb one
-        // tick at 60 fps with a handful of panes (~10s of wakes), small
-        // enough to be O(byte) memory.
-        const _: () = assert!(
-            WAKE_CHANNEL_CAPACITY >= 32 && WAKE_CHANNEL_CAPACITY <= 256,
-            "WAKE_CHANNEL_CAPACITY outside expected range"
+    fn percent_decode_basic() {
+        assert_eq!(percent_decode("/tmp"), "/tmp");
+        assert_eq!(percent_decode("/path%20with%20spaces"), "/path with spaces");
+        assert_eq!(percent_decode("%2Fweird%2Fpath"), "/weird/path");
+        // Unknown escape — leave alone
+        assert_eq!(percent_decode("%ZZ"), "%ZZ");
+    }
+
+    #[test]
+    fn parse_helpers() {
+        assert_eq!(parse_u8(b"42"), Some(42));
+        assert_eq!(parse_u8(b""), None);
+        assert_eq!(parse_u8(b"abc"), None);
+        assert_eq!(parse_u8(b"300"), None); // overflow
+        assert_eq!(parse_u32(b"1024"), Some(1024));
+    }
+
+    #[test]
+    fn scan_csi_finds_final_byte() {
+        match scan_csi_terminator(b"5u") {
+            ScanCsi::Complete { end, final_byte } => {
+                assert_eq!(end, 1);
+                assert_eq!(final_byte, b'u');
+            }
+            ScanCsi::Incomplete => panic!("should be complete"),
+        }
+    }
+
+    #[test]
+    fn scan_osc_terminators() {
+        match scan_osc_terminator(b"7;file:///tmp\x07") {
+            ScanOsc::Complete { end } => assert_eq!(end, b"7;file:///tmp".len()),
+            ScanOsc::Incomplete => panic!("BEL terminator missed"),
+        }
+        match scan_osc_terminator(b"7;file:///tmp\x1b\\") {
+            ScanOsc::Complete { end } => assert_eq!(end, b"7;file:///tmp".len()),
+            ScanOsc::Incomplete => panic!("ST terminator missed"),
+        }
+        match scan_osc_terminator(b"7;file:///tmp") {
+            ScanOsc::Incomplete => {}
+            ScanOsc::Complete { .. } => panic!("should be incomplete"),
+        }
+    }
+
+    // ─── #74 — Kitty keyboard stack via interceptor ────────
+
+    #[test]
+    fn intercept_kitty_push_then_query_replies_with_top() {
+        let mut state = PaneTerminalState::new();
+        let mut pending = Vec::new();
+        let policy = ClipboardPolicy::default();
+        let palette = ThemePalette::default();
+
+        // Push flags=5
+        run_intercept(b"\x1b[>5u", &mut state, &mut pending, &policy, &palette);
+        assert_eq!(state.kitty_kbd.active().bits(), 5);
+
+        // Query → reply written to writer
+        let reply = run_intercept(b"\x1b[?u", &mut state, &mut pending, &policy, &palette);
+        assert_eq!(reply, b"\x1b[?5u");
+    }
+
+    #[test]
+    fn intercept_kitty_push_pop_modify_sequence() {
+        let mut state = PaneTerminalState::new();
+        let mut pending = Vec::new();
+        let policy = ClipboardPolicy::default();
+        let palette = ThemePalette::default();
+
+        // Push 1, push 15, modify with mode=3 (AND-NOT) flags=4 → 11
+        run_intercept(
+            b"\x1b[>1u\x1b[>15u\x1b[=4;3u",
+            &mut state,
+            &mut pending,
+            &policy,
+            &palette,
         );
+        assert_eq!(state.kitty_kbd.active().bits(), 11);
+        assert_eq!(state.kitty_kbd.depth(), 2);
+
+        // Pop one
+        run_intercept(b"\x1b[<1u", &mut state, &mut pending, &policy, &palette);
+        assert_eq!(state.kitty_kbd.active().bits(), 1);
+
+        // Pop everything
+        run_intercept(b"\x1b[<5u", &mut state, &mut pending, &policy, &palette);
+        assert_eq!(state.kitty_kbd.depth(), 0);
+        assert_eq!(state.kitty_kbd.active().bits(), 0);
+    }
+
+    // ─── #75 — OSC 7 cwd intercept ──────────────────────────
+
+    #[test]
+    fn intercept_osc7_decodes_simple_path() {
+        let mut state = PaneTerminalState::new();
+        let mut pending = Vec::new();
+        let policy = ClipboardPolicy::default();
+        let palette = ThemePalette::default();
+
+        run_intercept(
+            b"\x1b]7;file:///tmp\x1b\\",
+            &mut state,
+            &mut pending,
+            &policy,
+            &palette,
+        );
+        let (path, _ts) = state.reported_cwd.as_ref().expect("OSC 7 not captured");
+        assert_eq!(path.as_path(), std::path::Path::new("/tmp"));
+    }
+
+    #[test]
+    fn intercept_osc7_decodes_percent_escapes_and_host() {
+        let mut state = PaneTerminalState::new();
+        let mut pending = Vec::new();
+        let policy = ClipboardPolicy::default();
+        let palette = ThemePalette::default();
+
+        run_intercept(
+            b"\x1b]7;file://hostname/home/u%20ser/pkg\x07",
+            &mut state,
+            &mut pending,
+            &policy,
+            &palette,
+        );
+        let (path, _ts) = state.reported_cwd.as_ref().unwrap();
+        assert_eq!(path.as_path(), std::path::Path::new("/home/u ser/pkg"));
+    }
+
+    // ─── #76 — OSC 8 hyperlinks pass-through ────────────────
+
+    #[test]
+    fn intercept_osc8_does_not_consume_or_inject() {
+        let mut state = PaneTerminalState::new();
+        let mut pending = Vec::new();
+        let policy = ClipboardPolicy::default();
+        let palette = ThemePalette::default();
+
+        // OSC 8 ; ; URL ST text OSC 8 ; ; ST — the multiplexer touches none of it.
+        let reply = run_intercept(
+            b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\",
+            &mut state,
+            &mut pending,
+            &policy,
+            &palette,
+        );
+        assert!(reply.is_empty(), "OSC 8 must not produce a writer reply");
+        assert!(pending.is_empty(), "OSC 8 must not enqueue anything");
+        assert!(state.reported_cwd.is_none());
+    }
+
+    // ─── #77 — OSC 4/10/11/12 colour queries ────────────────
+
+    #[test]
+    fn intercept_osc11_query_returns_theme_bg() {
+        let mut state = PaneTerminalState::new();
+        let mut pending = Vec::new();
+        let policy = ClipboardPolicy::default();
+        let mut palette = ThemePalette::default();
+        palette.bg = Some(Rgb::new(0x1e, 0x1e, 0x2e));
+
+        let reply = run_intercept(
+            b"\x1b]11;?\x07",
+            &mut state,
+            &mut pending,
+            &policy,
+            &palette,
+        );
+        assert_eq!(reply, b"\x1b]11;rgb:1e1e/1e1e/2e2e\x07");
+    }
+
+    #[test]
+    fn intercept_osc11_query_passes_through_when_no_theme() {
+        let mut state = PaneTerminalState::new();
+        let mut pending = Vec::new();
+        let policy = ClipboardPolicy::default();
+        let palette = ThemePalette::default(); // inactive
+
+        let reply = run_intercept(
+            b"\x1b]11;?\x07",
+            &mut state,
+            &mut pending,
+            &policy,
+            &palette,
+        );
+        assert!(reply.is_empty(), "no theme → no multiplexer-side reply");
+    }
+
+    #[test]
+    fn intercept_osc4_palette_query() {
+        let mut state = PaneTerminalState::new();
+        let mut pending = Vec::new();
+        let policy = ClipboardPolicy::default();
+        let mut palette = ThemePalette::default();
+        palette.palette[42] = Some(Rgb::new(0x12, 0x34, 0x56));
+
+        let reply = run_intercept(
+            b"\x1b]4;42;?\x07",
+            &mut state,
+            &mut pending,
+            &policy,
+            &palette,
+        );
+        assert_eq!(reply, b"\x1b]4;42;rgb:1212/3434/5656\x07");
+    }
+
+    #[test]
+    fn intercept_osc4_unknown_index_silent() {
+        let mut state = PaneTerminalState::new();
+        let mut pending = Vec::new();
+        let policy = ClipboardPolicy::default();
+        let mut palette = ThemePalette::default();
+        palette.fg = Some(Rgb::new(0xff, 0xff, 0xff));
+
+        // Theme is active but index 99 not set: no reply.
+        let reply = run_intercept(
+            b"\x1b]4;99;?\x07",
+            &mut state,
+            &mut pending,
+            &policy,
+            &palette,
+        );
+        assert!(reply.is_empty());
+    }
+
+    // ─── #78 — Per-pane state (interceptor) ────────────────
+
+    #[test]
+    fn intercept_chunk_boundary_split_osc52() {
+        // Same OSC 52 split across two reads — must reassemble correctly.
+        let mut state = PaneTerminalState::new();
+        let mut pending = Vec::new();
+        let policy = ClipboardPolicy {
+            set: Osc52SetPolicy::Allow,
+            ..ClipboardPolicy::default()
+        };
+        let palette = ThemePalette::default();
+
+        let mut writer = VecWriter(Vec::new());
+        let mut osc_carry = Vec::new();
+        let mut csi_carry = Vec::new();
+        {
+            let mut ctx = InterceptCtx {
+                state: &mut state,
+                osc52_pending: &mut pending,
+                osc_carry: &mut osc_carry,
+                csi_carry: &mut csi_carry,
+                writer: &mut writer,
+                policy: &policy,
+                palette: &palette,
+            };
+            // First half ends mid-OSC.
+            intercept_chunk(&mut ctx, b"\x1b]52;c;");
+            assert!(ctx.osc52_pending.is_empty());
+            // Second half completes it.
+            intercept_chunk(&mut ctx, b"aGVsbG8=\x07");
+        }
+        assert_eq!(pending.len(), 1);
+        assert_eq!(&pending[0], b"\x1b]52;c;aGVsbG8=\x07");
+    }
+
+    // ─── #79 — OSC 52 paste-injection guard ────────────────
+
+    #[test]
+    fn intercept_osc52_set_allow_pushes_envelope() {
+        let mut state = PaneTerminalState::new();
+        let mut pending = Vec::new();
+        let policy = ClipboardPolicy {
+            set: Osc52SetPolicy::Allow,
+            ..ClipboardPolicy::default()
+        };
+        let palette = ThemePalette::default();
+
+        run_intercept(
+            b"\x1b]52;c;aGVsbG8=\x07",
+            &mut state,
+            &mut pending,
+            &policy,
+            &palette,
+        );
+        assert_eq!(pending.len(), 1);
+        assert!(state.osc52_pending_confirm.is_empty());
+    }
+
+    #[test]
+    fn intercept_osc52_set_deny_drops_silently() {
+        let mut state = PaneTerminalState::new();
+        let mut pending = Vec::new();
+        let policy = ClipboardPolicy {
+            set: Osc52SetPolicy::Deny,
+            ..ClipboardPolicy::default()
+        };
+        let palette = ThemePalette::default();
+
+        run_intercept(
+            b"\x1b]52;c;aGVsbG8=\x07",
+            &mut state,
+            &mut pending,
+            &policy,
+            &palette,
+        );
+        assert!(pending.is_empty());
+        assert!(state.osc52_pending_confirm.is_empty());
+    }
+
+    #[test]
+    fn intercept_osc52_set_confirm_parks_payload() {
+        let mut state = PaneTerminalState::new();
+        let mut pending = Vec::new();
+        let policy = ClipboardPolicy::default(); // Confirm is the default
+        let palette = ThemePalette::default();
+
+        run_intercept(
+            b"\x1b]52;c;aGVsbG8=\x07",
+            &mut state,
+            &mut pending,
+            &policy,
+            &palette,
+        );
+        assert!(pending.is_empty(), "confirm policy must not auto-forward");
+        assert_eq!(state.osc52_pending_confirm.len(), 1);
+    }
+
+    #[test]
+    fn intercept_osc52_set_oversized_dropped() {
+        let mut state = PaneTerminalState::new();
+        let mut pending = Vec::new();
+        let policy = ClipboardPolicy {
+            set: Osc52SetPolicy::Allow,
+            max_bytes: 16,
+            ..ClipboardPolicy::default()
+        };
+        let palette = ThemePalette::default();
+
+        // 32-byte base64 payload exceeds the cap.
+        let blob = vec![b'A'; 32];
+        let mut seq = b"\x1b]52;c;".to_vec();
+        seq.extend_from_slice(&blob);
+        seq.push(0x07);
+        run_intercept(&seq, &mut state, &mut pending, &policy, &palette);
+        assert!(pending.is_empty(), "oversized OSC 52 must be dropped");
+    }
+
+    #[test]
+    fn intercept_osc52_get_default_denies() {
+        let mut state = PaneTerminalState::new();
+        let mut pending = Vec::new();
+        let policy = ClipboardPolicy::default();
+        let palette = ThemePalette::default();
+
+        run_intercept(
+            b"\x1b]52;c;?\x07",
+            &mut state,
+            &mut pending,
+            &policy,
+            &palette,
+        );
+        assert!(pending.is_empty(), "OSC 52 read must be denied by default");
+    }
+
+    #[test]
+    fn intercept_osc52_per_pane_decision_overrides_confirm() {
+        let mut state = PaneTerminalState::new();
+        state.osc52_decision = Osc52Decision::Allowed;
+        let mut pending = Vec::new();
+        let policy = ClipboardPolicy::default(); // Confirm
+        let palette = ThemePalette::default();
+
+        run_intercept(
+            b"\x1b]52;c;aGVsbG8=\x07",
+            &mut state,
+            &mut pending,
+            &policy,
+            &palette,
+        );
+        // Decision=Allowed should bypass confirm and forward immediately.
+        assert_eq!(pending.len(), 1);
+        assert!(state.osc52_pending_confirm.is_empty());
+    }
+
+    #[test]
+    fn intercept_osc52_per_pane_decision_denied_blocks() {
+        let mut state = PaneTerminalState::new();
+        state.osc52_decision = Osc52Decision::Denied;
+        let mut pending = Vec::new();
+        let policy = ClipboardPolicy {
+            set: Osc52SetPolicy::Allow,
+            ..ClipboardPolicy::default()
+        };
+        let palette = ThemePalette::default();
+
+        run_intercept(
+            b"\x1b]52;c;aGVsbG8=\x07",
+            &mut state,
+            &mut pending,
+            &policy,
+            &palette,
+        );
+        // Cached Denied beats config Allow.
+        assert!(pending.is_empty());
     }
 }

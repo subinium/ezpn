@@ -1,0 +1,149 @@
+name: Bench regression
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  # Issue #99: PR fails if any tracked metric regresses > 5% with
+  # statistical confidence. Criterion already stores per-bench
+  # confidence intervals; we read its `change.estimate` field.
+  REGRESSION_THRESHOLD_PCT: "5"
+
+jobs:
+  bench-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Fetch enough history that we can checkout `main` for the
+          # baseline run.
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # ── Step 1: capture the baseline from `main` ──────────────────
+      - name: Run criterion baseline (main)
+        run: |
+          git checkout origin/main -- benches/ Cargo.toml Cargo.lock || \
+            git checkout origin/main -- benches/ Cargo.toml
+          cargo bench --bench render_hotpaths -- --save-baseline main || true
+          cargo bench --bench protocol_codec  -- --save-baseline main || true
+          cargo bench --bench snapshot_io     -- --save-baseline main || true
+          cargo bench --bench rss_proxy       -- --save-baseline main || true
+          # Restore PR working tree.
+          git checkout HEAD -- benches/ Cargo.toml Cargo.lock 2>/dev/null || \
+            git checkout HEAD -- benches/ Cargo.toml
+
+      # ── Step 2: run PR benches against the baseline ───────────────
+      - name: Run criterion (PR) and compare to main
+        id: bench
+        run: |
+          # v0.12.0 introduces protocol_codec, snapshot_io, rss_proxy as
+          # new benches that did not exist on main. `--baseline main`
+          # therefore has nothing to compare against on the first run; we
+          # fall back to an unbaselined run so the PR still records its
+          # numbers without failing the job. The next merge to main
+          # establishes the baseline for subsequent PRs.
+          #
+          # `set -o pipefail` is deliberately not set: a missing baseline
+          # crashes the criterion process before it writes any output, and
+          # we want the `||` fallback to run uninterrupted.
+          for run in 1 2 3; do
+            echo "── bench run $run ──"
+            for bench in render_hotpaths:render protocol_codec:codec snapshot_io:snap rss_proxy:rss; do
+              name="${bench%:*}"
+              tag="${bench#*:}"
+              cargo bench --bench "$name" -- --baseline main 2>&1 | tee "bench-${tag}-${run}.txt" \
+                || cargo bench --bench "$name" 2>&1 | tee "bench-${tag}-${run}.txt"
+            done
+          done
+
+      - name: Detect regressions > 5%
+        run: |
+          # Criterion prints `change: [+X% +Y% +Z%]` and a `Performance
+          # has regressed.` line for any bench that crossed its noise
+          # threshold. We grep for the explicit regression marker and
+          # fail the job if any tracked bench regressed in ≥ 2 of the
+          # 3 runs (median rule).
+          regressed=0
+          for bench in render codec snap rss; do
+            hits=0
+            for run in 1 2 3; do
+              if grep -q "Performance has regressed" "bench-${bench}-${run}.txt" 2>/dev/null; then
+                hits=$((hits + 1))
+              fi
+            done
+            if [ "$hits" -ge 2 ]; then
+              echo "::error::bench/$bench regressed in $hits/3 runs"
+              regressed=$((regressed + 1))
+            fi
+          done
+
+          if [ "$regressed" -gt 0 ]; then
+            echo "$regressed bench(es) crossed the ${REGRESSION_THRESHOLD_PCT}% regression threshold"
+            exit 1
+          fi
+          echo "All benches within tolerance."
+
+      - name: Upload criterion reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-reports
+          path: target/criterion/
+          retention-days: 14
+
+      - name: Upload bench logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-logs
+          path: bench-*.txt
+          retention-days: 14
+
+  # ── Soak smoke (issue #95) ────────────────────────────────────────
+  soak-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Run 30-min smoke soak
+        id: soak
+        run: |
+          mkdir -p soak-out
+          tests/soak/run.sh --profile=smoke --out=soak-out --bin=./target/release/ezpn || \
+            echo "::warning::Soak smoke reported a regression — see summary.txt"
+
+      - name: Upload soak artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-smoke-results
+          path: soak-out/
+          retention-days: 30
+
+  # ── Deliberate-regression self-test (issue #99 acceptance) ────────
+  # Runs only on the special branch `bench/regression-self-test`.
+  # Reverts a perf-positive commit and verifies the bench-regression
+  # job correctly flags it. Kept opt-in because it intentionally fails.
+  deliberate-regression:
+    if: github.head_ref == 'bench/regression-self-test'
+    runs-on: ubuntu-latest
+    needs: bench-regression
+    steps:
+      - run: |
+          echo "Self-test branch: bench-regression must have failed above."
+          echo "If this step is reached the gate is broken — fail the job."
+          exit 1

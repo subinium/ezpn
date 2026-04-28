@@ -23,20 +23,22 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::env_interp::{self, EnvContext, ExpandError, Redacted, SecretsLoadError};
+use crate::hooks::{Hook, RawHook};
 use crate::layout::Layout;
 use crate::pane::PaneLaunch;
-
-/// Maximum recursion depth allowed when expanding `${...}` references in env values.
-/// Hard cap to detect cycles like `A=${env:B}` + `B=${env:A}`.
-pub const ENV_RESOLVE_MAX_DEPTH: u32 = 8;
 
 /// Top-level `.ezpn.toml` structure.
 #[derive(Deserialize)]
 pub struct ProjectConfig {
     pub workspace: Option<WorkspaceSection>,
-    pub session: Option<SessionSection>,
     #[serde(default)]
     pub pane: Vec<PaneSection>,
+    /// Project-level `[[hooks]]`. Merged with global hooks from
+    /// `~/.config/ezpn/config.toml`. See `crate::hooks` (issue #83) for the
+    /// security model and event vocabulary.
+    #[serde(default)]
+    pub hooks: Vec<RawHook>,
 }
 
 #[derive(Deserialize)]
@@ -44,23 +46,6 @@ pub struct WorkspaceSection {
     pub layout: Option<String>,
     pub rows: Option<usize>,
     pub cols: Option<usize>,
-    /// Per-project override for the global `persist_scrollback` setting.
-    /// `Some(true|false)` overrides; `None` falls back to the global value.
-    pub persist_scrollback: Option<bool>,
-}
-
-/// Optional `[session]` section pinning a deterministic session name.
-///
-/// ```toml
-/// [session]
-/// name = "myproject"
-/// ```
-///
-/// When present, this name is preferred over the auto-derived basename.
-/// CLI `-S/--session` still wins over the pin (see `main::main`).
-#[derive(Deserialize)]
-pub struct SessionSection {
-    pub name: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -82,10 +67,12 @@ pub struct PaneSection {
     #[serde(default)]
     pub restart: RestartPolicy,
     pub shell: Option<String>,
-    /// Per-pane scrollback override (lines). When present, takes precedence
-    /// over the global `[scrollback] default_lines`. Capped against
-    /// `EzpnConfig::scrollback_max_lines` when applied. SPEC 02.
-    pub scrollback_lines: Option<usize>,
+    /// Per-pane override for snapshot scrollback persistence (#69).
+    /// `None` (omitted) means "fall back to `[global] persist_scrollback`";
+    /// `Some(true)` / `Some(false)` force the pane on or off regardless
+    /// of the global default. Resolution lives in [`ResolvedProject`]
+    /// so the daemon can consult a single map at save time.
+    pub persist_scrollback: Option<bool>,
 }
 
 /// Resolved project config ready for launching.
@@ -97,48 +84,18 @@ pub struct ResolvedProject {
     pub envs: HashMap<usize, HashMap<String, String>>,
     pub restarts: HashMap<usize, RestartPolicy>,
     pub shells: HashMap<usize, String>,
-    /// Directory containing `.ezpn.toml`. Used to resolve `${file:.env.local}`
-    /// and to locate `.env.local` for auto-merge. Surfaced for `ezpn doctor`
-    /// and snapshot restore — not read by current spawn path (envs are already
-    /// resolved at load time), but kept on the public struct so callers can
-    /// re-run [`resolve_env`] without re-parsing the TOML.
-    #[allow(dead_code)]
-    pub base_dir: PathBuf,
-    /// Per-pane env resolution errors, surfaced by `ezpn doctor`.
-    /// Empty when every reference in every pane resolved successfully.
-    #[allow(dead_code)]
-    pub env_errors: HashMap<usize, Vec<String>>,
-    /// Per-project override for `persist_scrollback`. `None` means defer to
-    /// the global `EzpnConfig.persist_scrollback`.
-    pub persist_scrollback: Option<bool>,
-    /// Per-pane scrollback line overrides. Empty when no `[[pane]]` section
-    /// supplied `scrollback_lines`. Looked up in `spawn_project_panes`.
-    pub scrollback_overrides: HashMap<usize, usize>,
+    /// Per-pane scrollback-persistence overrides (#69). `Some(true)` /
+    /// `Some(false)` force the pane on or off; missing entries fall
+    /// back to `[global] persist_scrollback` from `EzpnConfig`. Storing
+    /// only the explicit overrides keeps the map empty for the typical
+    /// case where the user just sets the global flag.
+    pub persist_scrollback: HashMap<usize, bool>,
+    /// Validated project-level hooks. Already passed through
+    /// `Hook::from_raw`, so unknown events / empty exec arrays are
+    /// rejected here at load time. Merge into the global executor at
+    /// server boot (`HookExecutor::new(global ++ project.hooks)`).
+    pub hooks: Vec<Hook>,
 }
-
-/// Errors returned by [`resolve_env`].
-#[derive(Debug)]
-pub enum ResolveError {
-    TooDeep,
-    MissingRef(String),
-    Io(String),
-}
-
-// Hand-rolled Display + Error so we don't pull in `thiserror` as a dep.
-impl std::fmt::Display for ResolveError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ResolveError::TooDeep => write!(
-                f,
-                "env interpolation exceeded depth {} (cycle?)",
-                ENV_RESOLVE_MAX_DEPTH
-            ),
-            ResolveError::MissingRef(s) => write!(f, "Missing reference: {s}"),
-            ResolveError::Io(s) => write!(f, "{s}"),
-        }
-    }
-}
-impl std::error::Error for ResolveError {}
 
 /// Try to find and load `.ezpn.toml` from the current directory.
 /// Returns `None` if the file doesn't exist.
@@ -148,27 +105,6 @@ pub fn load_project() -> Option<Result<ResolvedProject, String>> {
         return None;
     }
     Some(load_project_from(path))
-}
-
-/// Read the pinned `[session].name` from `.ezpn.toml` in cwd, if any.
-///
-/// Returns `None` when:
-/// - `.ezpn.toml` does not exist,
-/// - the file cannot be read or parsed,
-/// - the `[session]` section is absent,
-/// - or `name` is unset.
-///
-/// This is intentionally lenient — a malformed toml should not block the user
-/// from running `ezpn`; the regular `load_project()` path will surface the
-/// parse error later when layout resolution runs.
-pub fn pinned_session_name() -> Option<String> {
-    let path = Path::new(".ezpn.toml");
-    if !path.exists() {
-        return None;
-    }
-    let contents = std::fs::read_to_string(path).ok()?;
-    let config: ProjectConfig = toml::from_str(&contents).ok()?;
-    config.session.and_then(|s| s.name)
 }
 
 fn load_project_from(path: &Path) -> Result<ResolvedProject, String> {
@@ -188,61 +124,86 @@ fn load_project_from(path: &Path) -> Result<ResolvedProject, String> {
     let mut envs = HashMap::new();
     let mut restarts = HashMap::new();
     let mut shells = HashMap::new();
-    let mut scrollback_overrides: HashMap<usize, usize> = HashMap::new();
-    let mut env_errors: HashMap<usize, Vec<String>> = HashMap::new();
+    let mut persist_scrollback = HashMap::new();
     let base_dir = path
         .parent()
         .unwrap_or(Path::new("."))
         .canonicalize()
         .unwrap_or_else(|_| PathBuf::from("."));
 
+    // Build the interpolation context once per `.ezpn.toml` parse:
+    //   per-pane env > .env.local > secrets > process env
+    // Secrets are gated behind ${secret:KEY} and never leak through Debug.
+    let dotenv = env_interp::load_dotenv(&base_dir).map_err(|e| {
+        // Error message comes from load_dotenv; never includes secret values.
+        format!("loading .env.local: {e}")
+    })?;
+    let secrets_path = env_interp::default_secrets_path();
+    let secrets: HashMap<String, Redacted<String>> = env_interp::load_secrets(&secrets_path)
+        .map_err(|e: SecretsLoadError| format!("loading secrets: {e}"))?;
+    let base_ctx = EnvContext::build(dotenv, secrets);
+
     for (i, pid) in pane_ids.iter().enumerate() {
         if let Some(section) = config.pane.get(i) {
+            // Resolve the pane's own env block first, using the base context
+            // (no pane overrides yet — the pane's env values are the source
+            // for that precedence layer, so they cannot reference themselves).
+            let mut resolved_env: HashMap<String, String> = HashMap::new();
+            for (k, v) in &section.env {
+                let expanded = env_interp::expand(v, &base_ctx)
+                    .map_err(|e| format_expand_err("env", k, &e))?;
+                resolved_env.insert(k.clone(), expanded);
+            }
+            // Build a pane-scoped context that layers the resolved per-pane
+            // env on top of .env.local + process env, used for the pane's
+            // command/cwd/name/shell expansions.
+            let pane_ctx = base_ctx.with_pane(resolved_env.clone());
+
             if let Some(cmd) = &section.command {
-                launches.insert(*pid, PaneLaunch::Command(cmd.clone()));
+                let expanded = env_interp::expand(cmd, &pane_ctx)
+                    .map_err(|e| format_expand_err("command", "", &e))?;
+                launches.insert(*pid, PaneLaunch::Command(expanded));
             } else {
                 launches.insert(*pid, PaneLaunch::Shell);
             }
             if let Some(cwd) = &section.cwd {
-                let resolved = base_dir.join(cwd);
+                let expanded = env_interp::expand(cwd, &pane_ctx)
+                    .map_err(|e| format_expand_err("cwd", "", &e))?;
+                let resolved = base_dir.join(expanded);
                 cwds.insert(*pid, resolved);
             }
             if let Some(name) = &section.name {
-                names.insert(*pid, name.clone());
+                let expanded = env_interp::expand(name, &pane_ctx)
+                    .map_err(|e| format_expand_err("name", "", &e))?;
+                names.insert(*pid, expanded);
             }
-            // Resolve `${...}` interpolation + merge `.env.local` (overrides).
-            // On error, keep best-effort values (literal raw) and surface to doctor.
-            match resolve_env(&base_dir, &section.env, 0) {
-                Ok(resolved) => {
-                    if !resolved.is_empty() {
-                        envs.insert(*pid, resolved);
-                    }
-                }
-                Err(e) => {
-                    env_errors.entry(*pid).or_default().push(e.to_string());
-                    if !section.env.is_empty() {
-                        envs.insert(*pid, section.env.clone());
-                    }
-                }
+            if !resolved_env.is_empty() {
+                envs.insert(*pid, resolved_env);
             }
             if section.restart != RestartPolicy::Never {
                 restarts.insert(*pid, section.restart.clone());
             }
             if let Some(shell) = &section.shell {
-                shells.insert(*pid, shell.clone());
+                let expanded = env_interp::expand(shell, &pane_ctx)
+                    .map_err(|e| format_expand_err("shell", "", &e))?;
+                shells.insert(*pid, expanded);
             }
-            if let Some(lines) = section.scrollback_lines {
-                scrollback_overrides.insert(*pid, lines);
+            if let Some(flag) = section.persist_scrollback {
+                persist_scrollback.insert(*pid, flag);
             }
         } else {
             launches.insert(*pid, PaneLaunch::Shell);
         }
     }
 
-    let persist_scrollback = config
-        .workspace
-        .as_ref()
-        .and_then(|ws| ws.persist_scrollback);
+    // Validate project-level hooks. A bad event name or empty exec is a
+    // hard error — the project config refused to start the daemon.
+    let mut hooks = Vec::with_capacity(config.hooks.len());
+    for (i, raw) in config.hooks.into_iter().enumerate() {
+        let hook = Hook::from_raw(raw)
+            .map_err(|e| format!("[[hooks]][{i}] in {}: {e}", path.display()))?;
+        hooks.push(hook);
+    }
 
     Ok(ResolvedProject {
         layout,
@@ -252,273 +213,9 @@ fn load_project_from(path: &Path) -> Result<ResolvedProject, String> {
         envs,
         restarts,
         shells,
-        base_dir,
-        env_errors,
         persist_scrollback,
-        scrollback_overrides,
+        hooks,
     })
-}
-
-/// Resolve `${...}` references and merge `.env.local` into `raw`.
-///
-/// Supported reference forms:
-///   - `${HOME}`              -> `std::env::var("HOME")`
-///   - `${env:NODE_ENV}`      -> `std::env::var("NODE_ENV")`
-///   - `${file:.env.local}`   -> dotenv-style lookup of the *current key* in that file
-///   - `${secret:keychain:K}` -> macOS `security`, Linux `secret-tool`, then env fallback
-///
-/// `.env.local` (in `base_dir`) is merged AFTER per-pane resolution and **overrides**
-/// `.ezpn.toml` literal values. Missing `.env.local` is not an error.
-///
-/// `depth` is the recursion counter; pass 0 for top-level callers. Cap is
-/// [`ENV_RESOLVE_MAX_DEPTH`].
-pub fn resolve_env(
-    base_dir: &Path,
-    raw: &HashMap<String, String>,
-    depth: u32,
-) -> Result<HashMap<String, String>, ResolveError> {
-    if depth > ENV_RESOLVE_MAX_DEPTH {
-        return Err(ResolveError::TooDeep);
-    }
-    let mut out = HashMap::with_capacity(raw.len());
-    for (k, v) in raw {
-        out.insert(k.clone(), expand_value(v, k, base_dir, depth + 1)?);
-    }
-    // Merge `.env.local` (highest precedence below `${secret:...}`).
-    if let Some(local) = dotenv_load(&base_dir.join(".env.local"))? {
-        for (k, v) in local {
-            let resolved = expand_value(&v, &k, base_dir, depth + 1)?;
-            out.insert(k, resolved);
-        }
-    }
-    Ok(out)
-}
-
-/// Recursively expand `${...}` references in `value`. `current_key` is the
-/// outer env key being resolved — needed for `${file:.env.local}` which
-/// looks up the same key in the dotenv file.
-fn expand_value(
-    value: &str,
-    current_key: &str,
-    base_dir: &Path,
-    depth: u32,
-) -> Result<String, ResolveError> {
-    if depth > ENV_RESOLVE_MAX_DEPTH {
-        return Err(ResolveError::TooDeep);
-    }
-    let mut out = String::with_capacity(value.len());
-    let bytes = value.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        // Look for `${`
-        if i + 1 < bytes.len() && bytes[i] == b'$' && bytes[i + 1] == b'{' {
-            // Find matching `}` (no nested braces supported — keep grammar simple).
-            if let Some(end_rel) = bytes[i + 2..].iter().position(|&b| b == b'}') {
-                let inner = &value[i + 2..i + 2 + end_rel];
-                let resolved = resolve_ref(inner, current_key, base_dir)?;
-                // Recursively expand the resolved value (handles nested refs).
-                let expanded = expand_value(&resolved, current_key, base_dir, depth + 1)?;
-                out.push_str(&expanded);
-                i += 2 + end_rel + 1;
-                continue;
-            }
-            // Unterminated `${` — treat literally.
-        }
-        out.push(bytes[i] as char);
-        i += 1;
-    }
-    Ok(out)
-}
-
-/// Resolve a single `${...}` reference body (the part between braces).
-/// Forms accepted:
-///   `HOME`              -> env var lookup
-///   `env:VAR`           -> env var lookup
-///   `file:./relative`   -> dotenv lookup, key = `current_key`
-///   `secret:keychain:K` -> OS keyring (macOS/linux) with env fallback
-fn resolve_ref(body: &str, current_key: &str, base_dir: &Path) -> Result<String, ResolveError> {
-    if let Some(rest) = body.strip_prefix("env:") {
-        std::env::var(rest)
-            .map_err(|_| ResolveError::MissingRef(format!("${{env:{rest}}} (env var unset)")))
-    } else if let Some(rest) = body.strip_prefix("file:") {
-        let file_path = base_dir.join(rest);
-        let map = dotenv_load(&file_path)?.ok_or_else(|| {
-            ResolveError::MissingRef(format!("${{file:{rest}}} (file not found)"))
-        })?;
-        map.get(current_key).cloned().ok_or_else(|| {
-            ResolveError::MissingRef(format!(
-                "${{file:{rest}}} (key '{current_key}' not in file)"
-            ))
-        })
-    } else if let Some(rest) = body.strip_prefix("secret:") {
-        // Form: `secret:<backend>:<KEY>`
-        let mut parts = rest.splitn(2, ':');
-        let backend = parts.next().unwrap_or("");
-        let key = parts
-            .next()
-            .ok_or_else(|| ResolveError::MissingRef(format!("${{secret:{rest}}} (missing key)")))?;
-        match backend {
-            "keychain" => keychain_lookup(key)
-                .ok_or_else(|| ResolveError::MissingRef(format!("${{secret:keychain:{key}}}"))),
-            other => Err(ResolveError::MissingRef(format!(
-                "${{secret:{other}:{key}}} (unknown backend)"
-            ))),
-        }
-    } else {
-        // Bare `${HOME}` form -> env var
-        std::env::var(body)
-            .map_err(|_| ResolveError::MissingRef(format!("${{{body}}} (env var unset)")))
-    }
-}
-
-/// macOS: `security find-generic-password -s ezpn -a <key> -w` (500ms timeout).
-/// Linux: `secret-tool lookup ezpn <key>`. On either, fall back to env var with a warn.
-/// Returns `None` if the secret is not found anywhere.
-fn keychain_lookup(key: &str) -> Option<String> {
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(out) = run_with_timeout(
-            "security",
-            &["find-generic-password", "-s", "ezpn", "-a", key, "-w"],
-            std::time::Duration::from_millis(500),
-        ) {
-            return Some(out);
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(out) = run_with_timeout(
-            "secret-tool",
-            &["lookup", "ezpn", key],
-            std::time::Duration::from_millis(500),
-        ) {
-            return Some(out);
-        }
-    }
-    // Fallback: process env (with warn).
-    if let Ok(v) = std::env::var(key) {
-        eprintln!("ezpn: secret '{key}' not found in OS keychain, falling back to ${{env:{key}}}");
-        return Some(v);
-    }
-    None
-}
-
-/// Spawn a command, wait up to `timeout`, and return trimmed stdout on exit-0.
-/// Returns `None` on timeout, non-zero exit, or any I/O error.
-#[cfg(unix)]
-fn run_with_timeout(program: &str, args: &[&str], timeout: std::time::Duration) -> Option<String> {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-
-    let mut child = Command::new(program)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .stdin(Stdio::null())
-        .spawn()
-        .ok()?;
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return None;
-                }
-                let mut buf = String::new();
-                child.stdout.as_mut()?.read_to_string(&mut buf).ok()?;
-                return Some(buf.trim_end_matches(['\n', '\r']).to_string());
-            }
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    return None;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            Err(_) => return None,
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn run_with_timeout(
-    _program: &str,
-    _args: &[&str],
-    _timeout: std::time::Duration,
-) -> Option<String> {
-    None
-}
-
-/// Parse a dotenv-style file. Returns `Ok(None)` if the file does not exist.
-/// Grammar (intentionally minimal — no shell expansion):
-///   - `KEY=value`
-///   - `KEY="quoted value"` (handles `\"`, `\\`, `\n`, `\t`, `\r`)
-///   - `KEY='single-quoted'` (no escapes inside)
-///   - `# comment` lines and trailing `# comment` after value
-///   - blank lines
-///   - leading whitespace on lines is trimmed; `export KEY=...` is accepted
-pub fn dotenv_load(path: &Path) -> Result<Option<HashMap<String, String>>, ResolveError> {
-    let contents = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(ResolveError::Io(format!("read {}: {e}", path.display()))),
-    };
-    let mut out = HashMap::new();
-    for raw_line in contents.lines() {
-        let line = raw_line.trim_start();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let line = line.strip_prefix("export ").unwrap_or(line);
-        let Some((key, rest)) = line.split_once('=') else {
-            continue; // malformed line — silently skip
-        };
-        let key = key.trim().to_string();
-        if key.is_empty() {
-            continue;
-        }
-        let value = parse_dotenv_value(rest);
-        out.insert(key, value);
-    }
-    Ok(Some(out))
-}
-
-fn parse_dotenv_value(rest: &str) -> String {
-    let s = rest.trim_start();
-    if let Some(rest) = s.strip_prefix('"') {
-        // Double-quoted: collect up to unescaped `"`, process backslash escapes.
-        let mut out = String::with_capacity(rest.len());
-        let mut chars = rest.chars();
-        while let Some(c) = chars.next() {
-            match c {
-                '"' => return out,
-                '\\' => match chars.next() {
-                    Some('n') => out.push('\n'),
-                    Some('r') => out.push('\r'),
-                    Some('t') => out.push('\t'),
-                    Some('\\') => out.push('\\'),
-                    Some('"') => out.push('"'),
-                    Some(other) => {
-                        out.push('\\');
-                        out.push(other);
-                    }
-                    None => break,
-                },
-                _ => out.push(c),
-            }
-        }
-        out
-    } else if let Some(rest) = s.strip_prefix('\'') {
-        // Single-quoted: literal until next `'`.
-        match rest.find('\'') {
-            Some(end) => rest[..end].to_string(),
-            None => rest.to_string(),
-        }
-    } else {
-        // Unquoted: stop at `#` (comment) or end-of-line; trim trailing whitespace.
-        let end = s.find(" #").or_else(|| s.find('#')).unwrap_or(s.len());
-        s[..end].trim_end().to_string()
-    }
 }
 
 fn resolve_layout(config: &ProjectConfig) -> Result<Layout, String> {
@@ -549,6 +246,17 @@ fn resolve_layout(config: &ProjectConfig) -> Result<Layout, String> {
     // No [workspace] section — infer from pane count
     let pane_count = config.pane.len().max(2);
     Ok(Layout::from_grid(1, pane_count))
+}
+
+/// Format an `ExpandError` with the offending field/key context. The error
+/// message intentionally never contains resolved secret values — it relies
+/// on `ExpandError`'s redaction-safe `Display` impl.
+fn format_expand_err(field: &str, key: &str, err: &ExpandError) -> String {
+    if key.is_empty() {
+        format!("interpolation error in `{field}`: {err}")
+    } else {
+        format!("interpolation error in `{field}.{key}`: {err}")
+    }
 }
 
 #[cfg(test)]
@@ -656,130 +364,370 @@ command = "echo hello"
         assert_eq!(config.pane[0].restart, RestartPolicy::Never);
     }
 
-    // -------- env interpolation tests (.env.local, ${...}, depth, errors) --------
+    // ─── persist_scrollback override (#69) ─────────────────────
 
-    fn temp_dir() -> tempfile::TempDir {
-        tempfile::tempdir().unwrap()
-    }
+    #[test]
+    fn parse_persist_scrollback_override() {
+        let toml_str = r#"
+[[pane]]
+command = "tail -F /var/log/syslog"
+persist_scrollback = true
 
-    fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
+[[pane]]
+command = "htop"
+persist_scrollback = false
+
+[[pane]]
+command = "echo neutral"
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.pane[0].persist_scrollback, Some(true));
+        assert_eq!(config.pane[1].persist_scrollback, Some(false));
+        // Omitted means "fall back to global default".
+        assert_eq!(config.pane[2].persist_scrollback, None);
     }
 
     #[test]
-    fn env_interpolation_bare_var() {
-        // Use a known-set variable (PATH is always present on unix).
-        let raw = map(&[("MY_PATH", "${PATH}")]);
-        let dir = temp_dir();
-        let out = resolve_env(dir.path(), &raw, 0).unwrap();
-        let path = std::env::var("PATH").unwrap();
-        assert_eq!(out.get("MY_PATH").map(|s| s.as_str()), Some(path.as_str()));
+    fn resolved_persist_scrollback_only_records_explicit_overrides() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        isolate_secrets_dir(tmp.path());
+        let toml_str = r#"
+[workspace]
+layout = "1:1"
+
+[[pane]]
+command = "echo a"
+persist_scrollback = true
+
+[[pane]]
+command = "echo b"
+"#;
+        let path = write_project(tmp.path(), toml_str);
+        let resolved = load_project_from(&path).expect("load");
+
+        // Exactly one explicit override stored. The omitted pane is
+        // absent from the map so the daemon can fall through to the
+        // global flag without false `false` entries shadowing it.
+        assert_eq!(resolved.persist_scrollback.len(), 1);
+        assert_eq!(resolved.persist_scrollback.values().next(), Some(&true));
+
+        std::env::remove_var("EZPN_TEST_SECRETS_DIR");
+    }
+
+    // --- env interpolation integration (issue #63) --------------------------
+
+    use crate::pane::PaneLaunch;
+    use std::sync::Mutex;
+
+    /// Serialize tests that mutate `std::env`. `cargo test` runs tests in
+    /// parallel by default, and `std::env::set_var` is process-global.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn write_project(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        let path = dir.join(".ezpn.toml");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    fn isolate_secrets_dir(dir: &std::path::Path) {
+        // Prevents tests from picking up a real $XDG_RUNTIME_DIR/ezpn/secrets.toml.
+        // Safe to set per-process; serialized by ENV_LOCK callers.
+        std::env::set_var("EZPN_TEST_SECRETS_DIR", dir);
     }
 
     #[test]
-    fn env_interpolation_env_prefix() {
-        // SAFETY: process-level mutation in tests; key is unique to this test.
-        unsafe {
-            std::env::set_var("EZPN_TEST_VAR_X", "hello");
+    fn command_with_dollar_var_resolves() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        isolate_secrets_dir(tmp.path());
+        std::env::set_var("EZPN_TEST_EDITOR_VAR", "nvim");
+
+        let toml = r#"
+[workspace]
+layout = "1"
+
+[[pane]]
+command = "$EZPN_TEST_EDITOR_VAR ."
+"#;
+        let path = write_project(tmp.path(), toml);
+        let resolved = load_project_from(&path).expect("load");
+
+        let (_, launch) = resolved.launches.iter().next().expect("one pane");
+        match launch {
+            PaneLaunch::Command(cmd) => assert_eq!(cmd, "nvim ."),
+            other => panic!("expected Command, got {other:?}"),
         }
-        let raw = map(&[("FOO", "x=${env:EZPN_TEST_VAR_X}-end")]);
-        let dir = temp_dir();
-        let out = resolve_env(dir.path(), &raw, 0).unwrap();
-        assert_eq!(out.get("FOO").map(|s| s.as_str()), Some("x=hello-end"));
+
+        std::env::remove_var("EZPN_TEST_EDITOR_VAR");
+        std::env::remove_var("EZPN_TEST_SECRETS_DIR");
     }
 
     #[test]
-    fn env_interpolation_file_ref() {
-        let dir = temp_dir();
-        std::fs::write(dir.path().join(".env.shared"), "API_KEY=secret123\n").unwrap();
-        let raw = map(&[("API_KEY", "${file:.env.shared}")]);
-        let out = resolve_env(dir.path(), &raw, 0).unwrap();
-        assert_eq!(out.get("API_KEY").map(|s| s.as_str()), Some("secret123"));
+    fn command_with_default_uses_default_when_unset() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        isolate_secrets_dir(tmp.path());
+        std::env::remove_var("EZPN_TEST_PORT_VAR");
+
+        let toml = r#"
+[workspace]
+layout = "1"
+
+[[pane]]
+command = "${EZPN_TEST_PORT_VAR:-3000}"
+"#;
+        let path = write_project(tmp.path(), toml);
+        let resolved = load_project_from(&path).expect("load");
+
+        let (_, launch) = resolved.launches.iter().next().unwrap();
+        match launch {
+            PaneLaunch::Command(cmd) => assert_eq!(cmd, "3000"),
+            other => panic!("expected Command, got {other:?}"),
+        }
+
+        std::env::remove_var("EZPN_TEST_SECRETS_DIR");
     }
 
     #[test]
-    fn env_local_auto_merge_and_override() {
-        let dir = temp_dir();
-        // .env.local declares NODE_ENV (override) + adds DB_URL.
+    fn dotenv_overrides_process_env_at_project_level() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        isolate_secrets_dir(tmp.path());
+        std::env::set_var("EZPN_TEST_HOST_VAR", "from-process");
         std::fs::write(
-            dir.path().join(".env.local"),
-            "# local secrets\nNODE_ENV=production\nDB_URL=\"postgres://localhost/x\"\n",
+            tmp.path().join(".env.local"),
+            "EZPN_TEST_HOST_VAR=from-dotenv\n",
         )
         .unwrap();
-        let raw = map(&[("NODE_ENV", "development"), ("PORT", "3000")]);
-        let out = resolve_env(dir.path(), &raw, 0).unwrap();
-        assert_eq!(out.get("NODE_ENV").map(|s| s.as_str()), Some("production"));
-        assert_eq!(out.get("PORT").map(|s| s.as_str()), Some("3000"));
-        assert_eq!(
-            out.get("DB_URL").map(|s| s.as_str()),
-            Some("postgres://localhost/x")
-        );
-    }
 
-    #[test]
-    fn env_local_missing_is_silent() {
-        let dir = temp_dir();
-        let raw = map(&[("PORT", "3000")]);
-        let out = resolve_env(dir.path(), &raw, 0).unwrap();
-        assert_eq!(out.len(), 1);
-    }
+        let toml = r#"
+[workspace]
+layout = "1"
 
-    #[test]
-    fn env_resolve_depth_cap_errors() {
-        let dir = temp_dir();
-        let raw = map(&[("A", "x")]);
-        // Depth 9 is over the cap (8) -> immediate error.
-        let err = resolve_env(dir.path(), &raw, 9).unwrap_err();
-        assert!(matches!(err, ResolveError::TooDeep));
-    }
-
-    #[test]
-    fn env_resolve_missing_ref_errors() {
-        let dir = temp_dir();
-        // Use a name unlikely to exist.
-        let raw = map(&[("X", "${env:EZPN_DEFINITELY_NOT_SET_12345}")]);
-        let err = resolve_env(dir.path(), &raw, 0).unwrap_err();
-        assert!(matches!(err, ResolveError::MissingRef(_)));
-    }
-
-    #[test]
-    fn env_resolve_cycle_via_env_local() {
-        // .env.local: A=${env:LOOP_A} and process env has LOOP_A=${env:LOOP_A}
-        // Since expand_value recurses on resolved values, this hits the depth cap.
-        unsafe {
-            std::env::set_var("EZPN_CYCLE_LOOP", "${env:EZPN_CYCLE_LOOP}");
-        }
-        let dir = temp_dir();
-        let raw = map(&[("X", "${env:EZPN_CYCLE_LOOP}")]);
-        let err = resolve_env(dir.path(), &raw, 0).unwrap_err();
-        assert!(
-            matches!(err, ResolveError::TooDeep),
-            "expected TooDeep, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn dotenv_parse_quoted_and_comments() {
-        let dir = temp_dir();
-        let body = r#"
-# top comment
-export PLAIN=raw
-QUOTED="hello world"
-ESCAPED="line1\nline2"
-SINGLE='no $expand'
-WITH_COMMENT=foo # trailing
+[[pane]]
+command = "${EZPN_TEST_HOST_VAR}"
 "#;
-        std::fs::write(dir.path().join(".env.local"), body).unwrap();
-        let map = dotenv_load(&dir.path().join(".env.local"))
-            .unwrap()
-            .unwrap();
-        assert_eq!(map.get("PLAIN").map(|s| s.as_str()), Some("raw"));
-        assert_eq!(map.get("QUOTED").map(|s| s.as_str()), Some("hello world"));
-        assert_eq!(map.get("ESCAPED").map(|s| s.as_str()), Some("line1\nline2"));
-        assert_eq!(map.get("SINGLE").map(|s| s.as_str()), Some("no $expand"));
-        assert_eq!(map.get("WITH_COMMENT").map(|s| s.as_str()), Some("foo"));
+        let path = write_project(tmp.path(), toml);
+        let resolved = load_project_from(&path).expect("load");
+
+        let (_, launch) = resolved.launches.iter().next().unwrap();
+        match launch {
+            PaneLaunch::Command(cmd) => assert_eq!(cmd, "from-dotenv"),
+            other => panic!("expected Command, got {other:?}"),
+        }
+
+        std::env::remove_var("EZPN_TEST_HOST_VAR");
+        std::env::remove_var("EZPN_TEST_SECRETS_DIR");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_ref_resolves_from_0600_secrets_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let secrets_dir = tmp.path().join("ezpn");
+        std::fs::create_dir_all(&secrets_dir).unwrap();
+        let secrets_path = secrets_dir.join("secrets.toml");
+        std::fs::write(&secrets_path, "DB_PASSWORD = \"hunter2\"\n").unwrap();
+        std::fs::set_permissions(&secrets_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::env::set_var("EZPN_TEST_SECRETS_DIR", tmp.path());
+
+        let toml = r#"
+[workspace]
+layout = "1"
+
+[[pane]]
+command = "psql --password=${secret:DB_PASSWORD}"
+"#;
+        let path = write_project(tmp.path(), toml);
+        let resolved = load_project_from(&path).expect("load");
+
+        let (_, launch) = resolved.launches.iter().next().unwrap();
+        match launch {
+            PaneLaunch::Command(cmd) => assert_eq!(cmd, "psql --password=hunter2"),
+            other => panic!("expected Command, got {other:?}"),
+        }
+
+        std::env::remove_var("EZPN_TEST_SECRETS_DIR");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_file_with_mode_0644_refused_at_load() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let secrets_dir = tmp.path().join("ezpn");
+        std::fs::create_dir_all(&secrets_dir).unwrap();
+        let secrets_path = secrets_dir.join("secrets.toml");
+        std::fs::write(&secrets_path, "DB_PASSWORD = \"hunter2\"\n").unwrap();
+        std::fs::set_permissions(&secrets_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::env::set_var("EZPN_TEST_SECRETS_DIR", tmp.path());
+
+        let toml = r#"
+[workspace]
+layout = "1"
+
+[[pane]]
+command = "echo ok"
+"#;
+        let path = write_project(tmp.path(), toml);
+        let err = match load_project_from(&path) {
+            Ok(_) => panic!("must refuse 0644 secrets"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("0600"),
+            "error should mention required mode: {err}"
+        );
+        // The error must not embed any secret value.
+        assert!(
+            !err.contains("hunter2"),
+            "secret value leaked into error: {err}"
+        );
+
+        std::env::remove_var("EZPN_TEST_SECRETS_DIR");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secrets_never_appear_in_resolved_project_debug() {
+        // ResolvedProject does not derive Debug, but the secrets HashMap
+        // we feed into EnvContext must not leak its values via Debug.
+        use std::os::unix::fs::PermissionsExt;
+        let _g = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let secrets_dir = tmp.path().join("ezpn");
+        std::fs::create_dir_all(&secrets_dir).unwrap();
+        let secrets_path = secrets_dir.join("secrets.toml");
+        std::fs::write(&secrets_path, "TOKEN = \"do-not-print-me\"\n").unwrap();
+        std::fs::set_permissions(&secrets_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let secrets = crate::env_interp::load_secrets(&secrets_path).expect("load secrets");
+        let dbg = format!("{:?}", secrets);
+        assert!(
+            !dbg.contains("do-not-print-me"),
+            "secrets HashMap Debug leaked value: {dbg}"
+        );
+    }
+
+    #[test]
+    fn required_var_unset_errors_with_offending_name() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        isolate_secrets_dir(tmp.path());
+        std::env::remove_var("EZPN_TEST_REQUIRED_VAR");
+
+        let toml = r#"
+[workspace]
+layout = "1"
+
+[[pane]]
+command = "${EZPN_TEST_REQUIRED_VAR:?must be set}"
+"#;
+        let path = write_project(tmp.path(), toml);
+        let err = match load_project_from(&path) {
+            Ok(_) => panic!("must error on unset required var"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("EZPN_TEST_REQUIRED_VAR"),
+            "error missing var name: {err}"
+        );
+        assert!(err.contains("command"), "error missing field name: {err}");
+
+        std::env::remove_var("EZPN_TEST_SECRETS_DIR");
+    }
+
+    #[test]
+    fn per_pane_env_value_itself_is_expanded() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        isolate_secrets_dir(tmp.path());
+        std::env::set_var("EZPN_TEST_BASE_URL", "https://api.example.com");
+
+        let toml = r#"
+[workspace]
+layout = "1"
+
+[[pane]]
+command = "echo ${API_URL}"
+
+[pane.env]
+API_URL = "${EZPN_TEST_BASE_URL}/v1"
+"#;
+        let path = write_project(tmp.path(), toml);
+        let resolved = load_project_from(&path).expect("load");
+
+        // The pane's env value should have been expanded.
+        let (_, env) = resolved.envs.iter().next().expect("one pane env map");
+        assert_eq!(
+            env.get("API_URL").map(|s| s.as_str()),
+            Some("https://api.example.com/v1")
+        );
+
+        // And the command should pick up the per-pane env (highest precedence).
+        let (_, launch) = resolved.launches.iter().next().unwrap();
+        match launch {
+            PaneLaunch::Command(cmd) => assert_eq!(cmd, "echo https://api.example.com/v1"),
+            other => panic!("expected Command, got {other:?}"),
+        }
+
+        std::env::remove_var("EZPN_TEST_BASE_URL");
+        std::env::remove_var("EZPN_TEST_SECRETS_DIR");
+    }
+
+    // ─── project-level [[hooks]] (#83) ─────────────────────────
+
+    #[test]
+    fn project_hooks_validated_on_load() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        isolate_secrets_dir(tmp.path());
+        let toml_str = r#"
+[[pane]]
+command = "echo a"
+
+[[pane]]
+command = "echo b"
+
+[[hooks]]
+event = "after_pane_exit"
+exec = ["true"]
+"#;
+        let path = write_project(tmp.path(), toml_str);
+        let resolved = load_project_from(&path).expect("load");
+        assert_eq!(resolved.hooks.len(), 1);
+        assert_eq!(
+            resolved.hooks[0].event,
+            crate::hooks::HookEvent::AfterPaneExit
+        );
+
+        std::env::remove_var("EZPN_TEST_SECRETS_DIR");
+    }
+
+    #[test]
+    fn project_hooks_unknown_event_refuses_load() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        isolate_secrets_dir(tmp.path());
+        let toml_str = r#"
+[[pane]]
+command = "echo a"
+
+[[hooks]]
+event = "after_typo"
+exec = ["true"]
+"#;
+        let path = write_project(tmp.path(), toml_str);
+        let err = match load_project_from(&path) {
+            Ok(_) => panic!("must reject unknown hook event"),
+            Err(e) => e,
+        };
+        assert!(err.contains("unknown hook event"), "{err}");
+
+        std::env::remove_var("EZPN_TEST_SECRETS_DIR");
     }
 }

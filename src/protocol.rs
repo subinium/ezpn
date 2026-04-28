@@ -1,6 +1,17 @@
 //! Binary wire protocol for ezpn client-server communication.
 //!
 //! Wire format: `[u8 tag][u32 big-endian length][payload bytes]`
+//!
+//! # Version negotiation
+//!
+//! Every server-accepted connection MUST emit an [`S_VERSION`] frame as the
+//! very first message. The client then replies with [`C_HELLO`] before any
+//! other traffic. If the major version disagrees the server replies with
+//! [`S_INCOMPAT`] and closes the connection. Minor-version mismatch is
+//! tolerated: additive payload fields are forward-compatible.
+//!
+//! Tag space `0x10..=0x1F` is reserved for future negotiation extensions
+//! (capability re-negotiation, auth challenges, etc.).
 
 use std::io::{self, Read, Write};
 
@@ -18,17 +29,6 @@ pub const C_KILL: u8 = 0x04;
 pub const C_PING: u8 = 0x05;
 /// Client attach with mode. Payload = JSON `AttachRequest`.
 pub const C_ATTACH: u8 = 0x06;
-/// Client capability/version handshake. Payload = JSON `HelloMessage`.
-/// Optional but strongly recommended — without it the server assumes a
-/// "v0" capability-less client (legacy behaviour). On unknown major
-/// version, the server replies `S_HELLO_ERR` and closes.
-pub const C_HELLO: u8 = 0x07;
-
-/// Subscribe to one or more event topics. Payload = JSON `SubscribeRequest`.
-/// Sent after `C_HELLO`. The connection becomes a SPEC 07 event subscriber,
-/// not a render client — no `S_OUTPUT` will be sent on it. Tag range
-/// `0x08..0x0F` is reserved for v0.10 automation surface (future SPECs).
-pub const C_SUBSCRIBE: u8 = 0x08;
 
 // ── Server → Client tags ──
 
@@ -40,55 +40,24 @@ pub const S_DETACHED: u8 = 0x82;
 pub const S_EXIT: u8 = 0x83;
 /// Pong response to C_PING.
 pub const S_PONG: u8 = 0x84;
-/// Server accepts the handshake. Payload = JSON `HelloOk`.
-pub const S_HELLO_OK: u8 = 0x85;
-/// Server rejects the handshake (version mismatch, malformed payload).
-/// Payload = JSON `HelloErr`. Connection is closed after sending.
-pub const S_HELLO_ERR: u8 = 0x86;
 
-/// Server confirms a SPEC 07 subscription. Payload = JSON `SubscribeOk`.
-/// The connection is now an event channel — no further requests accepted.
-pub const S_SUBSCRIBE_OK: u8 = 0x87;
+// ── Version negotiation tags (reserved range 0x10..=0x1F) ──
 
-/// Single event push. Payload = JSON-encoded `EventEnvelope` (one object,
-/// no trailing newline — framing is `[tag][len][bytes]`, not by line).
-pub const S_EVENT: u8 = 0x88;
+/// Server hello. Payload = JSON [`ServerHello`]. First frame on every
+/// server-accepted connection.
+pub const S_VERSION: u8 = 0x10;
+/// Client hello. Payload = JSON [`ClientHello`]. Sent in response to
+/// [`S_VERSION`] before any other client frame.
+pub const C_HELLO: u8 = 0x11;
+/// Server-emitted incompatibility notice. Payload = JSON [`IncompatNotice`].
+/// Sent when the server cannot speak the client's protocol (major mismatch
+/// or legacy client). Server closes the connection immediately after.
+pub const S_INCOMPAT: u8 = 0x12;
 
-/// Inline notice that the per-subscriber backlog overflowed and at least
-/// one event was dropped since the last `S_EVENT_OVERFLOW`. Payload =
-/// JSON `EventEnvelope` with `topic = "_meta"` and `type = "overflow"`.
-pub const S_EVENT_OVERFLOW: u8 = 0x89;
-
-/// Server rejects a `C_SUBSCRIBE` (malformed payload, empty topics list,
-/// future cap-gating). Payload = JSON `SubscribeErr`. Connection is closed
-/// after sending. Distinct from `S_HELLO_ERR` so consumers can tell whether
-/// the failure was during initial handshake or post-handshake subscribe.
-pub const S_SUBSCRIBE_ERR: u8 = 0x8A;
-
-/// Wire-protocol major version. Bump on any backwards-incompatible
-/// change to message tags or framing semantics. `S_HELLO_OK` carries
-/// the server's version so the client can refuse a mismatch up-front
-/// rather than silently misparsing later messages.
-pub const PROTOCOL_VERSION: u32 = 1;
-
-/// Capability bits the daemon currently supports. Sent in `S_HELLO_OK`
-/// and intersected with the client's bits to determine what features
-/// the rest of the session may use (true-color sequences, focus events,
-/// etc.). New bits MUST keep their meaning forever — once shipped the
-/// bit number is load-bearing.
-pub const SERVER_CAPABILITIES: u32 =
-    CAP_KITTY_KEYBOARD | CAP_FOCUS_EVENTS | CAP_TRUE_COLOR | CAP_EVENT_STREAM;
-
-pub const CAP_KITTY_KEYBOARD: u32 = 0x0001;
-pub const CAP_FOCUS_EVENTS: u32 = 0x0002;
-pub const CAP_TRUE_COLOR: u32 = 0x0004;
-/// Reserved for #14 (scrollback persistence). Not yet emitted by the daemon.
-#[allow(dead_code)]
-pub const CAP_SCROLLBACK_PERSIST: u32 = 0x0008;
-/// Server supports SPEC 07 event subscriptions (`C_SUBSCRIBE` + `S_EVENT`).
-/// New clients should refuse to send `C_SUBSCRIBE` if this bit is missing
-/// from the negotiated capability mask.
-pub const CAP_EVENT_STREAM: u32 = 0x0010;
+/// Current wire protocol major version. Bumped only for breaking changes.
+pub const PROTO_MAJOR: u16 = 1;
+/// Current wire protocol minor version. Bumped for additive changes.
+pub const PROTO_MINOR: u16 = 0;
 
 /// Maximum message payload size (16 MB).
 const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
@@ -168,113 +137,263 @@ pub struct AttachRequest {
     pub mode: AttachMode,
 }
 
-/// First message a v0.6+ client sends. Everything else (C_ATTACH /
-/// C_RESIZE) follows after the server confirms with `S_HELLO_OK`.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct HelloMessage {
-    /// Major protocol version. Mismatch with `PROTOCOL_VERSION` is
-    /// fatal — the server rejects with `S_HELLO_ERR`.
-    pub version: u32,
-    /// Bitfield of `CAP_*` constants the client supports / wants enabled.
-    pub capabilities: u32,
-    /// Free-form client identifier ("ezpn 0.6.0", "ezpn-ctl 0.6.0"…).
-    /// Used for logging only — never load-bearing.
-    pub client: String,
+// ── Version handshake payloads ──
+
+/// Payload of [`S_VERSION`] (first server frame on every connection).
+///
+/// Forward-compat rule: clients MUST tolerate unknown additive fields, and
+/// servers MUST tolerate missing optional fields when parsing future
+/// extensions. Required fields below MUST never be removed without a
+/// [`PROTO_MAJOR`] bump.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ServerHello {
+    pub proto_major: u16,
+    pub proto_minor: u16,
+    /// Human-readable build identifier, e.g. `"ezpn 0.12.0 (rev abc1234)"`.
+    pub build: String,
 }
 
-/// Response payload for `S_HELLO_OK`.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct HelloOk {
-    pub version: u32,
-    /// Intersection of client + server caps. Both sides agree to use
-    /// only these features for the rest of the session.
-    pub capabilities: u32,
-    pub server: String,
+/// Payload of [`C_HELLO`] (client's reply to [`S_VERSION`]).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ClientHello {
+    pub proto_major: u16,
+    pub proto_minor: u16,
+    /// Human-readable client build identifier.
+    pub client_build: String,
+    /// Capability flags the client understands. The server may opt to
+    /// stream extra payload formats only when a known flag is present.
+    pub supported_features: Vec<String>,
 }
 
-/// Response payload for `S_HELLO_ERR` — connection is closed after this.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct HelloErr {
-    pub reason: String,
-    /// Server's preferred version, so the client can hint at the upgrade.
-    pub server_version: u32,
+/// Payload of [`S_INCOMPAT`].
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct IncompatNotice {
+    /// `"<major>.<minor>"` of the server.
+    pub server_proto: String,
+    /// `"<major>.<minor>"` of the client (best-effort; may be `"unknown"`
+    /// if the client never sent a [`C_HELLO`], e.g. legacy v0.5 clients).
+    pub client_proto: String,
+    /// Human-readable explanation suitable for direct display to the user.
+    pub message: String,
 }
 
-// ── SPEC 07 event-subscription types ─────────────────────────────────
+/// Capability strings the current client advertises in [`ClientHello`].
+///
+/// Server code uses these to gate optional output formats. Adding a new
+/// flag is additive and does NOT require a [`PROTO_MINOR`] bump unless the
+/// flag is mandatory.
+pub const CLIENT_FEATURES: &[&str] = &["scrollback-v3", "kitty-kbd-stack", "osc-52-confirm"];
 
-/// Topics a subscriber can opt into. Lower-case on the wire so the JSON
-/// matches the CLI flag (`--subscribe pane,client`).
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum EventTopic {
-    Pane,
-    Client,
-    Layout,
-    Tab,
-    Mode,
-}
-
-/// Optional server-side filter. v0.10 only honours `session = "<name>"`;
-/// future fields are deserialized but ignored (and warned in logs).
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
-pub struct EventFilter {
-    #[serde(default)]
-    pub session: Option<String>,
-}
-
-/// `C_SUBSCRIBE` payload.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct SubscribeRequest {
-    pub topics: Vec<EventTopic>,
-    #[serde(default)]
-    pub filter: Option<EventFilter>,
-}
-
-/// `S_SUBSCRIBE_OK` payload.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct SubscribeOk {
-    pub subscriber_id: u64,
-    pub topics: Vec<EventTopic>,
-}
-
-/// `S_SUBSCRIBE_ERR` payload — connection is closed after this.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct SubscribeErr {
-    pub reason: String,
-}
-
-/// One JSON object per `S_EVENT` frame. `data` is the topic-specific
-/// payload (`PaneEvent` / `ClientEvent` / …). `_meta` is reserved for
-/// protocol notices — see `S_EVENT_OVERFLOW`.
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct EventEnvelope {
-    /// Schema version. Bumped on any breaking shape change. Consumers MUST
-    /// ignore unknown `type` values inside a known topic.
-    pub v: u32,
-    /// Milliseconds since Unix epoch (host clock).
-    pub ts: u64,
-    /// Topic name on the wire. `"_meta"` for protocol notices.
-    pub topic: &'static str,
-    /// Topic-specific event type discriminator (`pane.created`, …).
-    #[serde(rename = "type")]
-    pub type_: &'static str,
-    /// Daemon session name (`session_name` parameter to `daemon::run`).
-    pub session: String,
-    /// Topic-specific payload. Borrowed `serde_json::Value` keeps the
-    /// envelope generic over per-topic structs.
-    pub data: serde_json::Value,
-}
-
-impl EventEnvelope {
-    /// Now() in milliseconds since the Unix epoch — wall clock, not
-    /// monotonic. We use a fallible `duration_since` so a clock skew
-    /// before 1970 surfaces as `0` instead of panicking.
-    pub fn now_ts() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
+/// Build the canonical `build` string for [`ServerHello`].
+///
+/// NOTE: the git revision is currently not captured at build time (no
+/// `build.rs`). Callers who want the rev should pass it explicitly.
+/// See issue #57 for the follow-up to wire `git rev-parse --short HEAD`
+/// through a build script.
+pub fn build_string(rev: Option<&str>) -> String {
+    match rev {
+        Some(sha) if !sha.is_empty() => {
+            format!("ezpn {} (rev {})", env!("CARGO_PKG_VERSION"), sha)
+        }
+        _ => format!("ezpn {} (rev unknown)", env!("CARGO_PKG_VERSION")),
     }
+}
+
+/// Encode the canonical [`S_VERSION`] frame the server sends as its first
+/// message. Returns the framed bytes ready to be written to the socket.
+///
+/// The server-side `accept` loop should call this immediately after
+/// `listener.accept()` succeeds and before reading anything from the
+/// client.
+#[allow(dead_code)] // wired by the server-side commit follow-up to #57
+pub fn server_hello() -> Vec<u8> {
+    let hello = ServerHello {
+        proto_major: PROTO_MAJOR,
+        proto_minor: PROTO_MINOR,
+        build: build_string(None),
+    };
+    let json = serde_json::to_vec(&hello).expect("ServerHello serialization is infallible");
+    let mut buf = Vec::with_capacity(5 + json.len());
+    write_msg(&mut buf, S_VERSION, &json).expect("writing to Vec<u8> never fails");
+    buf
+}
+
+/// Outcome of inspecting the first byte received on a server-side socket
+/// after `S_VERSION` has been written.
+///
+/// We classify pre-handshake bytes into three buckets so the server can
+/// emit a friendly [`S_INCOMPAT`] for legacy v0.5 clients that don't
+/// understand version negotiation and just dump an `AttachRequest` JSON
+/// blob immediately.
+///
+/// Variants are `#[allow(dead_code)]` because the matching server-side
+/// dispatch lands in a follow-up commit (the `accept` loop in
+/// `src/server.rs` is owned by another agent in the v0.12 split).
+#[allow(dead_code)] // wired by the server-side commit follow-up to #57
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FirstByteKind {
+    /// Looks like a tag in the negotiation/normal range (`0x00..=0x20`).
+    /// Server should proceed with `read_msg` as normal.
+    Tag,
+    /// Looks like raw JSON (`{`, `[`, whitespace) — almost certainly a
+    /// legacy client that skipped the handshake. Server should reply with
+    /// a friendly [`S_INCOMPAT`] and close.
+    LegacyJson,
+    /// Anything else — treat as a protocol violation and close.
+    Unknown,
+}
+
+/// Heuristic: classify the first byte received on a freshly-accepted
+/// connection. The current tag space tops out at `0x20`; legacy v0.5
+/// clients send `AttachRequest` JSON, whose first byte is always `{`
+/// (`0x7b`) — well above the tag range. We also treat `[` and ASCII
+/// whitespace as legacy markers because Serde happily consumes leading
+/// whitespace.
+#[allow(dead_code)] // wired by the server-side commit follow-up to #57
+pub fn classify_first_byte(b: u8) -> FirstByteKind {
+    match b {
+        0x00..=0x20 => FirstByteKind::Tag,
+        b'{' | b'[' => FirstByteKind::LegacyJson,
+        _ => FirstByteKind::Unknown,
+    }
+}
+
+/// Build an [`S_INCOMPAT`] frame for a major-version mismatch. The
+/// `message` follows the spec'd UX template:
+/// `client v<X.Y> cannot attach to server v<A.B> — restart the daemon
+/// with 'ezpn kill <name>' to upgrade.`
+#[allow(dead_code)] // wired by the server-side commit follow-up to #57
+pub fn incompat_for_major_mismatch(client: &ClientHello, session_name: &str) -> Vec<u8> {
+    let server_proto = format!("{}.{}", PROTO_MAJOR, PROTO_MINOR);
+    let client_proto = format!("{}.{}", client.proto_major, client.proto_minor);
+    let message = format!(
+        "client v{} cannot attach to server v{} \u{2014} restart the daemon with 'ezpn kill {}' to upgrade.",
+        client_proto, server_proto, session_name
+    );
+    let notice = IncompatNotice {
+        server_proto,
+        client_proto,
+        message,
+    };
+    encode_incompat(&notice)
+}
+
+/// Build an [`S_INCOMPAT`] frame for a legacy v0.5 client that didn't
+/// send a [`C_HELLO`].
+#[allow(dead_code)] // wired by the server-side commit follow-up to #57
+pub fn incompat_for_legacy_client(session_name: &str) -> Vec<u8> {
+    let server_proto = format!("{}.{}", PROTO_MAJOR, PROTO_MINOR);
+    let message = format!(
+        "legacy client detected (no version handshake) \u{2014} restart the daemon with 'ezpn kill {}' to upgrade.",
+        session_name
+    );
+    let notice = IncompatNotice {
+        server_proto,
+        client_proto: "unknown".to_string(),
+        message,
+    };
+    encode_incompat(&notice)
+}
+
+#[allow(dead_code)] // helper used by `incompat_for_*` (wired in a follow-up)
+fn encode_incompat(notice: &IncompatNotice) -> Vec<u8> {
+    let json = serde_json::to_vec(notice).expect("IncompatNotice serialization is infallible");
+    let mut buf = Vec::with_capacity(5 + json.len());
+    write_msg(&mut buf, S_INCOMPAT, &json).expect("writing to Vec<u8> never fails");
+    buf
+}
+
+/// Result of the client-side handshake.
+#[derive(Debug)]
+pub enum HandshakeOutcome {
+    /// Server and client are compatible; carries the parsed [`ServerHello`]
+    /// for the caller to log or expose via `ezpn ls`.
+    Ok(ServerHello),
+    /// Server replied with [`S_INCOMPAT`] (or our heuristic detected one).
+    /// Caller should print [`IncompatNotice::message`] and exit non-zero.
+    Incompat(IncompatNotice),
+}
+
+/// Drive the client-side version handshake on a freshly-connected stream.
+///
+/// Reads the first frame (must be [`S_VERSION`]), then writes a
+/// [`C_HELLO`] advertising [`PROTO_MAJOR`] / [`PROTO_MINOR`] and
+/// [`CLIENT_FEATURES`]. If the server replies with [`S_INCOMPAT`] before
+/// or after our hello (some servers may push [`S_INCOMPAT`] without
+/// reading our hello first when they detect a legacy first byte) the
+/// outcome is [`HandshakeOutcome::Incompat`].
+///
+/// A major-version mismatch where the server's major is greater than
+/// ours is reported as [`HandshakeOutcome::Incompat`] synthesized
+/// locally — the server's [`S_INCOMPAT`] frame is preferred when present
+/// because it carries the canonical message string.
+pub fn client_handshake<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+) -> io::Result<HandshakeOutcome> {
+    let (tag, payload) = read_msg(reader)?;
+    match tag {
+        S_VERSION => {
+            let server: ServerHello = serde_json::from_slice(&payload).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("malformed S_VERSION payload: {}", e),
+                )
+            })?;
+
+            // Major mismatch: don't bother sending C_HELLO — the server
+            // either can't parse it or will refuse us anyway.
+            if server.proto_major != PROTO_MAJOR {
+                return Ok(HandshakeOutcome::Incompat(IncompatNotice {
+                    server_proto: format!("{}.{}", server.proto_major, server.proto_minor),
+                    client_proto: format!("{}.{}", PROTO_MAJOR, PROTO_MINOR),
+                    message: format!(
+                        "client v{}.{} cannot attach to server v{}.{} \u{2014} reinstall the matching ezpn binary or restart the daemon.",
+                        PROTO_MAJOR, PROTO_MINOR, server.proto_major, server.proto_minor
+                    ),
+                }));
+            }
+
+            // Minor-version mismatch (additive, forward-compat) is fine.
+            let hello = ClientHello {
+                proto_major: PROTO_MAJOR,
+                proto_minor: PROTO_MINOR,
+                client_build: build_string(None),
+                supported_features: CLIENT_FEATURES.iter().map(|s| s.to_string()).collect(),
+            };
+            let json = serde_json::to_vec(&hello).map_err(io::Error::other)?;
+            write_msg(writer, C_HELLO, &json)?;
+            Ok(HandshakeOutcome::Ok(server))
+        }
+        S_INCOMPAT => {
+            let notice: IncompatNotice = serde_json::from_slice(&payload).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("malformed S_INCOMPAT payload: {}", e),
+                )
+            })?;
+            Ok(HandshakeOutcome::Incompat(notice))
+        }
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "expected S_VERSION (0x10) or S_INCOMPAT (0x12) as first frame, got 0x{:02x}",
+                other
+            ),
+        )),
+    }
+}
+
+/// Parse a [`C_HELLO`] payload. Returned for use by the server (in a
+/// follow-up commit).
+#[allow(dead_code)] // wired by the server-side commit follow-up to #57
+pub fn parse_client_hello(payload: &[u8]) -> io::Result<ClientHello> {
+    serde_json::from_slice(payload).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("malformed C_HELLO payload: {}", e),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -317,131 +436,208 @@ mod tests {
         assert_eq!(payload, b"hello");
     }
 
+    // ── version handshake tests ──
+
     #[test]
-    fn hello_message_round_trip() {
-        let hello = HelloMessage {
-            version: PROTOCOL_VERSION,
-            capabilities: CAP_KITTY_KEYBOARD | CAP_TRUE_COLOR,
-            client: "ezpn-test".to_string(),
+    fn s_version_frame_round_trip() {
+        let buf = server_hello();
+        // First byte is the tag.
+        assert_eq!(buf[0], S_VERSION);
+        let (tag, payload) = read_msg(&mut buf.as_slice()).unwrap();
+        assert_eq!(tag, S_VERSION);
+        let parsed: ServerHello = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed.proto_major, PROTO_MAJOR);
+        assert_eq!(parsed.proto_minor, PROTO_MINOR);
+        assert!(parsed.build.starts_with("ezpn "));
+    }
+
+    #[test]
+    fn server_hello_tag_is_in_reserved_range() {
+        // Spec reserves 0x10..=0x1F for negotiation tags.
+        assert!((0x10..=0x1F).contains(&S_VERSION));
+        assert!((0x10..=0x1F).contains(&C_HELLO));
+        assert!((0x10..=0x1F).contains(&S_INCOMPAT));
+    }
+
+    #[test]
+    fn c_hello_payload_round_trip() {
+        let hello = ClientHello {
+            proto_major: 1,
+            proto_minor: 0,
+            client_build: "ezpn 0.12.0 (rev test)".into(),
+            supported_features: vec![
+                "scrollback-v3".into(),
+                "kitty-kbd-stack".into(),
+                "osc-52-confirm".into(),
+            ],
         };
         let json = serde_json::to_vec(&hello).unwrap();
-        let decoded: HelloMessage = serde_json::from_slice(&json).unwrap();
-        assert_eq!(decoded.version, PROTOCOL_VERSION);
+        let parsed = parse_client_hello(&json).unwrap();
+        assert_eq!(parsed, hello);
+    }
+
+    #[test]
+    fn c_hello_tolerates_unknown_additive_fields() {
+        // Forward-compat: a future client might add fields. The server
+        // must still accept the hello as long as required fields exist.
+        let json = br#"{
+            "proto_major": 1,
+            "proto_minor": 7,
+            "client_build": "ezpn 99.0.0 (rev future)",
+            "supported_features": ["scrollback-v3"],
+            "future_field": {"nested": true}
+        }"#;
+        let parsed = parse_client_hello(json).unwrap();
+        assert_eq!(parsed.proto_minor, 7);
+        assert_eq!(parsed.supported_features, vec!["scrollback-v3".to_string()]);
+    }
+
+    #[test]
+    fn major_mismatch_emits_incompat() {
+        let client = ClientHello {
+            proto_major: PROTO_MAJOR + 1,
+            proto_minor: 0,
+            client_build: "ezpn 1.0.0".into(),
+            supported_features: vec![],
+        };
+        let frame = incompat_for_major_mismatch(&client, "myproj");
+        assert_eq!(frame[0], S_INCOMPAT);
+        let (tag, payload) = read_msg(&mut frame.as_slice()).unwrap();
+        assert_eq!(tag, S_INCOMPAT);
+        let notice: IncompatNotice = serde_json::from_slice(&payload).unwrap();
         assert_eq!(
-            decoded.capabilities & CAP_KITTY_KEYBOARD,
-            CAP_KITTY_KEYBOARD
+            notice.server_proto,
+            format!("{}.{}", PROTO_MAJOR, PROTO_MINOR)
         );
-        assert_eq!(decoded.client, "ezpn-test");
+        assert_eq!(notice.client_proto, format!("{}.0", PROTO_MAJOR + 1));
+        assert!(notice.message.contains("ezpn kill myproj"));
+        assert!(notice.message.contains("cannot attach"));
     }
 
     #[test]
-    fn hello_ok_carries_intersection() {
-        let server_caps = SERVER_CAPABILITIES;
-        let client_caps = CAP_KITTY_KEYBOARD | CAP_SCROLLBACK_PERSIST; // unknown bit set
-        let agreed = server_caps & client_caps;
-        // We agree on what BOTH sides know. Client requesting a future bit
-        // (SCROLLBACK_PERSIST) must not magically enable it server-side.
-        assert_eq!(agreed, CAP_KITTY_KEYBOARD);
-    }
-
-    #[test]
-    fn hello_err_includes_server_version() {
-        let err = HelloErr {
-            reason: "client/server major mismatch".to_string(),
-            server_version: PROTOCOL_VERSION,
+    fn minor_mismatch_is_tolerated_by_client_handshake() {
+        // Server pretends to be (PROTO_MAJOR, PROTO_MINOR + 1).
+        let server = ServerHello {
+            proto_major: PROTO_MAJOR,
+            proto_minor: PROTO_MINOR + 1,
+            build: format!("ezpn {} (rev future)", env!("CARGO_PKG_VERSION")),
         };
-        let json = serde_json::to_vec(&err).unwrap();
-        let decoded: HelloErr = serde_json::from_slice(&json).unwrap();
-        assert_eq!(decoded.server_version, PROTOCOL_VERSION);
-        assert!(decoded.reason.contains("mismatch"));
+        let mut server_to_client: Vec<u8> = Vec::new();
+        let json = serde_json::to_vec(&server).unwrap();
+        write_msg(&mut server_to_client, S_VERSION, &json).unwrap();
+
+        let mut client_to_server: Vec<u8> = Vec::new();
+        let outcome =
+            client_handshake(&mut server_to_client.as_slice(), &mut client_to_server).unwrap();
+
+        match outcome {
+            HandshakeOutcome::Ok(parsed) => {
+                assert_eq!(parsed.proto_minor, PROTO_MINOR + 1);
+            }
+            HandshakeOutcome::Incompat(n) => {
+                panic!("minor mismatch must NOT be reported as incompat: {:?}", n);
+            }
+        }
+
+        // Client must have written a C_HELLO frame in response.
+        let (tag, payload) = read_msg(&mut client_to_server.as_slice()).unwrap();
+        assert_eq!(tag, C_HELLO);
+        let hello = parse_client_hello(&payload).unwrap();
+        assert_eq!(hello.proto_major, PROTO_MAJOR);
+        assert_eq!(hello.proto_minor, PROTO_MINOR);
+        assert!(hello
+            .supported_features
+            .contains(&"scrollback-v3".to_string()));
     }
 
     #[test]
-    fn hello_tags_distinct_from_existing() {
-        // Defensive: catch accidental tag collisions when constants are added.
-        let tags = [
-            C_EVENT,
-            C_DETACH,
-            C_RESIZE,
-            C_KILL,
-            C_PING,
-            C_ATTACH,
-            C_HELLO,
-            C_SUBSCRIBE,
-        ];
-        let mut sorted = tags.to_vec();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(sorted.len(), tags.len(), "client tag collision");
-
-        let stags = [
-            S_OUTPUT,
-            S_DETACHED,
-            S_EXIT,
-            S_PONG,
-            S_HELLO_OK,
-            S_HELLO_ERR,
-            S_SUBSCRIBE_OK,
-            S_EVENT,
-            S_EVENT_OVERFLOW,
-            S_SUBSCRIBE_ERR,
-        ];
-        let mut sorted_s = stags.to_vec();
-        sorted_s.sort_unstable();
-        sorted_s.dedup();
-        assert_eq!(sorted_s.len(), stags.len(), "server tag collision");
-    }
-
-    #[test]
-    fn subscribe_request_round_trip() {
-        let req = SubscribeRequest {
-            topics: vec![EventTopic::Pane, EventTopic::Tab],
-            filter: Some(EventFilter {
-                session: Some("build".to_string()),
-            }),
+    fn major_mismatch_short_circuits_client_handshake() {
+        // Server claims major = PROTO_MAJOR + 1 — client must NOT send
+        // C_HELLO and must report Incompat.
+        let server = ServerHello {
+            proto_major: PROTO_MAJOR + 1,
+            proto_minor: 0,
+            build: "ezpn future".into(),
         };
-        let json = serde_json::to_string(&req).unwrap();
-        // Lower-case topics on the wire (matches CLI flags).
-        assert!(json.contains("\"pane\""), "json={json}");
-        assert!(json.contains("\"tab\""));
-        let decoded: SubscribeRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded.topics, vec![EventTopic::Pane, EventTopic::Tab]);
-        assert_eq!(decoded.filter.unwrap().session.as_deref(), Some("build"));
-    }
+        let mut server_to_client: Vec<u8> = Vec::new();
+        let json = serde_json::to_vec(&server).unwrap();
+        write_msg(&mut server_to_client, S_VERSION, &json).unwrap();
 
-    #[test]
-    fn subscribe_request_default_filter() {
-        let json = r#"{"topics":["pane"]}"#;
-        let decoded: SubscribeRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(decoded.topics, vec![EventTopic::Pane]);
-        assert!(decoded.filter.is_none());
-    }
+        let mut client_to_server: Vec<u8> = Vec::new();
+        let outcome =
+            client_handshake(&mut server_to_client.as_slice(), &mut client_to_server).unwrap();
 
-    #[test]
-    fn event_envelope_serializes_with_type_rename() {
-        let env = EventEnvelope {
-            v: 1,
-            ts: 1714082400000,
-            topic: "pane",
-            type_: "pane.created",
-            session: "default".to_string(),
-            data: serde_json::json!({"pane_id": 3, "cols": 120}),
-        };
-        let json = serde_json::to_string(&env).unwrap();
         assert!(
-            json.contains("\"type\":\"pane.created\""),
-            "type_ must serialize as 'type': {json}"
+            client_to_server.is_empty(),
+            "client must not send C_HELLO on major mismatch"
         );
-        assert!(json.contains("\"v\":1"));
-        assert!(json.contains("\"topic\":\"pane\""));
+        match outcome {
+            HandshakeOutcome::Incompat(notice) => {
+                assert_eq!(notice.server_proto, format!("{}.0", PROTO_MAJOR + 1));
+                assert_eq!(
+                    notice.client_proto,
+                    format!("{}.{}", PROTO_MAJOR, PROTO_MINOR)
+                );
+            }
+            HandshakeOutcome::Ok(_) => panic!("expected Incompat for major mismatch"),
+        }
     }
 
     #[test]
-    fn cap_event_stream_is_advertised() {
-        assert_eq!(
-            SERVER_CAPABILITIES & CAP_EVENT_STREAM,
-            CAP_EVENT_STREAM,
-            "SERVER_CAPABILITIES must include CAP_EVENT_STREAM"
-        );
+    fn server_pushed_incompat_is_surfaced() {
+        // Server skips S_VERSION (e.g. detected legacy first byte from a
+        // different connection in spec — here we just simulate a server
+        // that pushes S_INCOMPAT outright).
+        let frame = incompat_for_legacy_client("demo");
+        let mut client_to_server: Vec<u8> = Vec::new();
+        let outcome = client_handshake(&mut frame.as_slice(), &mut client_to_server).unwrap();
+        match outcome {
+            HandshakeOutcome::Incompat(notice) => {
+                assert!(notice.message.contains("legacy client detected"));
+                assert!(notice.message.contains("ezpn kill demo"));
+            }
+            HandshakeOutcome::Ok(_) => panic!("expected Incompat from server-pushed S_INCOMPAT"),
+        }
+    }
+
+    #[test]
+    fn legacy_first_byte_classification() {
+        // Real tags fall in 0x00..=0x20. Any current/future negotiation
+        // tag is also in that range (we reserved 0x10..=0x1F).
+        assert_eq!(classify_first_byte(C_EVENT), FirstByteKind::Tag);
+        assert_eq!(classify_first_byte(C_RESIZE), FirstByteKind::Tag);
+        assert_eq!(classify_first_byte(C_ATTACH), FirstByteKind::Tag);
+        assert_eq!(classify_first_byte(S_VERSION), FirstByteKind::Tag);
+        assert_eq!(classify_first_byte(C_HELLO), FirstByteKind::Tag);
+
+        // Legacy v0.5 client dumps `AttachRequest` JSON — first byte `{`.
+        assert_eq!(classify_first_byte(b'{'), FirstByteKind::LegacyJson);
+        // JSON arrays would also be a legacy marker.
+        assert_eq!(classify_first_byte(b'['), FirstByteKind::LegacyJson);
+
+        // Anything else: protocol violation.
+        assert_eq!(classify_first_byte(b'A'), FirstByteKind::Unknown);
+        assert_eq!(classify_first_byte(0xFF), FirstByteKind::Unknown);
+    }
+
+    #[test]
+    fn build_string_with_and_without_rev() {
+        let with_rev = build_string(Some("abc1234"));
+        assert!(with_rev.contains("rev abc1234"));
+        assert!(with_rev.contains(env!("CARGO_PKG_VERSION")));
+        let no_rev = build_string(None);
+        assert!(no_rev.contains("rev unknown"));
+        let empty_rev = build_string(Some(""));
+        assert!(empty_rev.contains("rev unknown"));
+    }
+
+    #[test]
+    fn unknown_first_frame_is_an_error() {
+        // Server speaks gibberish — client must fail loudly.
+        let mut bad: Vec<u8> = Vec::new();
+        write_msg(&mut bad, S_OUTPUT, b"raw bytes").unwrap();
+        let mut sink: Vec<u8> = Vec::new();
+        let err = client_handshake(&mut bad.as_slice(), &mut sink).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

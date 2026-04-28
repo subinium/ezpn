@@ -13,8 +13,6 @@
   <a href="https://crates.io/crates/ezpn"><img src="https://img.shields.io/crates/v/ezpn?style=flat-square&color=orange" alt="crates.io"></a>
   <a href="../LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="MIT License"></a>
   <a href="https://github.com/subinium/ezpn/actions"><img src="https://img.shields.io/github/actions/workflow/status/subinium/ezpn/ci.yml?style=flat-square&label=CI" alt="CI"></a>
-  <a href="https://github.com/subinium/ezpn/actions/workflows/gitleaks.yml"><img src="https://img.shields.io/github/actions/workflow/status/subinium/ezpn/gitleaks.yml?style=flat-square&label=gitleaks" alt="gitleaks"></a>
-  <a href="https://github.com/subinium/ezpn/actions/workflows/supply-chain.yml"><img src="https://img.shields.io/github/actions/workflow/status/subinium/ezpn/supply-chain.yml?style=flat-square&label=audit" alt="audit"></a>
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey?style=flat-square" alt="Platform">
 </p>
 
@@ -37,12 +35,8 @@ Pas de fichiers de configuration, pas de setup, pas de courbe d'apprentissage. L
 **Dans un projet**, placez `.ezpn.toml` dans votre dépôt et lancez `ezpn` — tout le monde obtient le même espace de travail :
 
 ```toml
-[session]
-name = "myproject"           # épingle le nom de session (les collisions deviennent myproject-1, -2...)
-
 [workspace]
 layout = "7:3/1:1"
-persist_scrollback = true    # le scrollback survit au détachement/rattachement
 
 [[pane]]
 name = "editor"
@@ -52,7 +46,6 @@ command = "nvim ."
 name = "server"
 command = "npm run dev"
 restart = "on_failure"
-env = { NODE_ENV = "${env:NODE_ENV}", DB_URL = "${file:.env.local}" }
 
 [[pane]]
 name = "tests"
@@ -64,8 +57,7 @@ command = "tail -f logs/app.log"
 ```
 
 ```bash
-$ ezpn         # lit .ezpn.toml, lance tout
-$ ezpn doctor  # valide l'interpolation d'env + les références de secrets avant exécution
+$ ezpn   # lit .ezpn.toml, lance tout
 ```
 
 Pas de tmuxinator. Pas de YAML. Juste un fichier TOML dans votre dépôt.
@@ -75,8 +67,6 @@ Pas de tmuxinator. Pas de YAML. Juste un fichier TOML dans votre dépôt.
 ```bash
 cargo install ezpn
 ```
-
-Ou récupérez un binaire précompilé depuis la [dernière release](https://github.com/subinium/ezpn/releases/latest) — `ezpn-x86_64-unknown-linux-gnu.tar.gz`, `ezpn-x86_64-apple-darwin.tar.gz` ou `ezpn-aarch64-apple-darwin.tar.gz`.
 
 <details>
 <summary>Compiler depuis les sources</summary>
@@ -105,10 +95,7 @@ ezpn a                 # Reconnecter à la session la plus récente
 ezpn a myproject       # Reconnecter par nom
 ezpn ls                # Lister les sessions actives
 ezpn kill myproject    # Terminer une session
-ezpn --new             # Forcer une nouvelle session même s'il en existe déjà une pour $PWD
 ```
-
-Les noms de session sont par défaut `basename($PWD)`. Les collisions sont résolues de manière déterministe — `repo` → `repo-1` → `repo-2` (les sockets morts sont nettoyés pendant le scan). Épinglez un nom dans `.ezpn.toml` via `[session].name = "..."`.
 
 ### Onglets
 
@@ -126,26 +113,16 @@ Toutes les touches tmux fonctionnent — `Ctrl+B %` pour diviser, `Ctrl+B x` pou
 |---|---|
 | **Zéro configuration** | Fonctionne immédiatement. Aucun fichier rc nécessaire. |
 | **Presets de disposition** | `dev`, `ide`, `monitor`, `quad`, `stack`, `main`, `trio` |
-| **Persistance de session** | Détacher/attacher comme tmux. Daemon en arrière-plan qui maintient les processus en vie. Rattachement à froid sous 50 ms. |
-| **Persistance du scrollback** | `persist_scrollback` optionnel — le scrollback survit au détachement/rattachement (gzip+bincode dans les snapshots v3). |
+| **Persistance de session** | Détacher/attacher comme tmux. Daemon en arrière-plan. |
 | **Onglets** | Fenêtres style tmux avec barre d'onglets et clic souris. |
 | **Souris d'abord** | Clic pour cibler, glisser pour redimensionner, molette pour l'historique, glisser pour sélectionner et copier. |
-| **Mode copie** | Touches Vi, sélection visuelle, recherche incrémentale par largeur d'affichage, presse-papiers OSC 52. |
+| **Mode copie** | Touches Vi, sélection visuelle, recherche incrémentale, presse-papiers OSC 52. |
 | **Palette de commandes** | `Ctrl+B :` avec commandes compatibles tmux. |
 | **Mode broadcast** | Saisir dans tous les panneaux simultanément. |
 | **Configuration projet** | `.ezpn.toml` — disposition, commandes, variables d'env, redémarrage auto. |
-| **Interpolation d'env** | `${HOME}`, `${env:VAR}`, `${file:.env.local}`, `${secret:keychain:KEY}` dans l'env des panneaux. |
-| **Thèmes** | Palette TOML + 4 intégrés (`tokyo-night`, `gruvbox-dark`, `solarized-dark`/`-light`). |
-| **Rechargement à chaud** | `Ctrl+B r` recharge `~/.config/ezpn/config.toml` sans détacher. |
 | **Mode sans bordure** | `ezpn -b none` pour maximiser l'espace d'écran. |
-| **Clavier Kitty** | `Shift+Enter`, `Ctrl+Arrow`, Alt+Char (CSI u / RFC 3665) — les touches modifiées fonctionnent correctement. |
+| **Clavier Kitty** | `Shift+Enter`, `Ctrl+Arrow` et touches modifiées fonctionnent correctement. |
 | **CJK/Unicode** | Calcul précis de largeur pour coréen, chinois, japonais et emoji. |
-| **Isolation des crashs** | Un panneau qui panique ne peut pas faire tomber le daemon (gestion sûre des signaux SIGTERM/SIGCHLD). |
-| **Entrée scriptable** | `ezpn-ctl send-keys --pane N -- 'cmd' Enter` — pour éditeurs, agents IA et scripts CI. |
-| **Flux d'événements** | Abonnements `S_EVENT` longue durée sur le protocole binaire (intégrations style `-CC`). |
-| **Hooks** | Configuration déclarative `[[hooks]]` : exécution shell sur événements daemon, pool de workers + timeout par hook. |
-| **Recherche regex** | `[copy_mode] search = "regex"` bascule la recherche du mode copie en motifs POSIX + smart-case. |
-| **Historique par panneau** | `ezpn-ctl clear-history --pane N` / `set-scrollback --pane N --lines L` contrôle à l'exécution. |
 
 ## Presets de disposition
 
@@ -170,70 +147,21 @@ Placez `.ezpn.toml` à la racine du projet et lancez `ezpn`. C'est tout.
 ```bash
 ezpn init              # Générer un modèle .ezpn.toml
 ezpn from Procfile     # Importer depuis Procfile
-ezpn doctor            # Valider la config + l'interpolation d'env, sortie non-zéro si références manquantes
 ```
-
-### Hooks
-
-Exécutez une commande shell sur événements du daemon. Pool de 4 workers avec `timeout_ms` par hook ; chaque processus enfant est lancé dans son propre groupe, donc l'escalade SIGTERM → SIGKILL atteint tout l'arbre.
-
-```toml
-# ~/.config/ezpn/config.toml ou .ezpn.toml
-
-[[hooks]]
-event = "client-attached"
-command = "notify-send 'pane {client_id} attached'"
-shell = true
-timeout_ms = 2000
-
-[[hooks]]
-event = "tab-created"
-command = ["/usr/local/bin/ezpn-tab-init", "{name}", "{tab_index}"]
-```
-
-v0.11 câble `client-attached`, `client-detached`, `tab-created`, `tab-closed`, `session-renamed`. L'expansion de variables (`{session}`, `{client_id}`, `{pane_id}`, …) substitue les valeurs par événement dans `command` avant l'exec.
-
-### Interpolation d'env
-
-Les valeurs d'env des panneaux supportent quatre formes de référence :
-
-```toml
-[[pane]]
-command = "npm run dev"
-env = {
-  HOME       = "${HOME}",                    # env du processus
-  NODE_ENV   = "${env:NODE_ENV}",            # env explicite
-  DB_URL     = "${file:.env.local}",         # lookup dans un fichier dotenv
-  GH_TOKEN   = "${secret:keychain:GH_TOKEN}",# Trousseau macOS (Linux : secret-tool)
-}
-```
-
-`.env.local` à côté de `.ezpn.toml` est fusionné automatiquement et écrase `[env]`. `${secret:keychain:KEY}` retombe sur `${env:KEY}` avec un avertissement quand le trousseau de l'OS n'est pas disponible. La récursion est plafonnée à une profondeur de 8 pour détecter les cycles.
-
-### Thèmes
-
-```toml
-# .ezpn.toml ou ~/.config/ezpn/config.toml
-theme = "tokyo-night"   # default | tokyo-night | gruvbox-dark | solarized-dark | solarized-light
-```
-
-Les thèmes utilisateur se chargent depuis `~/.config/ezpn/themes/<name>.toml`. ezpn détecte automatiquement `$COLORTERM` / `$TERM` et redescend en 256 ou 16 couleurs quand le truecolor n'est pas supporté.
 
 <details>
-<summary>Configuration globale (~/.config/ezpn/config.toml)</summary>
+<summary>Configuration globale</summary>
+
+`~/.config/ezpn/config.toml` :
 
 ```toml
-border = rounded            # single | rounded | heavy | double | none
+border = rounded        # single | rounded | heavy | double | none
 shell = /bin/zsh
 scrollback = 10000
 status_bar = true
 tab_bar = true
-prefix = b                  # touche préfixe (Ctrl+<key>)
-theme = default             # default | tokyo-night | gruvbox-dark | solarized-dark | solarized-light
-persist_scrollback = false  # sauvegarder le scrollback dans les snapshots auto (désactivé par défaut)
+prefix = b              # touche préfixe (Ctrl+<key>)
 ```
-
-Les changements du panneau de réglages (`Ctrl+B Shift+,`) sont persistés de manière atomique. Rechargez depuis le disque avec `Ctrl+B r`.
 
 </details>
 
@@ -260,7 +188,6 @@ Les changements du panneau de réglages (`Ctrl+B Shift+,`) sont persistés de ma
 | `[` | Mode copie |
 | `B` | Broadcast |
 | `:` | Palette de commandes |
-| `r` | Recharger la config |
 | `d` | Détacher |
 | `?` | Aide |
 
@@ -339,6 +266,32 @@ broadcast                    Basculer le broadcast
 
 </details>
 
+## Pourquoi ezpn (vs. tmux)
+
+Trois affirmations mesurables. Vérifiez-les sur votre propre charge
+de travail avant de leur faire confiance.
+
+| Axe | tmux 3.4 | **ezpn 0.12** | Comment c'est mesuré |
+| --- | --- | --- | --- |
+| RSS au repos (16 panneaux, 50 MB de scrollback total, Linux 6.6) | ~180 MB | **~28 MB** | `ps -o rss= -p $(pgrep -d, tmux\|ezpn)` après 16 splits et 1 minute d'inactivité. |
+| Fiabilité de `send-keys` | fire-and-forget ; pas de signal de fin | **`--await-prompt` bloque jusqu'à OSC 133 D** | `ezpn-ctl send-keys --await-prompt --timeout 60s -- 'cargo test\n'` — voir [scripting.md](scripting.md). |
+| DECSET 2026 (sortie synchronisée) | transmis à l'émulateur hôte | **intercepté + bufferisé** ; une seule frame atomique aux clients | `printf '\e[?2026h…\e[?2026l'` avec deux clients connectés — les deux voient le même redessin atomique. |
+
+Au-delà des chiffres :
+
+- **Defaults zéro-config.** Toute touche tmux fonctionne sur une installation neuve. Pas de `.tmux.conf`, pas de gestionnaire de plugins.
+- **TOML, pas un satellite YAML.** `.ezpn.toml` vit dans votre repo ; tout le monde partage le même workspace sans `gem install tmuxinator`.
+- **Garde anti-injection OSC 52.** `cat hostile.log` ne peut pas écraser silencieusement votre presse-papiers ([clipboard.md](clipboard.md), [security.md](security.md)).
+- **Protocole gelé.** [`docs/protocol/v1.md`](protocol/v1.md) engage SemVer sur la surface IPC — vos scripts ne cassent pas entre des minor bumps.
+
+Compromis à peser avant de migrer :
+
+- Pas de système de plugins. L'écosystème de tmux a 10+ ans ; celui d'ezpn est vide.
+- Pas de `pipe-pane`, `command-alias`, `if-shell`. Utilisez `[[hooks]]` et le bus d'événements.
+- Linux et macOS uniquement. Pas de Windows.
+
+Guide de migration complet : [docs/migration-from-tmux.md](migration-from-tmux.md).
+
 ## ezpn vs. tmux vs. Zellij
 
 | | tmux | Zellij | **ezpn** |
@@ -353,9 +306,9 @@ broadcast                    Basculer le broadcast
 | Plugins | — | WASM | — |
 | Écosystème | Massif (30 ans) | En croissance | Nouveau |
 
-**ezpn** — division de terminal sans configuration + surface de scripting `ezpn-ctl send-keys` / flux d'événements / hooks.
-**tmux** — quand vous avez besoin d'un écosystème de plugins profond (TPM, etc.).
-**Zellij** — quand vous voulez des plugins WASM.
+**ezpn** — division de terminal sans configuration.
+**tmux** — quand vous avez besoin de scripting avancé et d'un écosystème de plugins.
+**Zellij** — quand vous voulez une UI moderne avec des plugins WASM.
 
 ## Référence CLI
 
@@ -365,37 +318,24 @@ ezpn -l <PRESET>         Démarrer avec un preset
 ezpn -e <CMD> [-e ...]   Commandes par panneau
 ezpn -S <NAME>           Session nommée
 ezpn -b <STYLE>          Style de bordure (single/rounded/heavy/double/none)
-ezpn --new               Forcer une nouvelle session (ignorer l'auto-rattachement)
 ezpn a [NAME]            Connecter à une session
 ezpn ls                  Lister les sessions
 ezpn kill [NAME]         Terminer une session
 ezpn rename OLD NEW      Renommer une session
 ezpn init                Générer un modèle .ezpn.toml
 ezpn from <FILE>         Importer depuis Procfile
-ezpn doctor              Valider .ezpn.toml + interpolation d'env
 ```
 
-### `ezpn-ctl` (scripting)
+## Documentation
 
-```
-ezpn-ctl list                                Lister les panneaux
-ezpn-ctl split [horizontal|vertical] [PANE]  Diviser un panneau
-ezpn-ctl close PANE                          Fermer un panneau
-ezpn-ctl focus PANE                          Focaliser un panneau
-ezpn-ctl save <PATH>                         Sauvegarder un snapshot du workspace
-ezpn-ctl load <PATH>                         Restaurer un workspace
-ezpn-ctl exec PANE <CMD>                     Remplacer un panneau par une nouvelle commande
-
-ezpn-ctl send-keys [--pane N | --target current] [--literal] -- <key>...
-                                             Envoyer des tokens de chord ou des octets bruts au PTY du panneau.
-                                             Exemples :
-                                               ezpn-ctl send-keys --pane 0 -- 'echo hi' Enter
-                                               ezpn-ctl send-keys --target current -- C-c
-                                               ezpn-ctl send-keys --pane 0 --literal -- $'#!/bin/sh\nexit 0\n'
-
-ezpn-ctl clear-history --pane N              Jeter le scrollback au-dessus de l'écran visible
-ezpn-ctl set-scrollback --pane N --lines L   Redimensionner l'anneau de scrollback (plafonné par scrollback_max_lines)
-```
+- [Démarrage](getting-started.md) — visite de 5 minutes
+- [Migrer depuis tmux](migration-from-tmux.md) — touche par touche, commande par commande
+- [Configuration](configuration.md) — référence complète de `config.toml` + `.ezpn.toml`
+- [Scripting](scripting.md) — `ezpn-ctl`, événements, `ls --json`
+- [Presse-papiers](clipboard.md) — OSC 52, chaîne de fallback, piège SSH
+- [Protocole terminal](terminal-protocol.md) — ce qu'ezpn transmet / intercepte / modifie
+- [Sécurité](security.md) — modèle de menaces et defaults
+- [Protocole IPC v1](protocol/v1.md) — gelé en v1.0
 
 ## Licence
 
