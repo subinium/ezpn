@@ -9,6 +9,11 @@
 //! of the binary and stays under the bench-suite cap of 5 minutes per
 //! issue #99 acceptance.
 
+// The bench only uses a handful of items from `protocol.rs`; the rest
+// (handshake structs, command tags, etc.) are exercised by the lib/bin
+// targets but legitimately look dead from the bench's narrow view.
+#![allow(dead_code, unused_imports)]
+
 use std::io::Cursor;
 use std::time::Duration;
 
