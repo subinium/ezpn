@@ -65,6 +65,11 @@ jobs:
           done
 
       - name: Detect regressions > 5%
+        # PR-only: on push events to main, the run exists to seed/refresh
+        # the baseline, not to gate the merge. Self-comparison + noisy
+        # micro-benches (codec, rss) trip 5% bands on shared runners,
+        # which is meaningless when the baseline IS the same commit.
+        if: github.event_name == 'pull_request'
         run: |
           # Criterion prints `change: [+X% +Y% +Z%]` and a `Performance
           # has regressed.` line for any bench that crossed its noise
