@@ -9,6 +9,60 @@ Entries are written in **functional-only style**: every bullet describes an obse
 
 ## [Unreleased]
 
+## [0.13.1] — 2026-04-29 — Clippy gate + RFC docs + cwd inheritance
+
+Patch release that (a) restores the strict clippy gate v0.12.0 had
+relaxed for deferred-wiring modules, (b) closes the v0.13.0 acceptance
+gap on OSC 7 cwd inheritance for new split panes, and (c) lands the
+six RFC design documents the v0.13.0 cycle accumulated.
+
+### Added
+- **Split-pane cwd inheritance** (#75): `do_split` now reads the focused
+  pane's `live_cwd()` (OSC 7 reported cwd if fresh, else procfs, else
+  launch-time cwd) and passes it to the new pane's spawn via a new
+  `bootstrap::spawn_pane_in` constructor.
+- **RFC 0002 — vt100 strategy commitment** (#102): commits to soft-fork
+  vt100 0.15 with parallel upstream PRs; 4-week SLA before falling back
+  to a shim layer for any individual blocker.
+- **RFC 0003 — IPC `Ext` channel routing** (#103): documents the
+  `IpcCommand::{Legacy, Ext}` channel split that shipped in v0.13.0.
+- **RFC 0004 — vt100-independent scrollback storage** (#104): byte-budget
+  + sparse-row design that replaces vt100's per-row `Vec<Cell>`.
+- **RFC 0005 — memory budget SLA** (#105): per-pane / per-session /
+  daemon RSS ceilings + CI gate plan via `/proc/self/status` in soak.
+- **RFC 0006 — snapshot v4 schema** (#106): named buffers + theme state
+  + future-proof slots; v3 → v4 migration path.
+- **RFC 0007 — OSC handler coverage matrix** (#107): full intercept
+  vs forward decision table across OSC 0/1/2/4/7/8/9/10/11/12/52/133.
+
+### Changed
+- **CI clippy gate** restored to `-D warnings` with no `-A clippy::all`
+  override (v0.12.0 had relaxed it for deferred-wiring modules; v0.13.0
+  wired everything; the restore was promised for v0.12.1, which we
+  skipped — landing in v0.13.1 instead).
+
+### Fixed
+- `clippy::field_reassign_with_default` in `pane.rs` and
+  `terminal_state.rs` test modules → struct-update syntax.
+- `clippy::useless_vec` in `hooks.rs` test → array literal.
+- Bench-only `dead_code` / `unused_imports` in `#[path]`-mounted bench
+  crates (`render_hotpaths.rs`, `protocol_codec.rs`, `rss_proxy.rs`)
+  silenced at the bench-crate level (items are exercised by lib/bin).
+
+### Closed (no code change — v0.13.0 retroactive)
+- **#76 OSC 8 hyperlinks pass-through**: tested as pass-through in
+  v0.13.0 (`intercept_osc8_does_not_consume_or_inject`); vt100 0.15
+  cell-state stripping documented in `docs/terminal-protocol.md` §7.
+- **#77 OSC 4/10/11/12 color queries**: shipped in v0.13.0 under
+  `pane.rs:handle_osc_color` / `handle_osc4`. EPIPE silent-drop, palette
+  pass-through gated on `palette.is_active()`.
+
+### Out of scope (deferred)
+- New-tab cwd inheritance (different refactor — focused-pane lookup
+  before `panes` is moved into the saved tab).
+- `Pane::with_cwd` constructor remains (public, unused) pending the
+  next round of pane-spawn API consolidation.
+
 ## [0.13.0] — 2026-04-28 — Multiplexer wiring + Memory & Persistence
 
 Roll-up release that finishes the v0.12.0 deferred-wiring backlog and
