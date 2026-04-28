@@ -534,9 +534,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                     session: session_name.to_string(),
                     pane: pid,
                     command: cmd,
-                    cwd: pane
-                        .live_cwd()
-                        .map(|p| p.to_string_lossy().into_owned()),
+                    cwd: pane.live_cwd().map(|p| p.to_string_lossy().into_owned()),
                     ts: events::now_ts(),
                 });
                 let payload = HookPayload::new()
@@ -1563,14 +1561,15 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                 // Build PaletteOverlayState if we're in CommandPalette mode
                 // (#86). Empty `fuzzy_index` falls back to the legacy text
                 // input — render_glue handles the None case.
-                let palette_matches: Vec<crate::fuzzy::Match> = if matches!(mode, InputMode::CommandPalette { .. }) {
-                    fuzzy_index
-                        .as_mut()
-                        .map(|fi| fi.search(palette_query.as_str(), 6))
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
+                let palette_matches: Vec<crate::fuzzy::Match> =
+                    if matches!(mode, InputMode::CommandPalette { .. }) {
+                        fuzzy_index
+                            .as_mut()
+                            .map(|fi| fi.search(palette_query.as_str(), 6))
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
                 let palette_state = if matches!(mode, InputMode::CommandPalette { .. }) {
                     fuzzy_index.as_ref().map(|fi| render::PaletteOverlayState {
                         query: palette_query.as_str(),

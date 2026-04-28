@@ -1119,12 +1119,7 @@ pub fn draw_status_bar_full(
         "CLOSE TAB? y/n" => &["y close tab", "any key cancel"],
         "ZOOM" => &["Ctrl+B z unzoom", "Ctrl+D/E split", "type normally"],
         "BROADCAST" => &["typing in ALL panes", "Ctrl+B B stop broadcast"],
-        ":" => &[
-            "↑↓ navigate",
-            "Enter select",
-            "Tab complete",
-            "Esc cancel",
-        ],
+        ":" => &["↑↓ navigate", "Enter select", "Tab complete", "Esc cancel"],
         "RENAME" => &["Enter confirm", "Esc cancel"],
         _ => &[
             "Ctrl+D/E split",
@@ -1599,9 +1594,7 @@ pub fn draw_osc52_confirm_overlay(
             g: 240,
             b: 200,
         });
-    let msg = format!(
-        " OSC52 pane #{pane_id}: allow {byte_count} bytes to clipboard? [y/n/Esc] "
-    );
+    let msg = format!(" OSC52 pane #{pane_id}: allow {byte_count} bytes to clipboard? [y/n/Esc] ");
     let max_inner = (term_w as usize).saturating_sub(2);
     let truncated: String = if msg.width() > max_inner {
         let mut acc = String::new();

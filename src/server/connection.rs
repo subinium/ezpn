@@ -220,11 +220,7 @@ pub(super) fn accept_client(
                 }
                 let seq = format!("\x1b[>{bits}u");
                 tracing::debug!(client_id, pane_id, flags = bits, "kitty kbd flag replay");
-                let _ = protocol::write_msg(
-                    &mut client.writer,
-                    protocol::S_OUTPUT,
-                    seq.as_bytes(),
-                );
+                let _ = protocol::write_msg(&mut client.writer, protocol::S_OUTPUT, seq.as_bytes());
             }
         }
     }

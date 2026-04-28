@@ -363,9 +363,8 @@ pub(super) fn process_key(
                 crate::keymap::Action::CopyMode => {
                     if let Some(pane) = panes.get(active) {
                         let (rows, cols) = pane.screen().size();
-                        *mode = InputMode::CopyMode(crate::copy_mode::CopyModeState::new(
-                            rows, cols,
-                        ));
+                        *mode =
+                            InputMode::CopyMode(crate::copy_mode::CopyModeState::new(rows, cols));
                         update.full_redraw = true;
                     }
                     return;
@@ -714,11 +713,8 @@ pub(super) fn process_key(
                     // clipboard fallback chain (#91, #92). OSC 52 is the
                     // last-resort fallback for when no clipboard tool is
                     // wired up — e.g. SSH with no host clipboard daemon.
-                    let report = crate::copy_mode::yank_to_buffer(
-                        &text,
-                        buffers,
-                        clipboard_copy_argv,
-                    );
+                    let report =
+                        crate::copy_mode::yank_to_buffer(&text, buffers, clipboard_copy_argv);
                     match &report.clipboard {
                         Ok(label) => {
                             tracing::debug!(
@@ -1103,11 +1099,7 @@ pub(super) fn process_key(
 /// Build the fuzzy palette candidate set (#86) and stash it in the
 /// runtime context. Sources: action vocabulary, recent history, current
 /// pane / tab list. Called when entering CommandPalette mode.
-fn build_palette_index(
-    ctx: &mut RuntimeCtx<'_>,
-    panes: &HashMap<usize, Pane>,
-    layout: &Layout,
-) {
+fn build_palette_index(ctx: &mut RuntimeCtx<'_>, panes: &HashMap<usize, Pane>, layout: &Layout) {
     use crate::fuzzy::{Entry, EntryKind, FuzzyIndex};
     let mut entries: Vec<Entry> = Vec::new();
     // Action / command vocabulary (frozen v1).

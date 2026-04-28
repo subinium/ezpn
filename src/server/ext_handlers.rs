@@ -173,9 +173,7 @@ fn build_tab_info(
                 Some(t.to_string())
             }
         };
-        let cwd = pane
-            .initial_cwd()
-            .map(|p| p.to_string_lossy().into_owned());
+        let cwd = pane.initial_cwd().map(|p| p.to_string_lossy().into_owned());
         let reported_cwd = pane
             .reported_cwd()
             .map(|p| p.to_string_lossy().into_owned());
@@ -340,7 +338,12 @@ mod tests {
         let response = IpcResponse::with_dump(DumpPayload {
             pane: 7,
             total: 4,
-            lines: vec!["alpha".into(), "beta".into(), "gamma".into(), "delta".into()],
+            lines: vec![
+                "alpha".into(),
+                "beta".into(),
+                "gamma".into(),
+                "delta".into(),
+            ],
         });
         let json = serde_json::to_string(&response).unwrap();
         let back: IpcResponse = serde_json::from_str(&json).unwrap();

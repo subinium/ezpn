@@ -306,12 +306,10 @@ pub(super) fn execute_action(
             settings.reload_request = true;
             return Ok(None);
         }
-        Action::SetBuffer { name, value } => {
-            match buffers.set(name.clone(), value.clone()) {
-                Ok(()) => return Ok(Some(format!("set-buffer {name}"))),
-                Err(e) => return Err(e.to_string()),
-            }
-        }
+        Action::SetBuffer { name, value } => match buffers.set(name.clone(), value.clone()) {
+            Ok(()) => return Ok(Some(format!("set-buffer {name}"))),
+            Err(e) => return Err(e.to_string()),
+        },
         Action::PasteBuffer { name } => {
             let entry = match name {
                 Some(n) => buffers.get(n.as_str()),

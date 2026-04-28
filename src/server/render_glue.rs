@@ -79,14 +79,7 @@ pub(super) fn render_frame_to_buf(
     // OSC 52 confirm prompt sits above everything else (modal).
     if let Some(state) = osc52_confirm {
         let palette = Some(&settings.resolved_palette);
-        render::draw_osc52_confirm_overlay(
-            buf,
-            state.pane_id,
-            state.byte_count,
-            palette,
-            tw,
-            th,
-        )?;
+        render::draw_osc52_confirm_overlay(buf, state.pane_id, state.byte_count, palette, tw, th)?;
     }
     Ok(())
 }

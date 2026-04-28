@@ -934,10 +934,7 @@ mod tests {
             .kind(),
             "set-buffer",
         );
-        assert_eq!(
-            Action::PasteBuffer { name: None }.kind(),
-            "paste-buffer",
-        );
+        assert_eq!(Action::PasteBuffer { name: None }.kind(), "paste-buffer",);
         assert_eq!(
             Action::PasteBuffer {
                 name: Some("foo".into())
