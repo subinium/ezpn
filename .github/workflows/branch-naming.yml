@@ -18,9 +18,9 @@ jobs:
               exit 0
               ;;
           esac
-          if ! echo "$BRANCH" | grep -qE '^(feat|fix|perf|refactor|chore|docs|test|release)/[a-z0-9._-]+$'; then
+          if ! echo "$BRANCH" | grep -qE '^(feat|fix|perf|refactor|chore|docs|test|ci|release)/[a-z0-9._-]+$'; then
             echo "Branch '$BRANCH' must match: <type>/<short-description>"
-            echo "Allowed types: feat, fix, perf, refactor, chore, docs, test, release"
+            echo "Allowed types: feat, fix, perf, refactor, chore, docs, test, ci, release"
             echo "Example: feat/scrollback-persistence, release/v0.9.0"
             exit 1
           fi
