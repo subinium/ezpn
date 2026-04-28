@@ -7,20 +7,15 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 /// Eviction policy for the byte-budget scrollback cap (#67).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ScrollbackEviction {
     /// Evict the oldest line first. Default. Matches user mental model
     /// (FIFO timeline preserved minus the head).
+    #[default]
     OldestLine,
     /// Evict the largest line first. Useful when the timeline matters
     /// more than rare giant lines (compiler errors, log dumps).
     LargestLine,
-}
-
-impl Default for ScrollbackEviction {
-    fn default() -> Self {
-        ScrollbackEviction::OldestLine
-    }
 }
 
 impl ScrollbackEviction {
@@ -127,6 +122,10 @@ impl Default for EzpnConfig {
 //   ]
 
 /// Side of the status bar a segment list anchors to.
+// reason: declarative segment-side enum referenced by the renderer wiring
+// scheduled in #87; enum exists so the `[status_bar]` schema is forward-
+// compatible without another config break.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatusBarSide {
     Left,
@@ -205,6 +204,9 @@ pub struct StatusBarConfig {
 impl StatusBarConfig {
     /// Look up a segment by placeholder name (e.g. `key_hints` for
     /// `"{key_hints}"`). Returns the first match.
+    // reason: consumed by the status-bar render wiring (#87); covered by
+    // unit tests today, called from `render::status_bar` once that wiring lands.
+    #[allow(dead_code)]
     pub fn segment(&self, name: &str) -> Option<&StatusBarSegment> {
         self.segments.iter().find(|s| s.name == name)
     }

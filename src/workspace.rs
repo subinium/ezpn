@@ -22,6 +22,7 @@ pub const SNAPSHOT_VERSION: u32 = 3;
 /// - v0.13 (this release): reads v1, v2, v3.
 /// - v0.16: drops v1.
 /// - v1.0:  drops v2.
+///
 /// Anything older than this constant produces a hard error pointing the
 /// user at `ezpn upgrade-snapshot`.
 pub const MIN_SUPPORTED_VERSION: u32 = 1;
@@ -141,6 +142,11 @@ pub enum ScrollbackEncoding {
 /// non-self-describing format, so any serializer-side skip would leave
 /// the deserializer expecting bytes that never appear (UnexpectedEOF).
 /// Compression handles the empty-`attrs` case adequately.
+// reason: snapshot v3 scrollback row type (#69); constructed by the
+// snapshot-save capture path scheduled in the same issue, decoded by
+// the snapshot-load restore path. Covered by this module's
+// `#[cfg(test)]` round-trip tests today.
+#[allow(dead_code)]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RowSnapshot {
     /// UTF-8 text of the row, with trailing whitespace preserved so the
@@ -157,6 +163,10 @@ impl ScrollbackBlob {
     /// Encode `rows` into a compressed blob with the default
     /// `BincodeGz` encoding. Returns the constructed blob ready for
     /// embedding in a `PaneSnapshot`.
+    // reason: snapshot v3 scrollback encoder (#69); see `RowSnapshot` above
+    // for the consumer wiring. Covered by this module's `#[cfg(test)]`
+    // suite today.
+    #[allow(dead_code)]
     pub fn encode_bincode_gz(rows: &[RowSnapshot]) -> anyhow::Result<Self> {
         let raw = bincode::serialize(rows)
             .map_err(|e| anyhow::anyhow!("bincode encode scrollback: {e}"))?;
@@ -183,6 +193,10 @@ impl ScrollbackBlob {
     /// for unknown encodings so callers can degrade gracefully (load
     /// layout + commands, drop scrollback) per the encoding-discriminator
     /// contract above.
+    // reason: snapshot v3 scrollback decoder (#69); see `RowSnapshot` above
+    // for the consumer wiring. Covered by this module's `#[cfg(test)]`
+    // round-trip tests today.
+    #[allow(dead_code)]
     pub fn decode(&self) -> anyhow::Result<Option<Vec<RowSnapshot>>> {
         match self.encoding {
             ScrollbackEncoding::BincodeGz => {
@@ -322,7 +336,7 @@ impl WorkspaceSnapshot {
 /// is `[MIN_SUPPORTED_VERSION, SNAPSHOT_VERSION]` inclusive — keep this
 /// in lockstep with the deprecation table in `CHANGELOG.md`.
 pub fn is_supported_version(v: u32) -> bool {
-    v >= MIN_SUPPORTED_VERSION && v <= SNAPSHOT_VERSION
+    (MIN_SUPPORTED_VERSION..=SNAPSHOT_VERSION).contains(&v)
 }
 
 /// Build PaneSnapshot vec for a set of panes.

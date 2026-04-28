@@ -257,16 +257,7 @@ pub(super) fn render_frame_to_buf_with_palette(
             // (current callers) fall back to the legacy `: <buffer>` prompt
             // so the renderer keeps working before the wiring lands.
             if let Some(state) = palette_overlay {
-                render::draw_palette_overlay(
-                    buf,
-                    state.matches,
-                    state.entries,
-                    state.query,
-                    state.selected,
-                    tw,
-                    th,
-                    palette,
-                )?;
+                render::draw_palette_overlay(buf, state, tw, th, palette)?;
             } else {
                 render::draw_text_input(buf, tw, th, ":", buffer)?;
             }

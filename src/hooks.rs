@@ -752,7 +752,7 @@ fn gc_logs_for(log_dir: &PathBuf, event_name: &str, keep: usize) {
     if files.len() <= keep {
         return;
     }
-    files.sort_by(|a, b| a.1.cmp(&b.1));
+    files.sort_by_key(|a| a.1);
     let drop = files.len() - keep;
     for (path, _) in files.into_iter().take(drop) {
         let _ = fs::remove_file(path);

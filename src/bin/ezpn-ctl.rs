@@ -5,7 +5,7 @@ use std::path::PathBuf;
 // `ipc.rs` references `crate::socket_security::*` for its bind/accept
 // hardening (issue #65). The control binary doesn't host a listener
 // itself, but it shares `ipc.rs` and so needs the same module visible.
-#[allow(dead_code)]
+// (the inner `#![allow(dead_code)]` in socket_security.rs already covers this)
 #[path = "../socket_security.rs"]
 mod socket_security;
 

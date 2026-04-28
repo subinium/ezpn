@@ -384,6 +384,10 @@ impl Pane {
     }
 
     /// Whether the pane is inside a DECSET 2026 synchronized-output window (#73).
+    // reason: synchronized-output (#73) public API; consumed by the host
+    // coalescer wiring scheduled in the same issue. Sibling helpers
+    // `sync_opened_at` / `force_close_sync` use the same allow.
+    #[allow(dead_code)]
     pub fn in_sync(&self) -> bool {
         self.sync_depth > 0
     }
@@ -924,7 +928,6 @@ fn handle_osc(ctx: &mut InterceptCtx<'_>, payload: &[u8]) {
     // OSC 4 ; <index> ; <spec>
     if let Some(rest) = payload.strip_prefix(b"4;") {
         handle_osc4(ctx, rest);
-        return;
     }
     // OSC 8 (hyperlinks): pure pass-through (#76). See `docs/multi-client-osc.md`.
 }

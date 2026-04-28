@@ -156,6 +156,9 @@ pub enum IpcCommand {
 /// Default timeout for `send-keys --await-prompt` when the client did
 /// not pass `--timeout` (#81 spec). Mirrored on the CLI side as the
 /// `30s` fallback.
+// reason: consumed by the send-keys --await-prompt server wiring (#81);
+// referenced from this module's `#[cfg(test)]` suite today.
+#[allow(dead_code)]
 pub const SEND_KEYS_DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
 fn default_true() -> bool {
@@ -363,6 +366,9 @@ impl IpcResponse {
 
     /// Wrap a [`SendKeysOutcome`] in an `ok` response (used when
     /// `await_prompt` is set).
+    // reason: consumed by the send-keys --await-prompt server wiring (#81);
+    // covered by this module's `#[cfg(test)]` round-trip test today.
+    #[allow(dead_code)]
     pub fn with_send_keys(outcome: SendKeysOutcome) -> Self {
         Self {
             ok: true,

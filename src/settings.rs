@@ -187,6 +187,10 @@ impl Settings {
     /// Drop the flash if its duration has elapsed. Call once per frame.
     //
     // FLASH-MSG-COORDINATE-WITH-#58
+    // reason: per-frame flash-expiry tick consumed by the flash-overlay
+    // wiring (#64); covered by this module's `tick_flash_clears_after_duration`
+    // test today.
+    #[allow(dead_code)]
     pub fn tick_flash(&mut self) {
         if let Some((_, kind, started)) = &self.flash_message {
             if started.elapsed() >= kind.duration() {
@@ -708,6 +712,9 @@ pub enum FlashKind {
 }
 
 impl FlashKind {
+    // reason: read by `Settings::tick_flash` (also a #64-deferred consumer);
+    // covered by this module's `flash_kind_durations` test today.
+    #[allow(dead_code)]
     pub fn duration(self) -> Duration {
         match self {
             FlashKind::Info => Duration::from_secs(1),

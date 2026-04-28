@@ -72,6 +72,9 @@ enum PaletteSlot {
     StatusBg,
     StatusFg,
     Broadcast,
+    // reason: consumed by `palette_color` in the dead-pane render branch
+    // (#tab-bar inactive tab fg path) — wiring is one renderer slice away.
+    #[allow(dead_code)]
     DeadFg,
 }
 
@@ -1216,6 +1219,10 @@ pub fn draw_status_bar_full(
 /// `settings` into the renderer's dependency graph.
 //
 // FLASH-MSG-COORDINATE-WITH-#58
+// reason: paired with `draw_flash_overlay` below — both consumed by the
+// flash-message overlay wiring in #64; the producer side
+// (`Settings::flash_message`) is already populated.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlashLevel {
     Info,
@@ -1231,6 +1238,8 @@ pub enum FlashLevel {
 /// in #58 — see the marker.
 //
 // FLASH-MSG-COORDINATE-WITH-#58
+// reason: see `FlashLevel` above — same #64 wiring.
+#[allow(dead_code)]
 pub fn draw_flash_overlay(
     stdout: &mut impl Write,
     term_w: u16,
@@ -1404,14 +1413,15 @@ pub struct PaletteOverlayState<'a> {
 /// falls back to the legacy hardcoded look.
 pub fn draw_palette_overlay(
     stdout: &mut impl Write,
-    matches_: &[fuzzy::Match],
-    entries: &[fuzzy::Entry],
-    query: &str,
-    selected: usize,
+    state: &PaletteOverlayState<'_>,
     term_width: u16,
     term_height: u16,
     palette: Option<&ResolvedPalette>,
 ) -> anyhow::Result<()> {
+    let matches_ = state.matches;
+    let entries = state.entries;
+    let query = state.query;
+    let selected = state.selected;
     if term_width < 10 || term_height < 8 {
         return Ok(());
     }

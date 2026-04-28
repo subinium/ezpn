@@ -43,12 +43,12 @@
 //! - `Event::SessionCreated`  emit once when the daemon binds its socket.
 //! - `Event::SessionDetached` emit when the last client disconnects.
 //! - `Event::PaneSpawned`     emit from `spawn_pane` / `do_split` /
-//!                            `replace_pane` after a `Pane` is inserted.
+//!   `replace_pane` after a `Pane` is inserted.
 //! - `Event::PaneExited`      emit when `pane.poll_output()` flips
-//!                            `alive` to false (capture `exit_code`).
+//!   `alive` to false (capture `exit_code`).
 //! - `Event::PaneFocused`     emit from the focus handler / IPC `Focus`.
 //! - `Event::PaneCwdChanged`  emit from the per-tick `live_cwd` poll
-//!                            when the value differs from the cache.
+//!   when the value differs from the cache.
 //! - `Event::TabAdded`        emit from `TabManager::create_tab`.
 //! - `Event::TabRenamed`      emit from the rename command path.
 //! - `Event::ConfigReloaded`  emit at the end of the SIGHUP handler.

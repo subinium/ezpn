@@ -44,7 +44,7 @@ use crate::protocol;
 use crate::render::{self, BorderCache};
 use crate::session;
 use crate::settings::Settings;
-use crate::theme::{self, ColorDepth};
+use crate::theme::ColorDepth;
 use crate::workspace::{self, WorkspaceSnapshot};
 
 use connection::{accept_client, bind_path_socket, effective_size, ClientMsg, ConnectedClient};
@@ -1575,7 +1575,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                     fuzzy_index.as_ref().map(|fi| render::PaletteOverlayState {
                         query: palette_query.as_str(),
                         matches: palette_matches.as_slice(),
-                        selected: palette_selected.min(palette_matches.len().saturating_sub(1).max(0)),
+                        selected: palette_selected.min(palette_matches.len().saturating_sub(1)),
                         entries: fi.entries(),
                     })
                 } else {

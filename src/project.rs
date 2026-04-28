@@ -89,11 +89,19 @@ pub struct ResolvedProject {
     /// back to `[global] persist_scrollback` from `EzpnConfig`. Storing
     /// only the explicit overrides keeps the map empty for the typical
     /// case where the user just sets the global flag.
+    // reason: consumed by the snapshot-save persistence wiring (#69);
+    // populated at project-load time and read once `workspace::save_snapshot`
+    // chains the per-pane override check.
+    #[allow(dead_code)]
     pub persist_scrollback: HashMap<usize, bool>,
     /// Validated project-level hooks. Already passed through
     /// `Hook::from_raw`, so unknown events / empty exec arrays are
     /// rejected here at load time. Merge into the global executor at
     /// server boot (`HookExecutor::new(global ++ project.hooks)`).
+    // reason: consumed by the project-hooks executor wiring (#tracked under
+    // hooks); populated by this module's loader and merged into the global
+    // `HookExecutor` once the boot path threads `ResolvedProject` through.
+    #[allow(dead_code)]
     pub hooks: Vec<Hook>,
 }
 

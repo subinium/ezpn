@@ -630,6 +630,10 @@ pub struct YankReport {
     /// otherwise. The buffer push happens *before* the clipboard exec
     /// so the user can still paste-buffer the yank even when the host
     /// has no graphical clipboard.
+    // reason: consumed by the copy-mode yank wiring in #91/#92; field is
+    // populated today and read once `server/input_modes.rs` chains the
+    // status-bar flash on yank.
+    #[allow(dead_code)]
     pub buffer: Result<(), SetError>,
     /// Result of [`crate::clipboard::copy`]. `Ok(label)` carries the
     /// program name (`"wl-copy"` / `"override(my-tool)"` / …) so the
@@ -642,6 +646,9 @@ impl YankReport {
     /// True iff at least one of the two paths succeeded. Used by the
     /// status-bar flash to decide between a "yanked" and a "copy
     /// failed" message.
+    // reason: same #91/#92 deferred wiring as `YankReport::buffer`; covered
+    // by unit tests in this module today.
+    #[allow(dead_code)]
     pub fn any_success(&self) -> bool {
         self.buffer.is_ok() || self.clipboard.is_ok()
     }

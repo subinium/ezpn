@@ -213,6 +213,12 @@ impl Layout {
     /// `next_id_hint` should be `pane_id + 1` (or any value > `pane_id`)
     /// so that subsequent splits in the new tab don't collide with ids
     /// from the donor tab.
+    // reason: `break-pane` / `join-pane` API surface — consumed by this
+    // module's `#[cfg(test)]` suite (see `detach_leaf_*`, `attach_pane_*`,
+    // `singleton_*` tests) and scheduled to be wired into the IPC handler
+    // in the v0.13.x follow-up. Keeping the impl in tree avoids a
+    // round-trip through git history when that wiring lands.
+    #[allow(dead_code)]
     pub fn singleton(pane_id: usize, next_id_hint: usize) -> Self {
         let next_id = next_id_hint.max(pane_id + 1);
         Layout {
@@ -228,6 +234,8 @@ impl Layout {
     ///
     /// Does NOT renumber surviving panes — `pane_ids()` simply omits the
     /// detached id afterwards.
+    // reason: see `Layout::singleton` above.
+    #[allow(dead_code)]
     pub fn detach_leaf(&mut self, target_id: usize) -> Option<usize> {
         if self.pane_count() <= 1 {
             return None;
@@ -253,6 +261,8 @@ impl Layout {
     /// Returns `Some(pane_id)` when the layout had exactly one leaf and
     /// that leaf was `target_id`. Caller must destroy this layout's tab
     /// after the call (the layout is now in an invalid empty state).
+    // reason: see `Layout::singleton` above.
+    #[allow(dead_code)]
     pub fn detach_sole_leaf(&mut self, target_id: usize) -> Option<usize> {
         if self.pane_count() != 1 {
             return None;
@@ -271,6 +281,8 @@ impl Layout {
     /// Returns `true` on success. Fails if `anchor_id` isn't a leaf in
     /// the tree or if `incoming_id` already exists in the tree (id
     /// collision — caller must remap before calling).
+    // reason: see `Layout::singleton` above.
+    #[allow(dead_code)]
     pub fn attach_pane(&mut self, anchor_id: usize, incoming_id: usize, dir: Direction) -> bool {
         if !contains(&self.root, anchor_id) {
             return false;
@@ -289,6 +301,8 @@ impl Layout {
     }
 
     /// Quick check: does `pane_id` exist as a leaf in this layout?
+    // reason: see `Layout::singleton` above.
+    #[allow(dead_code)]
     pub fn contains_pane(&self, pane_id: usize) -> bool {
         contains(&self.root, pane_id)
     }
