@@ -17,7 +17,12 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 
 /// Stand-in for the per-pane state the daemon keeps. Field names mirror
 /// what `pane.rs` allocates today; sizes are conservative upper bounds.
+//
+// Fields are populated to drive realistic allocations (the whole point of
+// an RSS proxy bench), but never read back — criterion only measures the
+// construct/drop cost. `#[allow(dead_code)]` is correct here.
 #[derive(Clone)]
+#[allow(dead_code)]
 struct PaneFootprint {
     id: usize,
     name: String,

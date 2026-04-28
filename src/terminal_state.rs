@@ -402,8 +402,10 @@ mod tests {
 
     #[test]
     fn theme_palette_active_when_any_field_set() {
-        let mut p = ThemePalette::default();
-        p.fg = Some(Rgb::new(255, 255, 255));
+        let p = ThemePalette {
+            fg: Some(Rgb::new(255, 255, 255)),
+            ..Default::default()
+        };
         assert!(p.is_active());
     }
 

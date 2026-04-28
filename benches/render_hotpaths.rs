@@ -1,4 +1,10 @@
-#![allow(dead_code)]
+// The `#[path]` mounts below pull entire src modules into this bench crate
+// for sibling-module path resolution. The bench only exercises a subset of
+// each module, so the unused half legitimately surfaces as dead code +
+// unused imports. All flagged items are exercised by the lib/bin targets;
+// confirmed via grep on every flagged identifier (see the v0.13.1 clippy
+// restoration commit).
+#![allow(dead_code, unused_imports)]
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;

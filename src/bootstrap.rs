@@ -1874,6 +1874,31 @@ pub(crate) fn spawn_pane(
     Pane::with_scrollback(shell, launch.clone(), cols, rows, scrollback)
 }
 
+/// Like [`spawn_pane`] but inherits `cwd` from the caller — used by `do_split`
+/// and new-tab paths so the new pane lands in the focused pane's `live_cwd()`
+/// (which prefers the OSC 7 reported cwd, then procfs — see issue #75).
+pub(crate) fn spawn_pane_in(
+    shell: &str,
+    launch: &PaneLaunch,
+    cols: u16,
+    rows: u16,
+    scrollback: usize,
+    cwd: Option<&std::path::Path>,
+) -> anyhow::Result<Pane> {
+    match cwd {
+        Some(_) => Pane::with_full_config(
+            shell,
+            launch.clone(),
+            cols,
+            rows,
+            scrollback,
+            cwd,
+            &std::collections::HashMap::new(),
+        ),
+        None => Pane::with_scrollback(shell, launch.clone(), cols, rows, scrollback),
+    }
+}
+
 pub(crate) fn spawn_project_panes(
     proj: &project::ResolvedProject,
     shell: &str,
@@ -2022,17 +2047,21 @@ pub(crate) fn do_split(
         }
     }
 
+    // #75: new pane inherits focused pane's `live_cwd()` (OSC 7 reported
+    // cwd if fresh, else procfs, else launch-time cwd).
+    let inherit_cwd = panes.get(&active).and_then(|p| p.live_cwd());
     let new_id = layout.split(active, dir);
     let rects = layout.pane_rects(&inner);
     if let Some(rect) = rects.get(&new_id) {
         panes.insert(
             new_id,
-            spawn_pane(
+            spawn_pane_in(
                 shell,
                 &PaneLaunch::Shell,
                 rect.w.max(1),
                 rect.h.max(1),
                 scrollback,
+                inherit_cwd.as_deref(),
             )?,
         );
     }
