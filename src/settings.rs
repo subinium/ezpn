@@ -7,6 +7,7 @@ use crossterm::{cursor, queue, style::*};
 
 use crate::config::{self, EzpnConfig};
 use crate::render::BorderStyle;
+use crate::theme::{ColorDepth, ResolvedPalette, Theme};
 
 // ─── Layout constants ──────────────────────────────────
 
@@ -114,6 +115,13 @@ pub struct Settings {
     //
     // FLASH-MSG-COORDINATE-WITH-#58
     pub flash_message: Option<(String, FlashKind, Instant)>,
+    /// Active theme (#85). Updated when `[theme]` is reloaded; downgraded
+    /// once into [`Self::resolved_palette`] for the renderer.
+    pub theme: Theme,
+    /// Pre-resolved palette in the live `ColorDepth`. The renderer reads
+    /// this every frame; recompute by calling [`Settings::set_theme`] when
+    /// the source theme changes.
+    pub resolved_palette: ResolvedPalette,
 }
 
 #[derive(PartialEq)]
@@ -126,6 +134,10 @@ pub enum SettingsAction {
 
 impl Settings {
     pub fn new(border: BorderStyle) -> Self {
+        // Default to TrueColor; phase 2b (server boot) replaces this with a
+        // `ColorDepth::detect()` result + the user's configured theme.
+        let theme = Theme::default_theme();
+        let resolved_palette = theme.resolve(ColorDepth::TrueColor);
         Self {
             visible: false,
             border_style: border,
@@ -136,7 +148,17 @@ impl Settings {
             reload_request: false,
             reload_dirty: false,
             flash_message: None,
+            theme,
+            resolved_palette,
         }
+    }
+
+    /// Replace the active theme and re-resolve the palette at `depth`.
+    /// Call this after config load + `ColorDepth::detect`, and again on
+    /// hot-reload when `[theme]` changes.
+    pub fn set_theme(&mut self, theme: Theme, depth: ColorDepth) {
+        self.resolved_palette = theme.resolve(depth);
+        self.theme = theme;
     }
 
     /// Attach the freshly-loaded `EzpnConfig` so hot-reload can diff against
@@ -239,12 +261,23 @@ impl Settings {
 
         // 5. Atomically apply reloadable fields + replace stored config.
         //    Done last so any failure above leaves state untouched.
+        let theme_changed = self.theme != new_config.theme;
         let visual_changed = self.border_style != new_config.border
             || self.show_status_bar != new_config.show_status_bar
-            || self.show_tab_bar != new_config.show_tab_bar;
+            || self.show_tab_bar != new_config.show_tab_bar
+            || theme_changed;
         self.border_style = new_config.border;
         self.show_status_bar = new_config.show_status_bar;
         self.show_tab_bar = new_config.show_tab_bar;
+        if theme_changed {
+            // Re-resolve at the same depth we currently use. Phase 2b owns
+            // the live `ColorDepth`; for now keep the existing depth implied
+            // by `resolved_palette` by re-resolving at TrueColor — this is
+            // the same default `Settings::new` chooses, so nothing observable
+            // changes until 2b wires `set_theme` with a detected depth.
+            self.theme = new_config.theme.clone();
+            self.resolved_palette = new_config.theme.resolve(ColorDepth::TrueColor);
+        }
         self.runtime = Some(RuntimeSettings { config: new_config });
         if visual_changed {
             self.reload_dirty = true;

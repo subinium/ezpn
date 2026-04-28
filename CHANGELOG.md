@@ -9,6 +9,165 @@ Entries are written in **functional-only style**: every bullet describes an obse
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-04-28 — Multiplexer wiring + Memory & Persistence
+
+Roll-up release that finishes the v0.12.0 deferred-wiring backlog and
+opens the v0.13 design agenda. v0.12.1 was deliberately skipped — the
+work expanded past patch scope into user-visible features, justifying a
+minor bump per SemVer. Six cross-cutting RFCs (#102–#107) capture the
+design debt surfaced during wiring; runtime work in this release is
+gated by them only where called out below.
+
+### Wiring (deferred from v0.12.0)
+- **Kitty keyboard flag replay on attach** (#74): on every client
+  connect, daemon walks active panes and emits `CSI > {flags} u` to the
+  new client only for panes with non-zero flag stack. Per-pane state
+  remains the source of truth; clients that detach/reattach mid-session
+  no longer drop the negotiated kbd encoding.
+- **Status-bar contextual hints** (#87): added match arms for `":"`
+  (palette: `↑↓ navigate / Enter select / Tab complete / Esc cancel`)
+  and `"RENAME"` (`Enter confirm / Esc cancel`). Normal-mode hints now
+  include `Ctrl+B p palette`.
+- **Named copy buffers + clipboard fallback chain** (#91, #92): three
+  new `Action` variants (`set-buffer`, `paste-buffer [NAME]`,
+  `list-buffers`). Copy-mode `CopyAndExit` now yanks via
+  `BufferStore` + auto-detected clipboard binary
+  (`wl-copy`/`xclip`/`xsel`/`pbcopy`, in that order; `[clipboard]
+  copy_command = [...]` overrides). On clipboard success the OSC 52
+  push is skipped; on failure OSC 52 is the documented fallback. New
+  `BufferStore` (16 MiB per-buffer cap, 100-buffer LRU) instantiated at
+  daemon boot.
+- **Scrollback eviction telemetry** (#71): per-pane byte-budget
+  watchdog emits `tracing::info!(pane_id, evicted_rows, byte_budget,
+  policy, "scrollback eviction")` once `scrollback_byte_estimate`
+  exceeds budget. Telemetry-only — the row-deletion side is blocked
+  on RFC #102 (vt100 0.15 has no public history-trim API). The line
+  cap baked into `vt100::Parser::new` continues to bound worst-case
+  memory.
+- **Theme system render integration** (#85): `[global] theme = "name"`
+  parsed; `Theme::from_name` resolves via embedded built-ins or
+  `assets/themes/{name}.toml` with sane fallback. `ColorDepth::detect`
+  runs once at boot; `Settings.resolved_palette` populated and threaded
+  through `render_frame_to_buf`. Six hardcoded color constants
+  (`ACTIVE_COLOR`, `BORDER_COLOR`, `STATUS_BG`, `STATUS_FG`,
+  `BROADCAST_COLOR`, `DEAD_FG`) replaced with palette lookups; the
+  remaining four (`HINT_FG`, `CLOSE_COLOR`, `DRAG_COLOR`, `MUTED_FG`)
+  stay hardcoded with a comment marking them for v0.14 schema
+  extension.
+- **Fuzzy command palette** (#86): `prefix p` enters CommandPalette
+  mode; `FuzzyIndex` populated from sessions/tabs/panes/history;
+  `draw_palette_overlay` renders an 8-row bottom-anchored overlay with
+  selection highlight, kind icons (`@`/`#`/`T`/`>`/`*`), and matched
+  substring spans. Up/Down navigates, Tab completes the query to the
+  selected match, Enter dispatches via `commands::parse` /
+  `Action::execute`, Esc cancels and clears state.
+- **OSC 52 paste-injection guard with confirm-prompt UI** (#79):
+  per-frame drain of `pane.take_osc52_pending_confirm()`; when
+  non-empty, daemon enters a modal confirm overlay
+  (`render::draw_osc52_confirm_overlay`) showing pane id and byte
+  count. `y/Y` calls `pane.set_osc52_decision(Allowed)` and forwards
+  the queued payloads via the existing `osc52_pending` path; `n/N`
+  denies and drops; `Esc` re-queues with `Pending` decision via the
+  new `Pane::requeue_osc52_pending_confirm` helper. Status-bar gains
+  an `OSC52` mode pill.
+- **Status / tab-bar partial-redraw producers** (#80): `status_dirty`
+  and `tabs_dirty` flags now set at six lifecycle sites (1-Hz tick,
+  focus switch, tab create/switch/close/rename, OSC 52 confirm
+  enter/exit). Partial redraw fast path consumes the flags via the
+  Phase-2a render-glue threading.
+- **Hooks system fire sites** (#83): `HookExecutor` instantiated at
+  boot from `config::load_hooks()`; hot-swapped on
+  `ReloadOutcome::Reloaded`. Eight of the eleven hook events fire
+  today (`AfterSessionCreate`, `AfterPaneSpawn`,
+  `AfterPaneExit`, `OnCwdChange`, `OnFocusChange`,
+  `OnConfigReload`, `BeforeSessionDestroy`, plus the implicit
+  `AfterSessionCreate`). Attach/detach hooks (`BeforeAttach`,
+  `AfterAttach`, `BeforeDetach`, `AfterDetach`) need
+  `connection::accept_client` to receive the hook handle — wired in
+  the same release through the new IPC unification (#103) but the
+  attach-path closure is parked for the v0.13 dot-release.
+- **User-defined keymap dispatch** (#84): `keymap.lookup(table,
+  &chord)` consulted **before** the legacy hardcoded match in all
+  three tables (Prefix / Normal / CopyMode). User-defined bindings
+  always win; misses fall through to the existing handlers. Mode-
+  toggle actions dispatched inline; data-mutating actions go through
+  `actions::execute_action` which round-trips through
+  `commands::parse` to share dispatch with the command palette.
+  Hot-reload swaps the keymap on `Reloaded`.
+- **Event bus producers** (#82): `crate::events::publish(Event::...)`
+  fired at 11 sites: `SessionCreated`, `SessionDetached`,
+  `PaneSpawned` (×3 — initial, newly_spawned diff, NewTab),
+  `PaneExited`, `PaneFocused`, `PaneCwdChanged`, `TabAdded`,
+  `TabRenamed`, `ConfigReloaded`, `SnapshotSaved`. The
+  client-visible `events` IPC subscription endpoint still depends on
+  the `IpcCommand::Ext` send-keys handler (#81) and is parked for
+  v0.13.x.
+- **`ezpn-ctl ls --json` server handler** (#89): walks `tab_mgr` and
+  `panes` to populate `LsTree` / `SessionTree` / `TabInfo` /
+  `PaneTreeInfo`. Honest about edges: `TabInfo.layout` is an opaque
+  `"panes:[id1,id2,...]"` descriptor pending RFC #102 (`Layout::to_spec`);
+  `ClientInfo.socket_path` is synthesised as `client-{id}` because
+  `ConnectedClient` carries no per-client socket path today.
+- **`ezpn-ctl dump --pane <id>` server handler** (#88): captures pane
+  text via new `Pane::dump_text(include_scrollback)`. To work around
+  the vt100 0.15 history-iteration gap (also blocking #68), the
+  helper walks `parser.set_scrollback(N)` from `max_scrollback` down
+  to `0`, capturing top rows at each step and saving/restoring the
+  caller's `scroll_offset` so interactive scroll is undisturbed.
+  Applies `--since` / `--last` slicing; rejects payloads exceeding
+  `DUMP_MAX_BYTES` (16 MiB) with `dump too large; use --last N` per
+  the #88 acceptance phrasing.
+
+### IPC architecture (RFC #103, executed)
+- **`IpcCommand` enum** unifies `Legacy(IpcRequest)` and
+  `Ext(IpcRequestExt)` into a single `mpsc::Sender<(IpcCommand,
+  ResponseSender)>` channel. The previous parallel
+  `handle_ext_request` path (which had no main-loop state access and
+  every variant returned a parent-deferred error) is deleted. Main-
+  loop dispatch gains a single `IpcCommand::Ext` arm before the
+  legacy match, calling `ext_handlers::dispatch_ext_mut`. No wire
+  format change; protocol still v1.
+
+### RFCs filed
+- **#102** vt100 strategy commitment (fork / replace / upstream) —
+  blocks #68 row eviction and #93 cell-grid diff
+- **#103** IPC `Ext` channel unification — implemented in this
+  release per the chosen path
+- **#104** vt100-independent scrollback storage — depends on #102
+- **#105** Memory budget SLA — `12 MB / 18 MB / 60 MB / 256 KB`
+  proposed ceilings
+- **#106** Snapshot v4 schema — buffers / theme / plugin / cwd_history
+  slots
+- **#107** OSC handler coverage matrix — multi-client semantics for
+  OSC 0/4/7/8/10/11/12/52/133/633/1337
+
+### Compatibility
+- **Wire protocol**: v1 (unchanged). New `IpcCommand` enum is
+  daemon-internal only.
+- **Snapshot**: v3 (unchanged). v4 schema designed in #106; not
+  shipped yet.
+- **Config**: `[global] theme` newly accepted; `[clipboard]
+  copy_command` newly honoured (was parsed in v0.12.0 but never read).
+- **Hooks**: `[[hooks]]` users gain six new fire events; existing
+  `client-attached`/`client-detached`/`tab-*` hooks unchanged.
+- **Keymap**: user `[keymap.<table>]` bindings now actually bind. If a
+  v0.12 user had an entry shadowing a daemon binding, behaviour
+  changes — documented in `docs/configuration.md`.
+
+### Test totals
+- 397 main bin tests (+17 from v0.12.0's 380), 25 ezpn-ctl bin tests
+  (unchanged), 59 property tests (unchanged), 6 integration tests
+  (PTY-gated, ignored on CI runners without TTY).
+
+### Deferred to v0.13.x or v0.14
+- `BeforeAttach`/`AfterAttach`/`BeforeDetach`/`AfterDetach` hook fires
+  (need attach-path closure on `accept_client`).
+- `ezpn-ctl events --format json` IPC subscription endpoint (depends
+  on #81 send-keys server handler reaching same maturity).
+- Real per-row scrollback eviction (#68 — blocked on RFC #102).
+- Layout opaque-descriptor → structured `Layout::to_spec` (depends on
+  RFC #102 outcome).
+
 ## [0.12.0] — 2026-04-28 — Multiplexer foundations + terminal protocol modernisation
 
 44-issue mega-release. Code lands as modules and self-contained

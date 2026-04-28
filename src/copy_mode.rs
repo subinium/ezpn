@@ -623,7 +623,6 @@ fn jump_to_match(state: &mut CopyModeState, forward: bool) {
 /// fire. If a real clipboard tool ran successfully, OSC 52 is still
 /// useful for forwarding through SSH-attached terminals; the policy is
 /// caller-defined.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct YankReport {
     /// Result of pushing the text into the default buffer slot. Always
@@ -639,7 +638,6 @@ pub struct YankReport {
     pub clipboard: Result<String, ClipboardError>,
 }
 
-#[allow(dead_code)]
 impl YankReport {
     /// True iff at least one of the two paths succeeded. Used by the
     /// status-bar flash to decide between a "yanked" and a "copy
@@ -659,7 +657,6 @@ impl YankReport {
 ///
 /// Returns a [`YankReport`] so the caller can chain OSC 52 fall-back
 /// and a status-bar flash.
-#[allow(dead_code)]
 pub fn yank_to_buffer(
     text: &str,
     buffers: &mut BufferStore,

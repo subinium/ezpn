@@ -140,6 +140,7 @@ fn bench_render(c: &mut Criterion) {
                     true,
                     None,
                     false,
+                    None,
                 )
                 .expect("full redraw render");
                 criterion::black_box(&buf);
@@ -167,6 +168,7 @@ fn bench_render(c: &mut Criterion) {
                     false,
                     None,
                     false,
+                    None,
                 )
                 .expect("partial redraw render");
                 criterion::black_box(&buf);

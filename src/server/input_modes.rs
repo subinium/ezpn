@@ -25,6 +25,24 @@ use crate::settings::{Settings, SettingsAction};
 
 use super::{actions, RenderUpdate};
 
+/// Server-runtime knobs threaded into `process_event` (#79 / #84 / #86).
+///
+/// These live behind a single struct so the caller's arg list doesn't
+/// balloon further every time a new subsystem is wired up. The fields
+/// are mutable references so the dispatcher can short-circuit input on
+/// an OSC 52 confirm prompt, hot-swap the keymap on reload, and rebuild
+/// the fuzzy palette index when entering CommandPalette mode.
+#[allow(clippy::struct_field_names)]
+pub(super) struct RuntimeCtx<'a> {
+    pub keymap: &'a crate::keymap::Keymap,
+    pub osc52_confirm: &'a mut Option<super::Osc52ConfirmState>,
+    pub fuzzy_index: &'a mut Option<crate::fuzzy::FuzzyIndex>,
+    pub palette_query: &'a mut String,
+    pub palette_selected: &'a mut usize,
+    pub history: &'a mut crate::fuzzy::History,
+    pub session_name: &'a str,
+}
+
 /// Input state machine for prefix key support.
 #[allow(dead_code)]
 pub(super) enum InputMode {
@@ -149,6 +167,9 @@ pub(super) fn process_event(
     tab_names: &[(usize, String, bool)],
     prefix_key: char,
     flash_message: &mut Option<(String, Instant)>,
+    buffers: &mut crate::buffers::BufferStore,
+    clipboard_copy_argv: Option<&[String]>,
+    ctx: &mut RuntimeCtx<'_>,
 ) {
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -172,6 +193,9 @@ pub(super) fn process_event(
                 tab_action,
                 prefix_key,
                 flash_message,
+                buffers,
+                clipboard_copy_argv,
+                ctx,
             );
         }
         Event::Mouse(mouse) => {
@@ -261,9 +285,155 @@ pub(super) fn process_key(
     tab_action: &mut TabAction,
     prefix_key: char,
     flash_message: &mut Option<(String, Instant)>,
+    buffers: &mut crate::buffers::BufferStore,
+    clipboard_copy_argv: Option<&[String]>,
+    ctx: &mut RuntimeCtx<'_>,
 ) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    // ── OSC 52 confirm prompt (#79) ──
+    // Modal: while a payload is queued, all keys route here. y/n
+    // resolve the prompt; Esc re-queues. Status bar shows "OSC52".
+    if let Some(state) = ctx.osc52_confirm.as_mut() {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Some(pane) = panes.get_mut(&state.pane_id) {
+                    pane.set_osc52_decision(crate::terminal_state::Osc52Decision::Allowed);
+                    // Drain queued payloads into the forward queue so
+                    // they reach attached clients on the next iteration.
+                    pane.osc52_pending.append(&mut state.queued_payloads);
+                }
+                *ctx.osc52_confirm = None;
+                update.full_redraw = true;
+                update.status_dirty = true;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                if let Some(pane) = panes.get_mut(&state.pane_id) {
+                    pane.set_osc52_decision(crate::terminal_state::Osc52Decision::Denied);
+                }
+                state.queued_payloads.clear();
+                *ctx.osc52_confirm = None;
+                update.full_redraw = true;
+                update.status_dirty = true;
+            }
+            KeyCode::Esc => {
+                // Re-queue: drop the prompt but leave decision Pending so
+                // the next decoded payload from the same pane will surface
+                // a fresh prompt. The current queued payloads are pushed
+                // back onto the pane's confirm queue so we don't lose them.
+                if let Some(pane) = panes.get_mut(&state.pane_id) {
+                    let payloads = std::mem::take(&mut state.queued_payloads);
+                    pane.requeue_osc52_pending_confirm(payloads);
+                }
+                *ctx.osc52_confirm = None;
+                update.full_redraw = true;
+                update.status_dirty = true;
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // ── Keymap dispatch (#84) ──
+    // Look up the user-bound chord BEFORE the hardcoded match so users
+    // can override builtins. On miss we fall through to the legacy
+    // per-mode handler below — keeps back-compat with the existing
+    // hotkey set even when the user supplies a partial keymap.
+    let chord = crate::keymap::KeyChord::from_event(key);
+    let table = match mode {
+        InputMode::Prefix { .. } => Some(crate::keymap::KeymapTable::Prefix),
+        InputMode::CopyMode(_) => Some(crate::keymap::KeymapTable::CopyMode),
+        InputMode::Normal if !settings.visible => Some(crate::keymap::KeymapTable::Normal),
+        _ => None,
+    };
+    if let Some(t) = table {
+        if let Some(action) = ctx.keymap.lookup(t, &chord).cloned() {
+            // Pre-mode side effects: a few keymap actions toggle modes
+            // rather than mutating data, so handle those before the
+            // execute_action shim. The shim returns Ok(None) for these.
+            match &action {
+                crate::keymap::Action::CommandPrompt => {
+                    enter_command_palette(mode, ctx, panes, layout, settings, update);
+                    if matches!(t, crate::keymap::KeymapTable::Prefix) {
+                        // Leave prefix mode after dispatching.
+                    }
+                    return;
+                }
+                crate::keymap::Action::CopyMode => {
+                    if let Some(pane) = panes.get(active) {
+                        let (rows, cols) = pane.screen().size();
+                        *mode = InputMode::CopyMode(crate::copy_mode::CopyModeState::new(
+                            rows, cols,
+                        ));
+                        update.full_redraw = true;
+                    }
+                    return;
+                }
+                crate::keymap::Action::DetachSession => {
+                    *detach_requested = true;
+                    *mode = InputMode::Normal;
+                    return;
+                }
+                crate::keymap::Action::KillSession => {
+                    *mode = InputMode::QuitConfirm;
+                    update.full_redraw = true;
+                    return;
+                }
+                crate::keymap::Action::RenameWindow => {
+                    *mode = InputMode::RenameTab {
+                        buffer: "\0".to_string(),
+                    };
+                    return;
+                }
+                crate::keymap::Action::NextWindow => {
+                    *tab_action = TabAction::NextTab;
+                    *mode = InputMode::Normal;
+                    return;
+                }
+                crate::keymap::Action::PreviousWindow => {
+                    *tab_action = TabAction::PrevTab;
+                    *mode = InputMode::Normal;
+                    return;
+                }
+                crate::keymap::Action::SelectWindow { index } => {
+                    *tab_action = TabAction::GoToTab(*index);
+                    *mode = InputMode::Normal;
+                    return;
+                }
+                _ => {}
+            }
+            // Data-mutating actions go through the shared
+            // execute_action shim so palette + keymap stay in sync.
+            let result = super::actions::execute_action(
+                &action,
+                layout,
+                panes,
+                active,
+                settings,
+                update,
+                default_shell,
+                tw,
+                th,
+                scrollback,
+                zoomed_pane,
+                broadcast,
+                tab_action,
+                buffers,
+            );
+            match result {
+                Ok(Some(text)) => *flash_message = Some((text, Instant::now())),
+                Ok(None) => {}
+                Err(text) => *flash_message = Some((text, Instant::now())),
+            }
+            // Exit prefix mode after dispatch (matches built-in
+            // behaviour where `Ctrl+B X` returns to Normal).
+            if matches!(t, crate::keymap::KeymapTable::Prefix) {
+                *mode = InputMode::Normal;
+            }
+            return;
+        }
+    }
 
     // ── Quit confirmation ──
     if matches!(mode, InputMode::QuitConfirm) {
@@ -373,15 +543,47 @@ pub(super) fn process_key(
         match key.code {
             KeyCode::Char(c) if !ctrl => {
                 buffer.push(c);
+                ctx.palette_query.push(c);
+                *ctx.palette_selected = 0;
                 update.full_redraw = true;
             }
             KeyCode::Backspace => {
                 buffer.pop();
+                ctx.palette_query.pop();
+                *ctx.palette_selected = 0;
                 update.full_redraw = true;
+            }
+            KeyCode::Up => {
+                *ctx.palette_selected = ctx.palette_selected.saturating_sub(1);
+                update.full_redraw = true;
+            }
+            KeyCode::Down => {
+                *ctx.palette_selected = ctx.palette_selected.saturating_add(1);
+                update.full_redraw = true;
+            }
+            KeyCode::Tab => {
+                // Completion: replace query with the selected match's payload.
+                if let Some(idx) = ctx.fuzzy_index.as_mut() {
+                    let matches = idx.search(ctx.palette_query.as_str(), 6);
+                    if let Some(m) = matches.get(*ctx.palette_selected) {
+                        if let Some(entry) = idx.entries().get(m.index) {
+                            *ctx.palette_query = entry.payload.clone();
+                            *buffer = entry.payload.clone();
+                            *ctx.palette_selected = 0;
+                            update.full_redraw = true;
+                        }
+                    }
+                }
             }
             KeyCode::Enter => {
                 let cmd = std::mem::take(buffer);
                 *mode = InputMode::Normal;
+                ctx.palette_query.clear();
+                *ctx.palette_selected = 0;
+                *ctx.fuzzy_index = None;
+                if !cmd.trim().is_empty() {
+                    ctx.history.push(cmd.clone());
+                }
                 // Parse and execute. Successful commands may produce a
                 // flash payload (e.g. `:display-message`); errors are
                 // surfaced as a 2-second status-bar flash so typos never
@@ -413,6 +615,9 @@ pub(super) fn process_key(
             }
             KeyCode::Esc => {
                 *mode = InputMode::Normal;
+                ctx.palette_query.clear();
+                *ctx.palette_selected = 0;
+                *ctx.fuzzy_index = None;
                 update.full_redraw = true;
             }
             _ => {}
@@ -507,10 +712,39 @@ pub(super) fn process_key(
 
             match action {
                 crate::copy_mode::CopyAction::CopyAndExit(text) => {
-                    // OSC 52 clipboard copy
-                    let encoded = crate::base64_encode(text.as_bytes());
-                    let osc = format!("\x1b]52;c;{}\x07", encoded);
-                    pane.osc52_pending.push(osc.into_bytes());
+                    // Push the yank through the buffer store + system
+                    // clipboard fallback chain (#91, #92). OSC 52 is the
+                    // last-resort fallback for when no clipboard tool is
+                    // wired up — e.g. SSH with no host clipboard daemon.
+                    let report = crate::copy_mode::yank_to_buffer(
+                        &text,
+                        buffers,
+                        clipboard_copy_argv,
+                    );
+                    match &report.clipboard {
+                        Ok(label) => {
+                            tracing::debug!(
+                                sink = "buffer + clipboard",
+                                program = %label,
+                                bytes = text.len(),
+                                "copy-and-exit yanked",
+                            );
+                        }
+                        Err(err) => {
+                            // Clipboard fallback failed — emit OSC 52 so
+                            // the host terminal can still receive the
+                            // yank.
+                            let encoded = crate::base64_encode(text.as_bytes());
+                            let osc = format!("\x1b]52;c;{}\x07", encoded);
+                            pane.osc52_pending.push(osc.into_bytes());
+                            tracing::debug!(
+                                sink = "buffer + osc52",
+                                bytes = text.len(),
+                                clipboard_error = %err,
+                                "copy-and-exit yanked (osc52 fallback)",
+                            );
+                        }
+                    }
                     pane.snap_to_bottom();
                     *mode = InputMode::Normal;
                 }
@@ -695,7 +929,11 @@ pub(super) fn process_key(
             KeyCode::Char('n') => {
                 *tab_action = TabAction::NextTab;
             }
-            // Previous tab (tmux p)
+            // Previous tab (tmux p) or command palette opener.
+            // The keymap (#84) gives users a way to rebind this; without
+            // a binding, default behaviour is the legacy "previous tab".
+            // The fuzzy palette is reachable via prefix `:` (also tmux's
+            // command-prompt key) — see the `:` arm below.
             KeyCode::Char('p') => {
                 *tab_action = TabAction::PrevTab;
             }
@@ -713,6 +951,7 @@ pub(super) fn process_key(
             }
             // Command palette (tmux :)
             KeyCode::Char(':') => {
+                build_palette_index(ctx, panes, layout);
                 next_mode = InputMode::CommandPalette {
                     buffer: String::new(),
                 };
@@ -863,4 +1102,62 @@ pub(super) fn process_key(
             pane.write_key(key);
         }
     }
+}
+
+/// Build the fuzzy palette candidate set (#86) and stash it in the
+/// runtime context. Sources: action vocabulary, recent history, current
+/// pane / tab list. Called when entering CommandPalette mode.
+fn build_palette_index(
+    ctx: &mut RuntimeCtx<'_>,
+    panes: &HashMap<usize, Pane>,
+    layout: &Layout,
+) {
+    use crate::fuzzy::{Entry, EntryKind, FuzzyIndex};
+    let mut entries: Vec<Entry> = Vec::new();
+    // Action / command vocabulary (frozen v1).
+    for kind in crate::keymap::Action::vocabulary() {
+        entries.push(Entry::new(EntryKind::Command, *kind));
+    }
+    // Recent history.
+    for e in ctx.history.as_entries() {
+        entries.push(e);
+    }
+    // Live pane list.
+    for pid in layout.pane_ids() {
+        let label = panes
+            .get(&pid)
+            .and_then(|p| p.name())
+            .map(String::from)
+            .unwrap_or_else(|| format!("pane {pid}"));
+        entries.push(
+            Entry::new(EntryKind::Pane, format!("pane: {label}"))
+                .with_payload(format!("select-pane {pid}")),
+        );
+    }
+    // Active session tag — keeps the fuzzy "@session" pattern usable.
+    entries.push(
+        Entry::new(EntryKind::Session, format!("@{}", ctx.session_name))
+            .with_payload("display-message current".to_string()),
+    );
+    *ctx.fuzzy_index = Some(FuzzyIndex::new(entries));
+    ctx.palette_query.clear();
+    *ctx.palette_selected = 0;
+}
+
+/// Enter CommandPalette mode from a non-prefix dispatch path (e.g. user
+/// keymap binding). Mirrors the `KeyCode::Char(':')` arm in the
+/// prefix-mode handler.
+fn enter_command_palette(
+    mode: &mut InputMode,
+    ctx: &mut RuntimeCtx<'_>,
+    panes: &HashMap<usize, Pane>,
+    layout: &Layout,
+    _settings: &Settings,
+    update: &mut RenderUpdate,
+) {
+    build_palette_index(ctx, panes, layout);
+    *mode = InputMode::CommandPalette {
+        buffer: String::new(),
+    };
+    update.full_redraw = true;
 }

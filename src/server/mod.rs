@@ -23,16 +23,20 @@
 
 mod actions;
 mod connection;
+mod ext_handlers;
 mod input_modes;
 mod mouse;
 mod render_glue;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::config;
+use crate::events::{self, Event};
+use crate::hooks::{HookEvent, HookExecutor, HookPayload};
 use crate::ipc;
+use crate::keymap::Keymap;
 use crate::layout::Layout;
 use crate::pane::PaneLaunch;
 use crate::project;
@@ -40,6 +44,7 @@ use crate::protocol;
 use crate::render::{self, BorderCache};
 use crate::session;
 use crate::settings::Settings;
+use crate::theme::{self, ColorDepth};
 use crate::workspace::{self, WorkspaceSnapshot};
 
 use connection::{accept_client, bind_path_socket, effective_size, ClientMsg, ConnectedClient};
@@ -49,6 +54,17 @@ pub(crate) use input_modes::TabAction;
 
 use super::RenderUpdate;
 
+/// Active OSC 52 clipboard-write confirmation prompt (#79).
+///
+/// While set, all keyboard input routes to the prompt's y/n/Esc handler
+/// in `process_event`. Stores the queued decoded payloads until the
+/// user accepts or rejects them.
+pub(crate) struct Osc52ConfirmState {
+    pub pane_id: usize,
+    pub byte_count: usize,
+    pub queued_payloads: Vec<Vec<u8>>,
+}
+
 /// Run the server daemon. This function does not return until all panes die
 /// or the server is killed.
 pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
@@ -57,6 +73,11 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
     // race with bind.
     let _log_guard = super::observability::init(session_name);
     tracing::info!(session = session_name, "ezpn daemon starting");
+
+    // Recorded once at startup so `ezpn-ctl ls --json` can populate
+    // `SessionTree.created_at` (frozen v1 schema, issue #89). Stored
+    // as seconds-since-epoch to match the wire format.
+    let session_started_at = events::now_ts();
 
     #[cfg(unix)]
     let signal_state = super::signals::install()
@@ -85,6 +106,71 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
     let mut prefix_key = file_config.prefix_key;
     settings.bind_runtime(config::load_config());
 
+    // Theme + palette init (#85). The detected `ColorDepth` is fixed for
+    // the lifetime of the daemon — the renderer reads `resolved_palette`
+    // every frame, so this single resolve is the only one we do at boot.
+    let depth = ColorDepth::detect();
+    settings.set_theme(file_config.theme.clone(), depth);
+
+    // Hooks executor (#83) — one instance for the daemon's lifetime,
+    // hot-swappable on `Reloaded`. `from_hooks` runs in the calling
+    // thread; the executor itself spawns one worker per fire.
+    let hook_executor = HookExecutor::new(config::load_hooks());
+
+    // Keymap (#84). Defaults are merged with the user table at load
+    // time. On parse error we surface a structured warning and fall
+    // back to defaults rather than aborting boot — the issue specifies
+    // "refuse to start" but until the CLI surfaces the error to stderr
+    // properly we degrade gracefully.
+    let mut keymap: Keymap = match config::load_keymap() {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::warn!(target: "keymap_load", error = %e, "falling back to defaults");
+            crate::keymap::load_defaults()
+        }
+    };
+
+    // Command palette state (#86). `FuzzyIndex` is rebuilt lazily when
+    // entering CommandPalette mode; query / selection cursor live here
+    // for the duration of the prompt.
+    let mut fuzzy_index: Option<crate::fuzzy::FuzzyIndex> = None;
+    let mut palette_query = String::new();
+    let mut palette_selected: usize = 0;
+    let mut history = crate::fuzzy::History::load(&crate::fuzzy::history_path());
+
+    // OSC 52 confirm state (#79). Set when a pane has pending decoded
+    // payloads waiting for a y/n decision; cleared once the user
+    // answers. While `Some`, all input is routed to the prompt
+    // (modal).
+    let mut osc52_confirm: Option<Osc52ConfirmState> = None;
+
+    // Per-pane previous cwd, populated lazily on first poll. Used by
+    // `Event::PaneCwdChanged` (#82) and the `OnCwdChange` hook (#83).
+    let mut prev_cwd: HashMap<usize, String> = HashMap::new();
+
+    // Pane-exit detection — fire `PaneExited` / `AfterPaneExit` once
+    // per pane so a long-dead pane doesn't spam the bus on every
+    // frame.
+    let mut exited_fired: HashSet<usize> = HashSet::new();
+
+    // Cwd poll cadence — procfs is cheap but not free; 1 Hz is plenty
+    // for an interactive terminal.
+    let mut last_cwd_poll = Instant::now();
+    const CWD_POLL_INTERVAL: Duration = Duration::from_millis(1000);
+
+    // Status-bar 1-Hz redraw tick (#80). The clock segment ticks at
+    // most once per second; we set `status_dirty` on the elapsed edge
+    // so quiet sessions still repaint.
+    let mut last_status_tick = Instant::now();
+    const STATUS_TICK_INTERVAL: Duration = Duration::from_millis(1000);
+
+    let mut session_created_emitted = false;
+    // Set of pane ids we've already emitted PaneSpawned for. Mismatches
+    // (new pids since the last frame) become spawn events; this is how
+    // we capture splits that happen inside input_modes/actions without
+    // plumbing the hook executor through those modules.
+    let mut spawned_seen: HashSet<usize> = HashSet::new();
+
     // Auto-restart state
     let mut restart_policies: HashMap<usize, project::RestartPolicy> = HashMap::new();
 
@@ -97,6 +183,18 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
         effective_scrollback,
     )?;
 
+    // Apply byte-budget telemetry + clipboard policy to every pane
+    // spawned at boot (#68/#71/#79). Newly-spawned panes from key/IPC
+    // paths inherit these via the per-frame "newly_spawned" detector
+    // below.
+    let scrollback_bytes = file_config.scrollback_bytes;
+    let scrollback_eviction = file_config.scrollback_eviction;
+    let clipboard_policy = file_config.clipboard;
+    for pane in panes.values_mut() {
+        pane.set_scrollback_budget(scrollback_bytes, scrollback_eviction);
+        pane.set_clipboard_policy(clipboard_policy);
+    }
+
     let mut drag: Option<DragState> = None;
     let mut zoomed_pane: Option<usize> = None;
     let mut last_click: Option<(Instant, u16, u16)> = None;
@@ -104,6 +202,17 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
     let mut last_active: usize = active;
     let mut selection_anchor: Option<(usize, u16, u16)> = None;
     let mut text_selection: Option<TextSelection> = None;
+
+    // Named copy-buffer store (#91) — long-lived, in-RAM, capped by
+    // `BufferStore::MAX_BUFFERS`. Snapshot-side persistence is a
+    // follow-up; for this slice the store is rebuilt on every daemon
+    // boot.
+    let mut buffers = crate::buffers::BufferStore::default();
+    // Cached override argv for the system-clipboard fallback chain
+    // (#92). Empty Vec → auto-detect (`wl-copy` / `xclip` / `xsel` /
+    // `pbcopy`). Cloned once at boot so we don't keep the rest of
+    // `file_config` alive for the lifetime of the run loop.
+    let clipboard_copy_argv: Vec<String> = file_config.clipboard_copy_command.clone();
 
     let mut restart_state: HashMap<usize, (Instant, u32)> = HashMap::new();
 
@@ -241,6 +350,12 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
             // explicit IPC bound is wired in a follow-up commit.
             if signal_state.sigterm.load(Ordering::Relaxed) {
                 tracing::info!("SIGTERM received — graceful shutdown");
+                let payload = HookPayload::new().set("session.name", session_name);
+                hook_executor.fire(HookEvent::BeforeSessionDestroy, &payload);
+                events::publish(Event::SessionDetached {
+                    session: session_name.to_string(),
+                    ts: events::now_ts(),
+                });
                 for c in &mut clients {
                     let _ = protocol::write_msg(&mut c.writer, protocol::S_DETACHED, &[]);
                 }
@@ -303,6 +418,12 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                         // locals (visual fields are already on `settings`).
                         prefix_key = settings.config().prefix_key;
 
+                        // Hot-swap hook + keymap registries (#83 / #84).
+                        hook_executor.replace(config::load_hooks());
+                        if let Ok(new_km) = config::load_keymap() {
+                            keymap = new_km;
+                        }
+
                         if non_reloadable_changed.is_empty() {
                             settings.set_flash("config reloaded", crate::settings::FlashKind::Info);
                         } else {
@@ -312,6 +433,15 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                                 crate::settings::FlashKind::Info,
                             );
                         }
+                        // Notify subscribers + fire user hook.
+                        events::publish(Event::ConfigReloaded {
+                            ok: true,
+                            ts: events::now_ts(),
+                        });
+                        let payload = HookPayload::new()
+                            .set("session.name", session_name)
+                            .set("config_path", path.display().to_string());
+                        hook_executor.fire(HookEvent::OnConfigReload, &payload);
                     }
                     crate::settings::ReloadOutcome::Error(msg) => {
                         tracing::warn!(target: "config_reload", "{msg}");
@@ -319,6 +449,10 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                             format!("config error: {msg}"),
                             crate::settings::FlashKind::Error,
                         );
+                        events::publish(Event::ConfigReloaded {
+                            ok: false,
+                            ts: events::now_ts(),
+                        });
                     }
                 }
             }
@@ -338,11 +472,31 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                     new_pane.write_bytes(b"\x1b[I");
                 }
             }
+            // #82 / #83: announce the focus change to subscribers and
+            // user hooks before we update `prev_active`, so payloads
+            // can include both new + previous pane ids.
+            events::publish(Event::PaneFocused {
+                session: session_name.to_string(),
+                pane: active,
+                ts: events::now_ts(),
+            });
+            let payload = HookPayload::new()
+                .set("session.name", session_name)
+                .set("pane.id", active)
+                .set("previous_pane_id", prev_active);
+            hook_executor.fire(HookEvent::OnFocusChange, &payload);
             last_active = prev_active;
             prev_active = active;
         }
 
         let mut update = RenderUpdate::default();
+        // Status bar is sensitive to focus / mode / broadcast / clock —
+        // mark it dirty whenever any of those flipped during this iteration.
+        // Flags reset every frame; setting them here is cheap.
+        if last_status_tick.elapsed() >= STATUS_TICK_INTERVAL {
+            update.status_dirty = true;
+            last_status_tick = Instant::now();
+        }
 
         // ── Pick up post-reload (#64) redraw side-effects. Set by
         // `Settings::reload_config` when border / status-bar / tab-bar
@@ -358,6 +512,77 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
             update.full_redraw = true;
         }
 
+        // Emit `Event::SessionCreated` + `AfterSessionCreate` exactly
+        // once, after the first iteration confirms initial panes are
+        // spawned. Done lazily here (rather than before the loop) so
+        // a hook firing at boot can observe the daemon as fully
+        // initialized — bind, IPC listener, signal handler all live.
+        if !session_created_emitted {
+            session_created_emitted = true;
+            events::publish(Event::SessionCreated {
+                session: session_name.to_string(),
+                ts: events::now_ts(),
+            });
+            let payload = HookPayload::new().set("session.name", session_name);
+            hook_executor.fire(HookEvent::AfterSessionCreate, &payload);
+            // Fire `AfterPaneSpawn` + `PaneSpawned` for the initial
+            // panes so subscribers see the boot fanout.
+            for (&pid, pane) in &panes {
+                spawned_seen.insert(pid);
+                let cmd = pane.launch_label(&default_shell);
+                events::publish(Event::PaneSpawned {
+                    session: session_name.to_string(),
+                    pane: pid,
+                    command: cmd,
+                    cwd: pane
+                        .live_cwd()
+                        .map(|p| p.to_string_lossy().into_owned()),
+                    ts: events::now_ts(),
+                });
+                let payload = HookPayload::new()
+                    .set("session.name", session_name)
+                    .set("pane.id", pid);
+                hook_executor.fire(HookEvent::AfterPaneSpawn, &payload);
+            }
+        }
+
+        // Detect newly-inserted panes (split paths inside input_modes /
+        // actions / IPC don't see the hook executor; the diff lets us
+        // fire `PaneSpawned` + `AfterPaneSpawn` from one place).
+        let mut newly_spawned: Vec<usize> = Vec::new();
+        for &pid in panes.keys() {
+            if !spawned_seen.contains(&pid) {
+                newly_spawned.push(pid);
+            }
+        }
+        for pid in newly_spawned {
+            spawned_seen.insert(pid);
+            // Apply byte budget + clipboard policy on every newly-spawned
+            // pane (#68/#71/#79).
+            if let Some(pane) = panes.get_mut(&pid) {
+                pane.set_scrollback_budget(scrollback_bytes, scrollback_eviction);
+                pane.set_clipboard_policy(clipboard_policy);
+            }
+            let cmd = panes
+                .get(&pid)
+                .map(|p| p.launch_label(&default_shell))
+                .unwrap_or_default();
+            events::publish(Event::PaneSpawned {
+                session: session_name.to_string(),
+                pane: pid,
+                command: cmd,
+                cwd: None,
+                ts: events::now_ts(),
+            });
+            let payload = HookPayload::new()
+                .set("session.name", session_name)
+                .set("pane.id", pid);
+            hook_executor.fire(HookEvent::AfterPaneSpawn, &payload);
+        }
+        // Clean up spawned_seen for panes that no longer exist so a
+        // recycled id can fire again.
+        spawned_seen.retain(|pid| panes.contains_key(pid));
+
         // ── Read PTY output ──
         for (&pid, pane) in &mut panes {
             if pane.read_output() {
@@ -369,6 +594,89 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                 for c in &mut clients {
                     for seq in &osc52_seqs {
                         let _ = protocol::write_msg(&mut c.writer, protocol::S_OUTPUT, seq);
+                    }
+                }
+            }
+        }
+
+        // ── OSC 52 confirm prompt drain (#79) ──
+        // If we don't already have a pending confirm, look for the
+        // first pane whose `take_osc52_pending_confirm` returned a
+        // non-empty queue. The prompt is modal: we only show one at a
+        // time. Subsequent panes will surface their own prompt after
+        // this one is resolved.
+        if osc52_confirm.is_none() {
+            // Iterate in pane-id order so the chosen pane is
+            // deterministic across runs.
+            let mut pids: Vec<usize> = panes.keys().copied().collect();
+            pids.sort_unstable();
+            for pid in pids {
+                if let Some(pane) = panes.get_mut(&pid) {
+                    let pending = pane.take_osc52_pending_confirm();
+                    if !pending.is_empty() {
+                        let bytes: usize = pending.iter().map(Vec::len).sum();
+                        osc52_confirm = Some(Osc52ConfirmState {
+                            pane_id: pid,
+                            byte_count: bytes,
+                            queued_payloads: pending,
+                        });
+                        update.status_dirty = true;
+                        update.full_redraw = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // ── Pane-exit detection (#82 / #83 AfterPaneExit) ──
+        // Run after `read_output` so `is_alive()` reflects the latest
+        // try_wait. Fire once per pane via the `exited_fired` set.
+        for (&pid, pane) in panes.iter() {
+            if !pane.is_alive() && !exited_fired.contains(&pid) {
+                exited_fired.insert(pid);
+                let exit_code = pane.exit_code().map(|c| c as i32);
+                events::publish(Event::PaneExited {
+                    session: session_name.to_string(),
+                    pane: pid,
+                    exit_code,
+                    ts: events::now_ts(),
+                });
+                let mut payload = HookPayload::new()
+                    .set("session.name", session_name)
+                    .set("pane.id", pid);
+                if let Some(code) = exit_code {
+                    payload.insert("pane.exit_code", code);
+                }
+                hook_executor.fire(HookEvent::AfterPaneExit, &payload);
+            }
+        }
+
+        // ── CWD polling (#82 PaneCwdChanged / #83 OnCwdChange) ──
+        // Throttled to 1 Hz; the live_cwd resolution chain (OSC 7 →
+        // procfs → initial_cwd) is cheap but we don't want to thrash
+        // it on a hot loop.
+        if last_cwd_poll.elapsed() >= CWD_POLL_INTERVAL {
+            last_cwd_poll = Instant::now();
+            for (&pid, pane) in panes.iter() {
+                if let Some(cwd) = pane.live_cwd() {
+                    let cwd_str = cwd.to_string_lossy().into_owned();
+                    let changed = match prev_cwd.get(&pid) {
+                        Some(prev) => prev != &cwd_str,
+                        None => true,
+                    };
+                    if changed {
+                        prev_cwd.insert(pid, cwd_str.clone());
+                        events::publish(Event::PaneCwdChanged {
+                            session: session_name.to_string(),
+                            pane: pid,
+                            cwd: cwd_str.clone(),
+                            ts: events::now_ts(),
+                        });
+                        let payload = HookPayload::new()
+                            .set("session.name", session_name)
+                            .set("pane.id", pid)
+                            .set("pane.cwd", &cwd_str);
+                        hook_executor.fire(HookEvent::OnCwdChange, &payload);
                     }
                 }
             }
@@ -645,6 +953,20 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                         if client_mode == protocol::AttachMode::Readonly {
                             continue;
                         }
+                        let copy_argv: Option<&[String]> = if clipboard_copy_argv.is_empty() {
+                            None
+                        } else {
+                            Some(clipboard_copy_argv.as_slice())
+                        };
+                        let mut ctx = input_modes::RuntimeCtx {
+                            keymap: &keymap,
+                            osc52_confirm: &mut osc52_confirm,
+                            fuzzy_index: &mut fuzzy_index,
+                            palette_query: &mut palette_query,
+                            palette_selected: &mut palette_selected,
+                            history: &mut history,
+                            session_name,
+                        };
                         process_event(
                             event,
                             &mut mode,
@@ -670,6 +992,9 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                             &current_tab_names,
                             prefix_key,
                             &mut flash_message,
+                            &mut buffers,
+                            copy_argv,
+                            &mut ctx,
                         );
                     }
                     Ok(ClientMsg::Resize(w, h)) => {
@@ -798,6 +1123,18 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                 effective_scrollback,
             );
             workspace::auto_save(session_name, &snapshot);
+            // #82: announce snapshot save + session detach.
+            events::publish(Event::SnapshotSaved {
+                session: session_name.to_string(),
+                path: format!("auto:{session_name}"),
+                ts: events::now_ts(),
+            });
+            events::publish(Event::SessionDetached {
+                session: session_name.to_string(),
+                ts: events::now_ts(),
+            });
+            // Persist palette history alongside auto-save.
+            let _ = history.save(&crate::fuzzy::history_path());
             mode = InputMode::Normal;
             drag = None;
             selection_anchor = None;
@@ -828,6 +1165,16 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                 let inner = super::make_inner(tw, th, settings.show_status_bar);
                 let rects = layout.pane_rects(&inner);
                 let (&pid, rect) = rects.iter().next().unwrap();
+                // #82: announce the new tab now so subscribers see the
+                // event even if the spawn fails (the failure path
+                // reverts the tab below). Tab index = newly-active.
+                events::publish(Event::TabAdded {
+                    session: session_name.to_string(),
+                    tab: tab_mgr.active_idx,
+                    ts: events::now_ts(),
+                });
+                update.tabs_dirty = true;
+                update.status_dirty = true;
                 match super::spawn_pane(
                     &default_shell,
                     &PaneLaunch::Shell,
@@ -835,9 +1182,26 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                     rect.h.max(1),
                     effective_scrollback,
                 ) {
-                    Ok(p) => {
+                    Ok(mut p) => {
+                        // Inherit byte-budget telemetry + clipboard policy
+                        // on every new pane.
+                        p.set_scrollback_budget(scrollback_bytes, scrollback_eviction);
+                        p.set_clipboard_policy(clipboard_policy);
+                        let cmd_label = p.launch_label(&default_shell);
                         panes.insert(pid, p);
                         active = pid;
+                        // #82 / #83: pane-spawn fanout.
+                        events::publish(Event::PaneSpawned {
+                            session: session_name.to_string(),
+                            pane: pid,
+                            command: cmd_label,
+                            cwd: None,
+                            ts: events::now_ts(),
+                        });
+                        let payload = HookPayload::new()
+                            .set("session.name", session_name)
+                            .set("pane.id", pid);
+                        hook_executor.fire(HookEvent::AfterPaneSpawn, &payload);
                         broadcast = false;
                         restart_policies.clear();
                         restart_state.clear();
@@ -930,6 +1294,8 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                         ));
                         update.mark_all(&layout);
                         update.border_dirty = true;
+                        update.tabs_dirty = true;
+                        update.status_dirty = true;
                         tab_names_dirty = true;
                     }
                 }
@@ -963,14 +1329,24 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                         ));
                         update.mark_all(&layout);
                         update.border_dirty = true;
+                        update.tabs_dirty = true;
+                        update.status_dirty = true;
                         tab_names_dirty = true;
                     }
                 }
             }
             TabAction::Rename(new_name) => {
-                tab_name = new_name;
+                tab_name = new_name.clone();
                 update.full_redraw = true;
+                update.tabs_dirty = true;
+                update.status_dirty = true;
                 tab_names_dirty = true;
+                events::publish(Event::TabRenamed {
+                    session: session_name.to_string(),
+                    tab: tab_mgr.active_idx,
+                    name: new_name,
+                    ts: events::now_ts(),
+                });
             }
             TabAction::KillSession => {
                 // Kill all panes in all tabs
@@ -989,6 +1365,30 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
         // ── Handle IPC commands ──
         if let Some(ref rx) = ipc_rx {
             while let Ok((cmd, resp_tx)) = rx.try_recv() {
+                // RFC #103: extended commands (`ls_tree`, `dump`,
+                // `send_keys`) flow through the same channel as the
+                // legacy `IpcRequest` vocabulary so handlers can read
+                // daemon state. Dispatch them to the dedicated
+                // ext_handlers module before the legacy match.
+                let cmd = match cmd {
+                    ipc::IpcCommand::Ext(ext) => {
+                        let response = ext_handlers::dispatch_ext_mut(
+                            ext,
+                            &mut panes,
+                            active,
+                            &tab_mgr,
+                            &tab_name,
+                            &layout,
+                            &clients,
+                            session_name,
+                            session_started_at,
+                        );
+                        let _ = resp_tx.send(response);
+                        continue;
+                    }
+                    ipc::IpcCommand::Legacy(req) => req,
+                };
+
                 // Intercept Save/Load to use full-session snapshots (with all tabs)
                 if let ipc::IpcRequest::Save { ref path } = cmd {
                     let snapshot = WorkspaceSnapshot::from_live(
@@ -1160,6 +1560,27 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                 }
                 let flash_text: Option<&str> = flash_message.as_ref().map(|(s, _)| s.as_str());
 
+                // Build PaletteOverlayState if we're in CommandPalette mode
+                // (#86). Empty `fuzzy_index` falls back to the legacy text
+                // input — render_glue handles the None case.
+                let palette_matches: Vec<crate::fuzzy::Match> = if matches!(mode, InputMode::CommandPalette { .. }) {
+                    fuzzy_index
+                        .as_mut()
+                        .map(|fi| fi.search(palette_query.as_str(), 6))
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let palette_state = if matches!(mode, InputMode::CommandPalette { .. }) {
+                    fuzzy_index.as_ref().map(|fi| render::PaletteOverlayState {
+                        query: palette_query.as_str(),
+                        matches: palette_matches.as_slice(),
+                        selected: palette_selected.min(palette_matches.len().saturating_sub(1).max(0)),
+                        entries: fi.entries(),
+                    })
+                } else {
+                    None
+                };
                 // Render once (smallest-client policy: all clients see the same frame)
                 render_buf.clear();
                 let render_result = render_glue::render_frame_to_buf(
@@ -1182,6 +1603,8 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                     &default_shell,
                     &tab_names_cache,
                     flash_text,
+                    palette_state.as_ref(),
+                    osc52_confirm.as_ref(),
                 );
 
                 super::reset_render_targets(&mut panes, &render_targets);
