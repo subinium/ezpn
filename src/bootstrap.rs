@@ -1871,7 +1871,7 @@ pub(crate) fn spawn_pane(
     rows: u16,
     scrollback: usize,
 ) -> anyhow::Result<Pane> {
-    spawn_pane_in(shell, launch, cols, rows, scrollback, None)
+    Pane::with_scrollback(shell, launch.clone(), cols, rows, scrollback)
 }
 
 /// Like [`spawn_pane`] but inherits `cwd` from the caller — used by `do_split`
@@ -1885,15 +1885,18 @@ pub(crate) fn spawn_pane_in(
     scrollback: usize,
     cwd: Option<&std::path::Path>,
 ) -> anyhow::Result<Pane> {
-    Pane::with_full_config(
-        shell,
-        launch.clone(),
-        cols,
-        rows,
-        scrollback,
-        cwd,
-        &std::collections::HashMap::new(),
-    )
+    match cwd {
+        Some(_) => Pane::with_full_config(
+            shell,
+            launch.clone(),
+            cols,
+            rows,
+            scrollback,
+            cwd,
+            &std::collections::HashMap::new(),
+        ),
+        None => Pane::with_scrollback(shell, launch.clone(), cols, rows, scrollback),
+    }
 }
 
 pub(crate) fn spawn_project_panes(
