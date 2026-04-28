@@ -1778,8 +1778,10 @@ mod tests {
         let mut state = PaneTerminalState::new();
         let mut pending = Vec::new();
         let policy = ClipboardPolicy::default();
-        let mut palette = ThemePalette::default();
-        palette.bg = Some(Rgb::new(0x1e, 0x1e, 0x2e));
+        let palette = ThemePalette {
+            bg: Some(Rgb::new(0x1e, 0x1e, 0x2e)),
+            ..Default::default()
+        };
 
         let reply = run_intercept(
             b"\x1b]11;?\x07",
@@ -1831,8 +1833,10 @@ mod tests {
         let mut state = PaneTerminalState::new();
         let mut pending = Vec::new();
         let policy = ClipboardPolicy::default();
-        let mut palette = ThemePalette::default();
-        palette.fg = Some(Rgb::new(0xff, 0xff, 0xff));
+        let palette = ThemePalette {
+            fg: Some(Rgb::new(0xff, 0xff, 0xff)),
+            ..Default::default()
+        };
 
         // Theme is active but index 99 not set: no reply.
         let reply = run_intercept(
