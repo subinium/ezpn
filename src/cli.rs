@@ -24,16 +24,11 @@ pub(crate) enum LayoutSpec {
 /// namespace at `\0ezpn-<uid>-<session>` — useful when the runtime dir
 /// lives on NFS or has surprising perms. On non-Linux platforms the
 /// flag is accepted and a warning is logged; bind falls back to `Path`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum SocketKind {
+    #[default]
     Path,
     Abstract,
-}
-
-impl Default for SocketKind {
-    fn default() -> Self {
-        Self::Path
-    }
 }
 
 pub(crate) struct Config {

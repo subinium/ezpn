@@ -129,10 +129,24 @@ pub enum Action {
     DisplayMessage { text: String },
     /// `set-option KEY VALUE` — session-scoped option mutation.
     SetOption { key: String, value: String },
+
+    // ── named copy buffers (#91) ──
+    /// `set-buffer NAME VALUE` — write `value` to the named buffer slot.
+    /// Empty `name` ("") writes the default buffer.
+    SetBuffer { name: String, value: String },
+    /// `paste-buffer [NAME]` — emit the named buffer's contents into the
+    /// active pane. `None` reads the default buffer.
+    PasteBuffer { name: Option<String> },
+    /// `list-buffers` — open the named-buffer browser.
+    ListBuffers,
 }
 
 impl Action {
     /// Stable wire name. Lower-case `kebab-case`. **Frozen.**
+    // reason: stable-action vocabulary contract referenced by this module's
+    // `#[cfg(test)]` `vocabulary_includes_every_action_kind` test; will be
+    // exposed through the IPC `keymap` query in the v0.13.x follow-up.
+    #[allow(dead_code)]
     pub fn kind(&self) -> &'static str {
         match self {
             Action::SplitWindowH => "split-window-h",
@@ -161,6 +175,9 @@ impl Action {
             Action::ToggleBroadcast => "toggle-broadcast",
             Action::DisplayMessage { .. } => "display-message",
             Action::SetOption { .. } => "set-option",
+            Action::SetBuffer { .. } => "set-buffer",
+            Action::PasteBuffer { .. } => "paste-buffer",
+            Action::ListBuffers => "list-buffers",
         }
     }
 
@@ -194,6 +211,9 @@ impl Action {
             "toggle-broadcast",
             "display-message",
             "set-option",
+            "set-buffer",
+            "paste-buffer",
+            "list-buffers",
         ]
     }
 }
@@ -312,6 +332,33 @@ pub fn parse_action(input: &str) -> Result<Action, ActionParseError> {
                 value: v.trim().to_string(),
             })
         }
+        "set-buffer" => {
+            if rest.is_empty() {
+                return Err(ActionParseError::MissingArgument {
+                    action: "set-buffer",
+                    arg: "NAME",
+                });
+            }
+            let (name, value) =
+                rest.split_once(char::is_whitespace)
+                    .ok_or(ActionParseError::MissingArgument {
+                        action: "set-buffer",
+                        arg: "VALUE",
+                    })?;
+            Ok(Action::SetBuffer {
+                name: name.to_string(),
+                value: value.trim().to_string(),
+            })
+        }
+        "paste-buffer" => {
+            let name = if rest.is_empty() {
+                None
+            } else {
+                Some(rest.to_string())
+            };
+            Ok(Action::PasteBuffer { name })
+        }
+        "list-buffers" => Ok(Action::ListBuffers),
         other => Err(ActionParseError::UnknownAction(other.to_string())),
     }
 }
@@ -430,6 +477,12 @@ impl KeyChord {
 pub enum KeyParseError {
     Empty,
     UnknownNamedKey(String),
+    // reason: parser does not currently emit this variant — the modifier
+    // tokenizer rejects unknown mods earlier as `UnknownNamedKey`. The
+    // variant stays in the public error vocabulary because the planned
+    // strict-mode parser refactor (#tracked separately) will distinguish
+    // bad-modifier from bad-key for better diagnostics.
+    #[allow(dead_code)]
     InvalidModifier(String),
     DanglingModifier,
 }
@@ -590,10 +643,16 @@ impl Keymap {
     }
 
     /// Number of bindings registered in the given table.
+    // reason: introspection helpers covered by this module's `#[cfg(test)]`
+    // suite (`apply_keymap_section_*` tests) and consumed by the planned
+    // `ezpn-ctl keymap show` IPC query.
+    #[allow(dead_code)]
     pub fn len(&self, table: KeymapTable) -> usize {
         self.tables.get(&table).map(HashMap::len).unwrap_or(0)
     }
 
+    // reason: see `len` above — same test-coverage and IPC consumer.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.tables.values().all(HashMap::is_empty)
     }
@@ -757,6 +816,11 @@ pub fn load_defaults() -> Keymap {
 /// Top-level `[keymap.<table>]` capture used by [`crate::config`] and
 /// [`crate::project`]. `flatten` would be nice but breaks `toml`'s type
 /// inference here, so we just take the inner table.
+// reason: serde target type for `[keymap.*]` deserialization; the
+// `apply_keymap_section` tests construct it directly. Live consumers
+// (config.rs, project.rs) currently parse `toml::Table` ad-hoc; this
+// struct is the typed replacement scheduled for the next config refactor.
+#[allow(dead_code)]
 #[derive(Debug, Default, Deserialize)]
 pub struct RawKeymapSection {
     #[serde(flatten)]
@@ -834,6 +898,80 @@ mod tests {
     }
 
     #[test]
+    fn parses_named_buffer_actions() {
+        // set-buffer NAME VALUE — name and value separated by whitespace.
+        assert_eq!(
+            parse_action("set-buffer foo hello world"),
+            Ok(Action::SetBuffer {
+                name: "foo".to_string(),
+                value: "hello world".to_string(),
+            })
+        );
+        // paste-buffer with explicit name.
+        assert_eq!(
+            parse_action("paste-buffer foo"),
+            Ok(Action::PasteBuffer {
+                name: Some("foo".to_string()),
+            })
+        );
+        // paste-buffer with no name → default buffer.
+        assert_eq!(
+            parse_action("paste-buffer"),
+            Ok(Action::PasteBuffer { name: None })
+        );
+        // list-buffers takes no arguments.
+        assert_eq!(parse_action("list-buffers"), Ok(Action::ListBuffers));
+    }
+
+    #[test]
+    fn buffer_actions_kind_strings_are_stable() {
+        // The `kind()` string is the wire / display name — frozen v1.
+        assert_eq!(
+            Action::SetBuffer {
+                name: "n".into(),
+                value: "v".into()
+            }
+            .kind(),
+            "set-buffer",
+        );
+        assert_eq!(Action::PasteBuffer { name: None }.kind(), "paste-buffer",);
+        assert_eq!(
+            Action::PasteBuffer {
+                name: Some("foo".into())
+            }
+            .kind(),
+            "paste-buffer",
+        );
+        assert_eq!(Action::ListBuffers.kind(), "list-buffers");
+    }
+
+    #[test]
+    fn set_buffer_requires_name_and_value() {
+        let err = parse_action("set-buffer").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ActionParseError::MissingArgument {
+                    action: "set-buffer",
+                    arg: "NAME"
+                }
+            ),
+            "expected missing NAME, got {err:?}",
+        );
+        let err = parse_action("set-buffer onlyname").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ActionParseError::MissingArgument {
+                    action: "set-buffer",
+                    arg: "VALUE"
+                }
+            ),
+            "expected missing VALUE, got {err:?}",
+        );
+    }
+
+    #[test]
     fn vocabulary_includes_every_action_kind() {
         // Every variant of `Action` should appear in `vocabulary()`. We
         // build one Action per variant via parse_action and assert the
@@ -865,6 +1003,9 @@ mod tests {
             "toggle-broadcast",
             "display-message hi",
             "set-option a b",
+            "set-buffer name value",
+            "paste-buffer",
+            "list-buffers",
         ];
         for p in probes {
             let action = parse_action(p).unwrap_or_else(|e| panic!("{p:?}: {e}"));

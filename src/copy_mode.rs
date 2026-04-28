@@ -623,7 +623,6 @@ fn jump_to_match(state: &mut CopyModeState, forward: bool) {
 /// fire. If a real clipboard tool ran successfully, OSC 52 is still
 /// useful for forwarding through SSH-attached terminals; the policy is
 /// caller-defined.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct YankReport {
     /// Result of pushing the text into the default buffer slot. Always
@@ -631,6 +630,10 @@ pub struct YankReport {
     /// otherwise. The buffer push happens *before* the clipboard exec
     /// so the user can still paste-buffer the yank even when the host
     /// has no graphical clipboard.
+    // reason: consumed by the copy-mode yank wiring in #91/#92; field is
+    // populated today and read once `server/input_modes.rs` chains the
+    // status-bar flash on yank.
+    #[allow(dead_code)]
     pub buffer: Result<(), SetError>,
     /// Result of [`crate::clipboard::copy`]. `Ok(label)` carries the
     /// program name (`"wl-copy"` / `"override(my-tool)"` / …) so the
@@ -639,11 +642,13 @@ pub struct YankReport {
     pub clipboard: Result<String, ClipboardError>,
 }
 
-#[allow(dead_code)]
 impl YankReport {
     /// True iff at least one of the two paths succeeded. Used by the
     /// status-bar flash to decide between a "yanked" and a "copy
     /// failed" message.
+    // reason: same #91/#92 deferred wiring as `YankReport::buffer`; covered
+    // by unit tests in this module today.
+    #[allow(dead_code)]
     pub fn any_success(&self) -> bool {
         self.buffer.is_ok() || self.clipboard.is_ok()
     }
@@ -659,7 +664,6 @@ impl YankReport {
 ///
 /// Returns a [`YankReport`] so the caller can chain OSC 52 fall-back
 /// and a status-bar flash.
-#[allow(dead_code)]
 pub fn yank_to_buffer(
     text: &str,
     buffers: &mut BufferStore,

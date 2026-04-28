@@ -217,3 +217,188 @@ pub(super) fn parse_bool_opt(s: &str) -> Option<bool> {
         _ => None,
     }
 }
+
+/// Translate a [`crate::keymap::Action`] into the corresponding
+/// command-palette [`crate::commands::Command`], dispatching it through
+/// [`execute_command`]. Keymap-only actions that don't have a palette
+/// equivalent (mode toggles, copy mode, etc.) mutate the input-mode state
+/// machine and are therefore handled by `input_modes::dispatch_keymap_action`
+/// — *this* helper is the data-mutation shim only.
+///
+/// Returns the same `Result<Option<String>, String>` shape as
+/// `execute_command` so the dispatcher can pipe success messages and
+/// errors into the status-bar flash channel uniformly.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn execute_action(
+    action: &crate::keymap::Action,
+    layout: &mut Layout,
+    panes: &mut HashMap<usize, Pane>,
+    active: &mut usize,
+    settings: &mut Settings,
+    update: &mut RenderUpdate,
+    default_shell: &str,
+    tw: u16,
+    th: u16,
+    scrollback: usize,
+    zoomed_pane: &mut Option<usize>,
+    broadcast: &mut bool,
+    tab_action: &mut TabAction,
+    buffers: &mut crate::buffers::BufferStore,
+) -> Result<Option<String>, String> {
+    use crate::commands::{Command, Dir as CmdDir};
+    use crate::keymap::{Action, Dir as KmDir};
+
+    let to_cmd_dir = |d: KmDir| match d {
+        KmDir::Up => CmdDir::Up,
+        KmDir::Down => CmdDir::Down,
+        KmDir::Left => CmdDir::Left,
+        KmDir::Right => CmdDir::Right,
+    };
+
+    // Convert the keymap action into a command-palette command when
+    // there's a 1:1 equivalent. Actions without an equivalent (mode
+    // toggles, copy mode, equalize, named buffers) are handled inline
+    // below and return early.
+    let cmd: Option<Command> = match action {
+        Action::SplitWindowH => Some(Command::SplitHorizontal),
+        Action::SplitWindowV => Some(Command::SplitVertical),
+        Action::KillPane => Some(Command::KillPane),
+        Action::KillWindow => Some(Command::KillWindow),
+        Action::NewWindow { name } => Some(Command::NewWindow { name: name.clone() }),
+        Action::RenameWindow => {
+            // No fixed argument — mode change handled by input_modes.
+            return Ok(None);
+        }
+        Action::SelectPane { dir } => Some(Command::SelectPane {
+            dir: to_cmd_dir(*dir),
+        }),
+        Action::ResizePane { dir, amount } => Some(Command::ResizePane {
+            dir: to_cmd_dir(*dir),
+            amount: *amount,
+        }),
+        Action::SwapPane { up } => Some(Command::SwapPane { up: *up }),
+        Action::SelectLayout { name } => Some(Command::SelectLayout { name: name.clone() }),
+        Action::SetOption { key, value } => Some(Command::SetOption {
+            key: key.clone(),
+            value: value.clone(),
+        }),
+        Action::DisplayMessage { text } => Some(Command::DisplayMessage { text: text.clone() }),
+        // Inline handlers for non-command-palette actions:
+        Action::Equalize => {
+            layout.equalize();
+            crate::resize_all(panes, layout, tw, th, settings);
+            update.mark_all(layout);
+            update.border_dirty = true;
+            return Ok(None);
+        }
+        Action::ToggleBroadcast => {
+            *broadcast = !*broadcast;
+            update.full_redraw = true;
+            update.status_dirty = true;
+            return Ok(None);
+        }
+        Action::ToggleSettings => {
+            settings.toggle();
+            update.full_redraw = true;
+            return Ok(None);
+        }
+        Action::ReloadConfig => {
+            settings.reload_request = true;
+            return Ok(None);
+        }
+        Action::SetBuffer { name, value } => match buffers.set(name.clone(), value.clone()) {
+            Ok(()) => return Ok(Some(format!("set-buffer {name}"))),
+            Err(e) => return Err(e.to_string()),
+        },
+        Action::PasteBuffer { name } => {
+            let entry = match name {
+                Some(n) => buffers.get(n.as_str()),
+                None => buffers.default_buffer(),
+            };
+            if let Some(buf) = entry {
+                if let Some(pane) = panes.get_mut(active) {
+                    if pane.is_alive() {
+                        pane.write_bytes(buf.text.as_bytes());
+                    }
+                }
+                return Ok(None);
+            }
+            return Err(format!(
+                "paste-buffer: no buffer `{}`",
+                name.as_deref().unwrap_or("")
+            ));
+        }
+        Action::ListBuffers => {
+            return Ok(Some(format!("buffers: {} stored", buffers.len())));
+        }
+        // Mode/state actions — input_modes handles these directly.
+        Action::CopyMode
+        | Action::Cancel
+        | Action::BeginSelection
+        | Action::CopySelectionAndCancel
+        | Action::CommandPrompt
+        | Action::DetachSession
+        | Action::KillSession
+        | Action::SelectWindow { .. }
+        | Action::NextWindow
+        | Action::PreviousWindow => return Ok(None),
+    };
+
+    if let Some(cmd) = cmd {
+        let rendered = render_command(&cmd);
+        return execute_command(
+            &rendered,
+            layout,
+            panes,
+            active,
+            settings,
+            update,
+            default_shell,
+            tw,
+            th,
+            scrollback,
+            zoomed_pane,
+            broadcast,
+            tab_action,
+        );
+    }
+    Ok(None)
+}
+
+/// Render a `Command` back into the string form `commands::parse` accepts,
+/// so the keymap dispatcher can re-use the existing palette parser/dispatch
+/// path without duplicating every match arm.
+fn render_command(cmd: &crate::commands::Command) -> String {
+    use crate::commands::{Command, Dir};
+    let dir_flag = |d: Dir| match d {
+        Dir::Up => "-U",
+        Dir::Down => "-D",
+        Dir::Left => "-L",
+        Dir::Right => "-R",
+    };
+    match cmd {
+        Command::SplitHorizontal => "split-window -h".into(),
+        Command::SplitVertical => "split-window -v".into(),
+        Command::KillPane => "kill-pane".into(),
+        Command::KillWindow => "kill-window".into(),
+        Command::NewWindow { name } => match name {
+            Some(n) => format!("new-window -n {n}"),
+            None => "new-window".into(),
+        },
+        Command::RenameWindow { name } => format!("rename-window {name}"),
+        Command::SelectPane { dir } => format!("select-pane {}", dir_flag(*dir)),
+        Command::ResizePane { dir, amount } => {
+            format!("resize-pane {} {}", dir_flag(*dir), amount)
+        }
+        Command::SwapPane { up } => {
+            if *up {
+                "swap-pane -U".into()
+            } else {
+                "swap-pane -D".into()
+            }
+        }
+        Command::SelectLayout { name } => format!("select-layout {name}"),
+        Command::SetOption { key, value } => format!("set-option {key} {value}"),
+        Command::DisplayMessage { text } => format!("display-message {text}"),
+    }
+}

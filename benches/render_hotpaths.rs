@@ -5,17 +5,27 @@ use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
+// Sibling-module includes so that `use crate::*` paths inside the
+// bin sources resolve to the same modules under the bench harness.
+// Order matters: leaf-most first so dependents see siblings.
+#[path = "../src/config.rs"]
+mod config;
+#[path = "../src/fuzzy.rs"]
+mod fuzzy;
+#[path = "../src/hooks.rs"]
+mod hooks;
+#[path = "../src/keymap.rs"]
+mod keymap;
 #[path = "../src/layout.rs"]
 mod layout;
 #[path = "../src/pane.rs"]
 mod pane;
 #[path = "../src/render.rs"]
 mod render;
-// `pane.rs` references `crate::terminal_state::*` after the v0.12 split,
-// so the bench harness must include the same module to satisfy the
-// imports. Sibling-only — no behaviour change.
 #[path = "../src/terminal_state.rs"]
 mod terminal_state;
+#[path = "../src/theme.rs"]
+mod theme;
 
 use layout::{Layout, Rect};
 use pane::{Pane, PaneLaunch};
@@ -140,6 +150,7 @@ fn bench_render(c: &mut Criterion) {
                     true,
                     None,
                     false,
+                    None,
                 )
                 .expect("full redraw render");
                 criterion::black_box(&buf);
@@ -167,6 +178,7 @@ fn bench_render(c: &mut Criterion) {
                     false,
                     None,
                     false,
+                    None,
                 )
                 .expect("partial redraw render");
                 criterion::black_box(&buf);

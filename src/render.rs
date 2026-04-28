@@ -1,3 +1,15 @@
+//! Rendering primitives.
+//!
+//! Theme integration (#85): the six palette-driven Color constants below
+//! (`ACTIVE_COLOR`, `BORDER_COLOR`, `STATUS_BG`, `STATUS_FG`, `BROADCAST_COLOR`,
+//! `DEAD_FG`) are kept as fallbacks for callers that do not yet plumb a
+//! `ResolvedPalette`. The themed render entry points (`draw_status_bar_full`,
+//! `draw_tab_bar`, `render_panes`) accept an `Option<&ResolvedPalette>` and
+//! prefer palette-resolved colours when present. The four remaining constants
+//! (`HINT_FG`, `CLOSE_COLOR`, `DRAG_COLOR`, `MUTED_FG`) have no direct
+//! `ResolvedPalette` field today and stay hardcoded — v0.14 may extend the
+//! theme schema with `hint_fg`, `close_fg`, `drag_indicator`, and `muted_fg`.
+
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
@@ -12,8 +24,61 @@ use crossterm::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::fuzzy;
 use crate::layout::{Layout, Rect};
 use crate::pane::Pane;
+use crate::theme::{Resolved, ResolvedPalette};
+
+// ─── Palette helpers (#85) ─────────────────────────────────
+
+/// Convert a [`Resolved`] palette entry into the matching `crossterm::Color`.
+/// `Indexed(i)` becomes `Color::AnsiValue(i)`; `Rgb(c)` becomes `Color::Rgb`.
+pub fn resolved_to_crossterm(resolved: &Resolved) -> Color {
+    match *resolved {
+        Resolved::Rgb(c) => Color::Rgb {
+            r: c.r,
+            g: c.g,
+            b: c.b,
+        },
+        Resolved::Indexed(i) => Color::AnsiValue(i),
+    }
+}
+
+/// Resolve a palette entry, falling back to a hardcoded constant when the
+/// palette is `None` (e.g. boot before a theme is bound, or callers that
+/// have not yet been threaded through). Keeps the legacy look as the
+/// no-palette default so partial integration never regresses visuals.
+fn palette_color(palette: Option<&ResolvedPalette>, pick: PaletteSlot) -> Color {
+    match (palette, pick) {
+        (Some(p), PaletteSlot::BorderActive) => resolved_to_crossterm(&p.border_active),
+        (Some(p), PaletteSlot::Border) => resolved_to_crossterm(&p.border),
+        (Some(p), PaletteSlot::StatusBg) => resolved_to_crossterm(&p.status_bg),
+        (Some(p), PaletteSlot::StatusFg) => resolved_to_crossterm(&p.status_fg),
+        (Some(p), PaletteSlot::Broadcast) => resolved_to_crossterm(&p.broadcast_indicator),
+        (Some(p), PaletteSlot::DeadFg) => resolved_to_crossterm(&p.tab_inactive_fg),
+        (None, PaletteSlot::BorderActive) => ACTIVE_COLOR,
+        (None, PaletteSlot::Border) => BORDER_COLOR,
+        (None, PaletteSlot::StatusBg) => STATUS_BG,
+        (None, PaletteSlot::StatusFg) => STATUS_FG,
+        (None, PaletteSlot::Broadcast) => BROADCAST_COLOR,
+        (None, PaletteSlot::DeadFg) => DEAD_FG,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PaletteSlot {
+    BorderActive,
+    Border,
+    StatusBg,
+    StatusFg,
+    Broadcast,
+    // reason: consumed by `palette_color` in the dead-pane render branch
+    // (#tab-bar inactive tab fg path) — wiring is one renderer slice away.
+    #[allow(dead_code)]
+    DeadFg,
+}
+
+// ─── Legacy constants (fallback when no palette is bound) ──
 
 const ACTIVE_COLOR: Color = Color::Cyan;
 const BORDER_COLOR: Color = Color::DarkGrey;
@@ -23,11 +88,13 @@ const STATUS_BG: Color = Color::Rgb {
     b: 48,
 };
 const STATUS_FG: Color = Color::White;
+// Unmapped: no `hint_fg` field on `ResolvedPalette` yet — see module doc.
 const HINT_FG: Color = Color::Rgb {
     r: 160,
     g: 170,
     b: 190,
 };
+// Unmapped: see module doc.
 const CLOSE_COLOR: Color = Color::DarkRed;
 const DEAD_FG: Color = Color::DarkGrey;
 const BROADCAST_COLOR: Color = Color::Rgb {
@@ -35,7 +102,9 @@ const BROADCAST_COLOR: Color = Color::Rgb {
     g: 140,
     b: 50,
 };
+// Unmapped: see module doc.
 const DRAG_COLOR: Color = Color::Yellow;
+// Unmapped: see module doc.
 const MUTED_FG: Color = Color::Rgb {
     r: 100,
     g: 100,
@@ -345,6 +414,7 @@ pub fn render_panes(
     full_redraw: bool,
     selection: PaneSelection,
     broadcast: bool,
+    palette: Option<&ResolvedPalette>,
 ) -> anyhow::Result<()> {
     queue!(stdout, cursor::Hide)?;
 
@@ -374,6 +444,9 @@ pub fn render_panes(
 
     if full_redraw {
         let active_rect = pane_rects.get(&active_id);
+        let border_active_color = palette_color(palette, PaletteSlot::BorderActive);
+        let border_color = palette_color(palette, PaletteSlot::Border);
+        let broadcast_color = palette_color(palette, PaletteSlot::Broadcast);
         for cell in &border_cache.cells {
             let is_active = active_rect
                 .map(|r| is_pane_border(cell.x, cell.y, r))
@@ -388,11 +461,11 @@ pub fn render_panes(
             } else if dragging_sep {
                 DRAG_COLOR
             } else if broadcast {
-                BROADCAST_COLOR
+                broadcast_color
             } else if is_active {
-                ACTIVE_COLOR
+                border_active_color
             } else {
-                BORDER_COLOR
+                border_color
             };
             queue!(
                 stdout,
@@ -905,7 +978,9 @@ pub fn draw_status_bar(
     total: usize,
     mode_label: &str,
 ) -> anyhow::Result<()> {
-    draw_status_bar_full(stdout, term_w, term_h, active_idx, total, mode_label, "", 0)
+    draw_status_bar_full(
+        stdout, term_w, term_h, active_idx, total, mode_label, "", 0, None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -918,15 +993,20 @@ pub fn draw_status_bar_full(
     mode_label: &str,
     pane_name: &str,
     selection_chars: usize,
+    palette: Option<&ResolvedPalette>,
 ) -> anyhow::Result<()> {
     let y = term_h - 1;
     let w = term_w as usize;
 
+    let status_bg = palette_color(palette, PaletteSlot::StatusBg);
+    let status_fg = palette_color(palette, PaletteSlot::StatusFg);
+    let accent = palette_color(palette, PaletteSlot::BorderActive);
+
     queue!(
         stdout,
         cursor::MoveTo(0, y),
-        SetBackgroundColor(STATUS_BG),
-        SetForegroundColor(STATUS_FG)
+        SetBackgroundColor(status_bg),
+        SetForegroundColor(status_fg)
     )?;
     for _ in 0..w {
         queue!(stdout, Print(" "))?;
@@ -936,7 +1016,7 @@ pub fn draw_status_bar_full(
     queue!(
         stdout,
         cursor::MoveTo(1, y),
-        SetForegroundColor(ACTIVE_COLOR),
+        SetForegroundColor(accent),
         SetAttribute(Attribute::Bold)
     )?;
     let left = if pane_name.is_empty() {
@@ -966,7 +1046,7 @@ pub fn draw_status_bar_full(
             SetAttribute(Attribute::Bold),
             Print(format!(" {} ", sel_label)),
             SetAttribute(Attribute::Reset),
-            SetBackgroundColor(STATUS_BG),
+            SetBackgroundColor(status_bg),
         )?;
         left_end += sel_label.len() + 2;
     } else if !mode_label.is_empty() {
@@ -986,7 +1066,7 @@ pub fn draw_status_bar_full(
             SetAttribute(Attribute::Bold),
             Print(format!(" {} ", mode_label)),
             SetAttribute(Attribute::Reset),
-            SetBackgroundColor(STATUS_BG),
+            SetBackgroundColor(status_bg),
         )?;
         left_end += mode_label.len() + 2;
     }
@@ -1002,7 +1082,7 @@ pub fn draw_status_bar_full(
     queue!(
         stdout,
         SetAttribute(Attribute::Reset),
-        SetBackgroundColor(STATUS_BG)
+        SetBackgroundColor(status_bg)
     )?;
     let hints: &[&str] = match mode_label {
         "PREFIX" => &[
@@ -1039,10 +1119,13 @@ pub fn draw_status_bar_full(
         "CLOSE TAB? y/n" => &["y close tab", "any key cancel"],
         "ZOOM" => &["Ctrl+B z unzoom", "Ctrl+D/E split", "type normally"],
         "BROADCAST" => &["typing in ALL panes", "Ctrl+B B stop broadcast"],
+        ":" => &["↑↓ navigate", "Enter select", "Tab complete", "Esc cancel"],
+        "RENAME" => &["Enter confirm", "Esc cancel"],
         _ => &[
             "Ctrl+D/E split",
             "Ctrl+N next",
             "Ctrl+B prefix",
+            "Ctrl+B p palette",
             "drag text→copy",
             "scroll↕output",
             "Ctrl+G settings",
@@ -1094,7 +1177,7 @@ pub fn draw_status_bar_full(
                     SetAttribute(Attribute::Bold),
                     Print(key),
                     SetAttribute(Attribute::Reset),
-                    SetBackgroundColor(STATUS_BG),
+                    SetBackgroundColor(status_bg),
                     SetForegroundColor(desc_fg),
                     Print(desc),
                 )?;
@@ -1105,7 +1188,7 @@ pub fn draw_status_bar_full(
                     SetAttribute(Attribute::Bold),
                     Print(*hint),
                     SetAttribute(Attribute::Reset),
-                    SetBackgroundColor(STATUS_BG),
+                    SetBackgroundColor(status_bg),
                 )?;
             }
         }
@@ -1117,7 +1200,7 @@ pub fn draw_status_bar_full(
         queue!(
             stdout,
             cursor::MoveTo(cx, y),
-            SetBackgroundColor(STATUS_BG),
+            SetBackgroundColor(status_bg),
             SetForegroundColor(HINT_FG),
             Print(&clock),
         )?;
@@ -1131,6 +1214,10 @@ pub fn draw_status_bar_full(
 /// `settings` into the renderer's dependency graph.
 //
 // FLASH-MSG-COORDINATE-WITH-#58
+// reason: paired with `draw_flash_overlay` below — both consumed by the
+// flash-message overlay wiring in #64; the producer side
+// (`Settings::flash_message`) is already populated.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlashLevel {
     Info,
@@ -1146,6 +1233,8 @@ pub enum FlashLevel {
 /// in #58 — see the marker.
 //
 // FLASH-MSG-COORDINATE-WITH-#58
+// reason: see `FlashLevel` above — same #64 wiring.
+#[allow(dead_code)]
 pub fn draw_flash_overlay(
     stdout: &mut impl Write,
     term_w: u16,
@@ -1289,6 +1378,254 @@ pub fn draw_text_input(
     Ok(())
 }
 
+// ─── Fuzzy command palette overlay (#86) ───────────────────
+
+/// State the renderer needs to draw the bottom-anchored fuzzy palette
+/// overlay. The owning state machine (server/mod.rs, phase 2b) populates
+/// the slice + index every keystroke; the renderer is pure.
+///
+/// Lives on the renderer side so phase 2b can `use render::PaletteOverlayState`
+/// without re-deriving the shape.
+pub struct PaletteOverlayState<'a> {
+    pub query: &'a str,
+    pub matches: &'a [fuzzy::Match],
+    pub selected: usize,
+    /// Snapshot of the candidate list the matches index into. Borrowed from
+    /// the same `FuzzyIndex` whose `search()` produced `matches`.
+    pub entries: &'a [fuzzy::Entry],
+}
+
+/// Render the 8-row fuzzy command-palette overlay, anchored at the bottom
+/// of the screen. Layout:
+/// - Row 1: `: {query}` text-input style prompt
+/// - Rows 2..7: top 6 matches; the selected row gets a `border_active`
+///   background.
+/// - Each match line: kind icon (`@` session, `#` pane, `T` tab, `>` cmd,
+///   `*` recent) + display text + faded payload tail.
+/// - When `matches` is empty: row 2 shows `(no matches)`.
+///
+/// `palette` drives the prompt accent and selection background; `None`
+/// falls back to the legacy hardcoded look.
+pub fn draw_palette_overlay(
+    stdout: &mut impl Write,
+    state: &PaletteOverlayState<'_>,
+    term_width: u16,
+    term_height: u16,
+    palette: Option<&ResolvedPalette>,
+) -> anyhow::Result<()> {
+    let matches_ = state.matches;
+    let entries = state.entries;
+    let query = state.query;
+    let selected = state.selected;
+    if term_width < 10 || term_height < 8 {
+        return Ok(());
+    }
+    const OVERLAY_ROWS: u16 = 8;
+    let top = term_height.saturating_sub(OVERLAY_ROWS);
+    let w = term_width as usize;
+
+    // Colour selection.
+    let bg = Color::Rgb {
+        r: 18,
+        g: 22,
+        b: 32,
+    };
+    let prompt_fg = palette
+        .map(|p| resolved_to_crossterm(&p.border_active))
+        .unwrap_or(Color::Rgb {
+            r: 102,
+            g: 217,
+            b: 239,
+        });
+    let select_bg = palette
+        .map(|p| resolved_to_crossterm(&p.border_active))
+        .unwrap_or(Color::Rgb {
+            r: 50,
+            g: 90,
+            b: 130,
+        });
+    let select_fg = palette
+        .map(|p| resolved_to_crossterm(&p.tab_active_fg))
+        .unwrap_or(Color::White);
+    let row_fg = palette
+        .map(|p| resolved_to_crossterm(&p.fg))
+        .unwrap_or(Color::Rgb {
+            r: 220,
+            g: 225,
+            b: 240,
+        });
+    let dim_fg = Color::Rgb {
+        r: 110,
+        g: 120,
+        b: 140,
+    };
+    let kind_fg = palette
+        .map(|p| resolved_to_crossterm(&p.tab_inactive_fg))
+        .unwrap_or(Color::Rgb {
+            r: 130,
+            g: 165,
+            b: 200,
+        });
+
+    // Backdrop fill.
+    let blank = " ".repeat(w);
+    for dy in 0..OVERLAY_ROWS {
+        queue!(
+            stdout,
+            cursor::MoveTo(0, top + dy),
+            SetBackgroundColor(bg),
+            Print(&blank)
+        )?;
+    }
+
+    // Row 0: ": query" prompt line.
+    queue!(
+        stdout,
+        cursor::MoveTo(1, top),
+        SetBackgroundColor(bg),
+        SetForegroundColor(prompt_fg),
+        SetAttribute(Attribute::Bold),
+        Print(":"),
+        SetAttribute(Attribute::Reset),
+        SetBackgroundColor(bg),
+        SetForegroundColor(row_fg),
+        Print(" "),
+        Print(query),
+    )?;
+
+    // Match rows.
+    let visible_rows = (OVERLAY_ROWS - 2) as usize; // 6
+    if matches_.is_empty() {
+        queue!(
+            stdout,
+            cursor::MoveTo(2, top + 2),
+            SetBackgroundColor(bg),
+            SetForegroundColor(dim_fg),
+            SetAttribute(Attribute::Italic),
+            Print("(no matches)"),
+            SetAttribute(Attribute::Reset),
+        )?;
+    } else {
+        for (i, m) in matches_.iter().take(visible_rows).enumerate() {
+            let row_y = top + 2 + i as u16;
+            let is_sel = i == selected;
+            let row_bg = if is_sel { select_bg } else { bg };
+            let label_fg = if is_sel { select_fg } else { row_fg };
+
+            // Fill background for the row first.
+            queue!(
+                stdout,
+                cursor::MoveTo(0, row_y),
+                SetBackgroundColor(row_bg),
+                Print(&blank),
+                cursor::MoveTo(2, row_y),
+            )?;
+
+            let entry = entries.get(m.index);
+            let icon = match entry.map(|e| e.kind) {
+                Some(fuzzy::EntryKind::Session) => '@',
+                Some(fuzzy::EntryKind::Pane) => '#',
+                Some(fuzzy::EntryKind::Tab) => 'T',
+                Some(fuzzy::EntryKind::Command) => '>',
+                Some(fuzzy::EntryKind::Recent) => '*',
+                None => '?',
+            };
+
+            // Icon
+            queue!(
+                stdout,
+                SetForegroundColor(if is_sel { select_fg } else { kind_fg }),
+                SetAttribute(Attribute::Bold),
+                Print(icon),
+                SetAttribute(Attribute::Reset),
+                SetBackgroundColor(row_bg),
+                SetForegroundColor(label_fg),
+                Print(" "),
+            )?;
+
+            // Display text + faded payload tail (when payload != display).
+            let display = entry.map(|e| e.display.as_str()).unwrap_or("?");
+            queue!(stdout, Print(display))?;
+            if let Some(e) = entry {
+                if e.payload != e.display {
+                    let tail = format!("  {}", e.payload);
+                    queue!(
+                        stdout,
+                        SetForegroundColor(if is_sel { select_fg } else { dim_fg }),
+                        Print(&tail),
+                    )?;
+                }
+            }
+        }
+    }
+
+    queue!(stdout, ResetColor, SetAttribute(Attribute::Reset))?;
+    Ok(())
+}
+
+/// Draw the OSC 52 confirm prompt (#79).
+///
+/// Modal yellow pill at the bottom-left explaining which pane is asking to
+/// write to the system clipboard and how big the payload is. The user
+/// answers via `y` (allow), `n` (deny), or `Esc` (re-queue the prompt).
+/// Rendered over the status bar so it's unmissable while the daemon is
+/// blocked on the decision.
+pub fn draw_osc52_confirm_overlay(
+    stdout: &mut impl Write,
+    pane_id: usize,
+    byte_count: usize,
+    palette: Option<&ResolvedPalette>,
+    term_w: u16,
+    term_h: u16,
+) -> anyhow::Result<()> {
+    if term_w == 0 || term_h == 0 {
+        return Ok(());
+    }
+    let y = term_h.saturating_sub(1);
+    let bg = Color::Rgb {
+        r: 130,
+        g: 90,
+        b: 20,
+    };
+    let fg = palette
+        .map(|p| resolved_to_crossterm(&p.tab_active_fg))
+        .unwrap_or(Color::Rgb {
+            r: 255,
+            g: 240,
+            b: 200,
+        });
+    let msg = format!(" OSC52 pane #{pane_id}: allow {byte_count} bytes to clipboard? [y/n/Esc] ");
+    let max_inner = (term_w as usize).saturating_sub(2);
+    let truncated: String = if msg.width() > max_inner {
+        let mut acc = String::new();
+        let mut w = 0usize;
+        for ch in msg.chars() {
+            let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if w + cw > max_inner.saturating_sub(1) {
+                acc.push('…');
+                break;
+            }
+            acc.push(ch);
+            w += cw;
+        }
+        acc
+    } else {
+        msg
+    };
+    queue!(
+        stdout,
+        cursor::MoveTo(0, y),
+        SetBackgroundColor(bg),
+        SetForegroundColor(fg),
+        SetAttribute(Attribute::Bold),
+        Print(&truncated),
+        SetAttribute(Attribute::Reset),
+        ResetColor,
+        cursor::Hide,
+    )?;
+    Ok(())
+}
+
 /// Draw a transient flash message on the status-bar row.
 ///
 /// Used by the command palette to surface parse errors (e.g.
@@ -1367,12 +1704,17 @@ pub fn tab_bar_hit(x: u16, tabs: &[(usize, String, bool)], term_w: u16) -> Optio
 /// Draw tab indicators in the status bar area.
 /// Renders a tab bar above the main status bar (uses 1 extra row).
 /// `tabs` is `(index, name, is_active)` for each tab.
+///
+/// `palette` (#85): when `Some`, overrides the active-tab fg/bg + index colour
+/// from `ResolvedPalette::tab_active_*` and `border_active`. `None` keeps the
+/// legacy hardcoded look.
 pub fn draw_tab_bar(
     stdout: &mut impl Write,
     term_w: u16,
     term_h: u16,
     tabs: &[(usize, String, bool)],
     show_status_bar: bool,
+    palette: Option<&ResolvedPalette>,
 ) -> anyhow::Result<()> {
     if tabs.len() <= 1 {
         return Ok(());
@@ -1386,26 +1728,34 @@ pub fn draw_tab_bar(
         g: 26,
         b: 34,
     };
-    let active_tab_bg = Color::Rgb {
-        r: 50,
-        g: 55,
-        b: 70,
-    };
-    let active_tab_fg = Color::Rgb {
-        r: 220,
-        g: 225,
-        b: 240,
-    };
-    let inactive_fg = Color::Rgb {
-        r: 100,
-        g: 110,
-        b: 130,
-    };
-    let index_fg = Color::Rgb {
-        r: 80,
-        g: 180,
-        b: 220,
-    };
+    let active_tab_bg = palette
+        .map(|p| resolved_to_crossterm(&p.tab_active_bg))
+        .unwrap_or(Color::Rgb {
+            r: 50,
+            g: 55,
+            b: 70,
+        });
+    let active_tab_fg = palette
+        .map(|p| resolved_to_crossterm(&p.tab_active_fg))
+        .unwrap_or(Color::Rgb {
+            r: 220,
+            g: 225,
+            b: 240,
+        });
+    let inactive_fg = palette
+        .map(|p| resolved_to_crossterm(&p.tab_inactive_fg))
+        .unwrap_or(Color::Rgb {
+            r: 100,
+            g: 110,
+            b: 130,
+        });
+    let index_fg = palette
+        .map(|p| resolved_to_crossterm(&p.border_active))
+        .unwrap_or(Color::Rgb {
+            r: 80,
+            g: 180,
+            b: 220,
+        });
     let sep_fg = Color::Rgb {
         r: 50,
         g: 55,
@@ -1500,6 +1850,7 @@ pub fn redraw_status_only(
     mode_label: &str,
     pane_name: &str,
     selection_chars: usize,
+    palette: Option<&ResolvedPalette>,
 ) -> anyhow::Result<()> {
     queue!(stdout, terminal::BeginSynchronizedUpdate)?;
     draw_status_bar_full(
@@ -1511,6 +1862,7 @@ pub fn redraw_status_only(
         mode_label,
         pane_name,
         selection_chars,
+        palette,
     )?;
     queue!(stdout, cursor::Hide, terminal::EndSynchronizedUpdate)?;
     Ok(())
@@ -1531,9 +1883,10 @@ pub fn redraw_tabs_only(
     term_h: u16,
     tabs: &[(usize, String, bool)],
     show_status_bar: bool,
+    palette: Option<&ResolvedPalette>,
 ) -> anyhow::Result<()> {
     queue!(stdout, terminal::BeginSynchronizedUpdate)?;
-    draw_tab_bar(stdout, term_w, term_h, tabs, show_status_bar)?;
+    draw_tab_bar(stdout, term_w, term_h, tabs, show_status_bar, palette)?;
     queue!(stdout, cursor::Hide, terminal::EndSynchronizedUpdate)?;
     Ok(())
 }
@@ -1974,7 +2327,7 @@ mod partial_redraw_tests {
     #[test]
     fn redraw_status_only_emits_bytes_and_hides_cursor() {
         let mut buf: Vec<u8> = Vec::new();
-        redraw_status_only(&mut buf, 80, 24, 0, 1, "PREFIX", "shell", 0)
+        redraw_status_only(&mut buf, 80, 24, 0, 1, "PREFIX", "shell", 0, None)
             .expect("redraw_status_only succeeds");
         assert!(!buf.is_empty(), "status-only redraw must emit output");
         // crossterm's cursor::Hide writes ESC[?25l — the helper appends
@@ -1993,8 +2346,27 @@ mod partial_redraw_tests {
         // both `mode_label` and `selection_chars` are empty; we still
         // need to repaint the row (clock tick scenario).
         let mut buf: Vec<u8> = Vec::new();
-        redraw_status_only(&mut buf, 80, 24, 0, 1, "", "", 0).expect("succeeds");
+        redraw_status_only(&mut buf, 80, 24, 0, 1, "", "", 0, None).expect("succeeds");
         assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn redraw_status_only_handles_palette_mode_label() {
+        // Issue #87: CommandPalette mode label is ":" — verify it
+        // produces output (the new match arm with palette hints).
+        let mut buf: Vec<u8> = Vec::new();
+        redraw_status_only(&mut buf, 80, 24, 0, 1, ":", "shell", 0, None)
+            .expect("palette mode succeeds");
+        assert!(!buf.is_empty(), "palette mode must emit output");
+    }
+
+    #[test]
+    fn redraw_status_only_handles_rename_mode_label() {
+        // Issue #87: RENAME mode label triggers the rename hint arm.
+        let mut buf: Vec<u8> = Vec::new();
+        redraw_status_only(&mut buf, 80, 24, 0, 1, "RENAME", "shell", 0, None)
+            .expect("rename mode succeeds");
+        assert!(!buf.is_empty(), "rename mode must emit output");
     }
 
     #[test]
@@ -2004,7 +2376,7 @@ mod partial_redraw_tests {
             (1_usize, "logs".to_string(), false),
         ];
         let mut buf: Vec<u8> = Vec::new();
-        redraw_tabs_only(&mut buf, 80, 24, &tabs, true).expect("succeeds");
+        redraw_tabs_only(&mut buf, 80, 24, &tabs, true, None).expect("succeeds");
         assert!(!buf.is_empty(), "tab-only redraw must emit output");
         let s = String::from_utf8_lossy(&buf);
         assert!(s.contains("\x1b[?25l"), "must hide cursor at the end");
@@ -2018,7 +2390,7 @@ mod partial_redraw_tests {
         // must not panic.
         let tabs = vec![(0_usize, "main".to_string(), true)];
         let mut buf: Vec<u8> = Vec::new();
-        redraw_tabs_only(&mut buf, 80, 24, &tabs, true).expect("succeeds");
+        redraw_tabs_only(&mut buf, 80, 24, &tabs, true, None).expect("succeeds");
         // BeginSynchronizedUpdate + EndSynchronizedUpdate + cursor::Hide
         // emit a small fixed envelope; we just ensure no panic and some
         // bytes for the envelope.

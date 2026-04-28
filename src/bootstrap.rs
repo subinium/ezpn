@@ -509,33 +509,33 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                     // ── Resize mode: arrows resize, q/Esc exits ──
                     else if matches!(mode, InputMode::ResizeMode) {
                         match key.code {
-                            KeyCode::Left | KeyCode::Char('h') => {
-                                if layout.resize_pane(active, NavDir::Left, 0.05) {
-                                    resize_all(&mut panes, &layout, tw, th, &settings);
-                                    update.mark_all(&layout);
-                                    update.border_dirty = true;
-                                }
+                            KeyCode::Left | KeyCode::Char('h')
+                                if layout.resize_pane(active, NavDir::Left, 0.05) =>
+                            {
+                                resize_all(&mut panes, &layout, tw, th, &settings);
+                                update.mark_all(&layout);
+                                update.border_dirty = true;
                             }
-                            KeyCode::Right | KeyCode::Char('l') => {
-                                if layout.resize_pane(active, NavDir::Right, 0.05) {
-                                    resize_all(&mut panes, &layout, tw, th, &settings);
-                                    update.mark_all(&layout);
-                                    update.border_dirty = true;
-                                }
+                            KeyCode::Right | KeyCode::Char('l')
+                                if layout.resize_pane(active, NavDir::Right, 0.05) =>
+                            {
+                                resize_all(&mut panes, &layout, tw, th, &settings);
+                                update.mark_all(&layout);
+                                update.border_dirty = true;
                             }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                if layout.resize_pane(active, NavDir::Up, 0.05) {
-                                    resize_all(&mut panes, &layout, tw, th, &settings);
-                                    update.mark_all(&layout);
-                                    update.border_dirty = true;
-                                }
+                            KeyCode::Up | KeyCode::Char('k')
+                                if layout.resize_pane(active, NavDir::Up, 0.05) =>
+                            {
+                                resize_all(&mut panes, &layout, tw, th, &settings);
+                                update.mark_all(&layout);
+                                update.border_dirty = true;
                             }
-                            KeyCode::Down | KeyCode::Char('j') => {
-                                if layout.resize_pane(active, NavDir::Down, 0.05) {
-                                    resize_all(&mut panes, &layout, tw, th, &settings);
-                                    update.mark_all(&layout);
-                                    update.border_dirty = true;
-                                }
+                            KeyCode::Down | KeyCode::Char('j')
+                                if layout.resize_pane(active, NavDir::Down, 0.05) =>
+                            {
+                                resize_all(&mut panes, &layout, tw, th, &settings);
+                                update.mark_all(&layout);
+                                update.border_dirty = true;
                             }
                             KeyCode::Char('q') | KeyCode::Esc => {
                                 mode = InputMode::Normal;
@@ -756,11 +756,9 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                                 update.full_redraw = true;
                             }
                             // Last pane (tmux ;)
-                            KeyCode::Char(';') => {
-                                if panes.contains_key(&last_active) {
-                                    active = last_active;
-                                    update.full_redraw = true;
-                                }
+                            KeyCode::Char(';') if panes.contains_key(&last_active) => {
+                                active = last_active;
+                                update.full_redraw = true;
                             }
                             // Cycle layout (tmux Space)
                             KeyCode::Char(' ') => {
@@ -1224,6 +1222,22 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
 
         if let Some(ref rx) = ipc_rx {
             while let Ok((cmd, resp_tx)) = rx.try_recv() {
+                // RFC #103: extended commands route through the same
+                // channel as legacy `IpcRequest` so handlers run with
+                // full state. Inline-mode (single-process) does not
+                // own a `tab_mgr`/`clients`, so the Ext path here is
+                // a stub that surfaces the missing-context error
+                // honestly. Daemon mode handles them in
+                // `server::ext_handlers`.
+                let cmd = match cmd {
+                    ipc::IpcCommand::Ext(_) => {
+                        let _ = resp_tx.send(ipc::IpcResponse::error(
+                            "ext commands (ls_tree/dump/send_keys) require daemon mode",
+                        ));
+                        continue;
+                    }
+                    ipc::IpcCommand::Legacy(req) => req,
+                };
                 let (response, mut ipc_update) = handle_ipc_command(
                     cmd,
                     &mut layout,
@@ -1318,6 +1332,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                         zoom_label,
                         pane_name,
                         0,
+                        Some(&settings.resolved_palette),
                     )?;
                 }
                 queue!(stdout, terminal::EndSynchronizedUpdate)?;
@@ -1434,6 +1449,7 @@ fn render_frame(
     broadcast: bool,
 ) -> anyhow::Result<()> {
     queue!(stdout, terminal::BeginSynchronizedUpdate)?;
+    let palette = Some(&settings.resolved_palette);
     render::render_panes(
         stdout,
         panes,
@@ -1449,6 +1465,7 @@ fn render_frame(
         full_redraw,
         selection,
         broadcast,
+        palette,
     )?;
     // Mode-aware status bar (render over the default one if we have a mode)
     if settings.show_status_bar && (!mode_label.is_empty() || selection_chars > 0) {
@@ -1464,6 +1481,7 @@ fn render_frame(
             mode_label,
             pane_name,
             selection_chars,
+            palette,
         )?;
     }
     if settings.visible {

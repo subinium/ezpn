@@ -171,6 +171,7 @@ pub(super) fn accept_client(
     }
 
     // Set up the new client
+    let mut new_client_id: Option<u64> = None;
     if let Ok(read_conn) = conn.try_clone() {
         conn.set_read_timeout(None).ok();
         let (msg_tx, msg_rx) = mpsc::channel();
@@ -186,6 +187,7 @@ pub(super) fn accept_client(
             tw: new_w,
             th: new_h,
         });
+        new_client_id = Some(client_id);
     }
 
     // Recompute effective size and resize panes
@@ -203,4 +205,23 @@ pub(super) fn accept_client(
     // Force full redraw for new client
     update.mark_all(layout);
     update.border_dirty = true;
+
+    // Replay Kitty keyboard protocol stack tops to the freshly attached
+    // client (#74). Each pane that has a non-zero active flag set needs the
+    // emulator to be told `CSI > flags u` so subsequent key events are
+    // encoded with the level the child negotiated before this attach.
+    // Wrapped in S_OUTPUT like every other byte stream the client receives.
+    if let Some(client_id) = new_client_id {
+        if let Some(client) = clients.iter_mut().find(|c| c.id == client_id) {
+            for (&pane_id, pane) in panes.iter() {
+                let bits = pane.kitty_kbd_active().bits();
+                if bits == 0 {
+                    continue;
+                }
+                let seq = format!("\x1b[>{bits}u");
+                tracing::debug!(client_id, pane_id, flags = bits, "kitty kbd flag replay");
+                let _ = protocol::write_msg(&mut client.writer, protocol::S_OUTPUT, seq.as_bytes());
+            }
+        }
+    }
 }

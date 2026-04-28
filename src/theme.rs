@@ -233,7 +233,7 @@ fn nearest_grayscale(rgb: RgbColor) -> (u8, u32) {
             best_idx = 232 + i;
         }
     }
-    let level = 8 + 10 * (best_idx - 232) as u8;
+    let level = 8 + 10 * (best_idx - 232);
     let actual = RgbColor::new(level, level, level);
     (best_idx, dist_sq(rgb, actual))
 }

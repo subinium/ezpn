@@ -65,10 +65,19 @@ impl MouseMode {
 pub struct KittyKbdFlags(pub u8);
 
 impl KittyKbdFlags {
+    // reason: kitty keyboard-protocol bit vocabulary — referenced by name
+    // in the kitty CSI dispatcher being wired up in #65; today the parser
+    // works on raw `u8` masks, so the symbolic constants are unread until
+    // the dispatcher rewrite lands.
+    #[allow(dead_code)]
     pub const DISAMBIGUATE: u8 = 0b00001;
+    #[allow(dead_code)]
     pub const REPORT_EVENTS: u8 = 0b00010;
+    #[allow(dead_code)]
     pub const REPORT_ALTERNATES: u8 = 0b00100;
+    #[allow(dead_code)]
     pub const REPORT_ALL_AS_ESCAPES: u8 = 0b01000;
+    #[allow(dead_code)]
     pub const REPORT_ASSOCIATED_TEXT: u8 = 0b10000;
     pub const ALL: u8 = 0b11111;
 
@@ -91,6 +100,9 @@ pub struct KittyKbdStack {
 }
 
 impl KittyKbdStack {
+    // reason: ergonomic constructor used by this module's `#[cfg(test)]`
+    // suite (5 callers); production code uses `KittyKbdStack::default()`.
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self::default()
     }
@@ -136,6 +148,9 @@ impl KittyKbdStack {
         }
     }
 
+    // reason: stack-depth observability; consumed by the kitty CSI
+    // dispatcher diagnostics and by this module's `#[cfg(test)]` suite.
+    #[allow(dead_code)]
     pub fn depth(&self) -> usize {
         self.entries.len()
     }
@@ -212,6 +227,10 @@ pub struct Rgb {
 }
 
 impl Rgb {
+    // reason: const RGB constructor used by this module's `#[cfg(test)]`
+    // suite; production callers populate `Rgb` via struct-literal from the
+    // OSC parser.
+    #[allow(dead_code)]
     pub const fn new(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b }
     }
@@ -304,6 +323,10 @@ impl PaneTerminalState {
     /// Reset state when a pane slot is reused for a freshly spawned shell.
     /// Prevents the state of the previous occupant from leaking into the
     /// new process — see #78 acceptance criteria.
+    // reason: pane-slot recycle hook (#78) — wired into `Pane::respawn`
+    // by the restart-policy follow-up; covered by this module's
+    // `#[cfg(test)]` suite today.
+    #[allow(dead_code)]
     pub fn reset(&mut self) {
         *self = Self::default();
     }

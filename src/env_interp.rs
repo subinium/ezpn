@@ -147,6 +147,9 @@ impl EnvContext {
     }
 
     /// Build a context using an explicit process-env snapshot (for tests).
+    // reason: test-only constructor; consumed by this module's `#[cfg(test)]`
+    // suite which clippy `--bin` does not compile.
+    #[allow(dead_code)]
     pub fn build_with_process(
         dotenv: HashMap<String, String>,
         secrets: HashMap<String, Redacted<String>>,

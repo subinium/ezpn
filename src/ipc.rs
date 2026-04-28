@@ -133,9 +133,32 @@ pub enum IpcRequestExt {
 /// into).
 const EXT_CMD_TAGS: &[&str] = &["ls_tree", "dump", "send_keys"];
 
+/// Unified command envelope routed through the daemon main loop.
+///
+/// Per RFC #103 (v0.13 IPC unification), legacy [`IpcRequest`] and
+/// extended [`IpcRequestExt`] commands share a single
+/// `mpsc` channel into the main loop so that handlers for both
+/// vocabularies can inspect daemon state (`panes`, `tab_mgr`,
+/// `clients`, …) consistently. Prior to this change `IpcRequestExt`
+/// was intercepted inline in [`handle_client`], which had no access
+/// to server state — every variant returned a "not yet wired" error.
+#[derive(Debug)]
+pub enum IpcCommand {
+    /// Legacy commands handled by `bootstrap::handle_ipc_command` and
+    /// the Save/Load interceptors in `server::run`.
+    Legacy(IpcRequest),
+    /// v0.12 extended commands (`ls_tree`, `dump`, `send_keys`).
+    /// Server-side handlers live in `server::ext_handlers` and run
+    /// inside the main loop with full state access.
+    Ext(IpcRequestExt),
+}
+
 /// Default timeout for `send-keys --await-prompt` when the client did
 /// not pass `--timeout` (#81 spec). Mirrored on the CLI side as the
 /// `30s` fallback.
+// reason: consumed by the send-keys --await-prompt server wiring (#81);
+// referenced from this module's `#[cfg(test)]` suite today.
+#[allow(dead_code)]
 pub const SEND_KEYS_DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
 fn default_true() -> bool {
@@ -343,6 +366,9 @@ impl IpcResponse {
 
     /// Wrap a [`SendKeysOutcome`] in an `ok` response (used when
     /// `await_prompt` is set).
+    // reason: consumed by the send-keys --await-prompt server wiring (#81);
+    // covered by this module's `#[cfg(test)]` round-trip test today.
+    #[allow(dead_code)]
     pub fn with_send_keys(outcome: SendKeysOutcome) -> Self {
         Self {
             ok: true,
@@ -383,7 +409,7 @@ pub fn socket_path_for_pid(pid: u32) -> PathBuf {
     PathBuf::from(format!("{}/ezpn-{}.sock", dir, pid))
 }
 
-pub fn start_listener() -> anyhow::Result<mpsc::Receiver<(IpcRequest, ResponseSender)>> {
+pub fn start_listener() -> anyhow::Result<mpsc::Receiver<(IpcCommand, ResponseSender)>> {
     let path = socket_path();
     if let Some(parent) = path.parent() {
         crate::socket_security::harden_socket_dir(parent)?;
@@ -431,7 +457,7 @@ pub fn start_listener() -> anyhow::Result<mpsc::Receiver<(IpcRequest, ResponseSe
                             continue;
                         }
                     }
-                    let tx = tx.clone();
+                    let tx: mpsc::Sender<(IpcCommand, ResponseSender)> = tx.clone();
                     std::thread::spawn(move || handle_client(stream, tx));
                 }
                 Err(_) => break,
@@ -446,7 +472,7 @@ pub fn cleanup() {
     let _ = std::fs::remove_file(socket_path());
 }
 
-fn handle_client(stream: UnixStream, tx: mpsc::Sender<(IpcRequest, ResponseSender)>) {
+fn handle_client(stream: UnixStream, tx: mpsc::Sender<(IpcCommand, ResponseSender)>) {
     let Ok(read_stream) = stream.try_clone() else {
         return;
     };
@@ -463,27 +489,33 @@ fn handle_client(stream: UnixStream, tx: mpsc::Sender<(IpcRequest, ResponseSende
             continue;
         }
 
-        // Peek the `cmd` tag and dispatch to either the legacy
-        // [`IpcRequest`] handler (which routes through the daemon main
-        // loop) or the extended [`IpcRequestExt`] handler (intercepted
-        // here, server-side hook is parent-deferred).
-        let response = if is_ext_command(&line) {
-            handle_ext_request(&line)
+        // Peek the `cmd` tag and parse into either [`IpcRequest`] or
+        // [`IpcRequestExt`]. Both vocabularies route through the same
+        // channel so the daemon main loop dispatches with full state
+        // access (RFC #103, v0.13 IPC unification).
+        let parsed: Result<IpcCommand, String> = if is_ext_command(&line) {
+            serde_json::from_str::<IpcRequestExt>(&line)
+                .map(IpcCommand::Ext)
+                .map_err(|e| format!("invalid request: {}", e))
         } else {
-            match serde_json::from_str::<IpcRequest>(&line) {
-                Ok(request) => {
-                    let (resp_tx, resp_rx) = mpsc::sync_channel(1);
-                    if tx.send((request, resp_tx)).is_err() {
-                        let response = IpcResponse::error("listener unavailable");
-                        let _ = write_response(&mut writer, &response);
-                        break;
-                    }
-                    resp_rx
-                        .recv()
-                        .unwrap_or_else(|_| IpcResponse::error("internal error"))
+            serde_json::from_str::<IpcRequest>(&line)
+                .map(IpcCommand::Legacy)
+                .map_err(|e| format!("invalid request: {}", e))
+        };
+
+        let response = match parsed {
+            Ok(cmd) => {
+                let (resp_tx, resp_rx) = mpsc::sync_channel(1);
+                if tx.send((cmd, resp_tx)).is_err() {
+                    let response = IpcResponse::error("listener unavailable");
+                    let _ = write_response(&mut writer, &response);
+                    break;
                 }
-                Err(error) => IpcResponse::error(format!("invalid request: {}", error)),
+                resp_rx
+                    .recv()
+                    .unwrap_or_else(|_| IpcResponse::error("internal error"))
             }
+            Err(message) => IpcResponse::error(message),
         };
 
         if write_response(&mut writer, &response).is_err() {
@@ -504,48 +536,10 @@ fn is_ext_command(line: &str) -> bool {
     EXT_CMD_TAGS.contains(&cmd)
 }
 
-/// Server-side intercept for [`IpcRequestExt`].
-///
-/// **Parent-deferred**: every variant currently returns an error
-/// message announcing the missing daemon hook. The CLI surface in
-/// `src/bin/ezpn-ctl.rs` exists today so external tooling can pin to
-/// the wire schema; the parent agent will replace each branch with the
-/// real implementation that reads from the live workspace / pane state.
-///
-/// Integration TODOs (see commit-message footers for the matching
-/// issue numbers):
-///
-/// * `LsTree` — walk the active `Workspace` (sessions × tabs × panes),
-///   populate [`SessionTree`] / [`TabInfo`] / [`PaneTreeInfo`].
-/// * `Dump` — call the (parent-supplied) pane snapshot helper that
-///   yields visible-grid + scrollback lines, applying `since` /
-///   `last` / `strip_ansi` and the [`DUMP_MAX_BYTES`] cap. Per #88
-///   acceptance criteria, exceeding the cap MUST return
-///   `IpcResponse::error("dump too large; use --last N")` rather than
-///   truncating silently.
-/// * `SendKeys` — write `text` (+ optional newline) to the pane's
-///   PTY; when `await_prompt` is set, block on the per-pane
-///   `prompt_seen_at: Option<Instant>` channel updated by the OSC
-///   133 D parser (see the API shape in the integration TODO at the
-///   bottom of this file).
-fn handle_ext_request(line: &str) -> IpcResponse {
-    let request = match serde_json::from_str::<IpcRequestExt>(line) {
-        Ok(req) => req,
-        Err(error) => return IpcResponse::error(format!("invalid request: {}", error)),
-    };
-
-    match request {
-        IpcRequestExt::LsTree { .. } => {
-            IpcResponse::error("ls --json: server-side handler not yet wired (issue #89)")
-        }
-        IpcRequestExt::Dump { .. } => {
-            IpcResponse::error("dump: server-side handler not yet wired (issue #88)")
-        }
-        IpcRequestExt::SendKeys { .. } => {
-            IpcResponse::error("send-keys: server-side handler not yet wired (issue #81)")
-        }
-    }
-}
+// `handle_ext_request` was removed in v0.13 (RFC #103). Both
+// [`IpcRequest`] and [`IpcRequestExt`] now flow through
+// [`IpcCommand`] so the daemon main loop handles them with full state
+// access. The Ext dispatcher lives in `crate::server::ext_handlers`.
 
 // ---------------------------------------------------------------------
 // Integration TODO — `send-keys --await-prompt` (issue #81)
@@ -690,15 +684,14 @@ mod tests {
         assert!(!is_ext_command("not json"));
     }
 
-    /// The parent-deferred handler returns a structured error pointing
-    /// at the right issue number.
+    /// `ls_tree` requests parse cleanly into the [`IpcRequestExt`]
+    /// vocabulary — the inline parent-deferred error path was removed
+    /// in v0.13 (RFC #103); `ls_tree` now dispatches through
+    /// [`IpcCommand::Ext`] to a real daemon-side handler.
     #[test]
-    fn ls_tree_handler_is_parent_deferred() {
-        let response = handle_ext_request(r#"{"cmd":"ls_tree"}"#);
-        assert!(!response.ok);
-        let err = response.error.unwrap();
-        assert!(err.contains("#89"), "got: {err}");
-        assert!(err.contains("ls --json"), "got: {err}");
+    fn ls_tree_request_parses_for_main_loop_dispatch() {
+        let req: IpcRequestExt = serde_json::from_str(r#"{"cmd":"ls_tree"}"#).unwrap();
+        assert!(matches!(req, IpcRequestExt::LsTree { session: None }));
     }
 
     /// `IpcResponse` must round-trip with the new optional fields.
@@ -750,14 +743,14 @@ mod tests {
         assert!(is_ext_command(r#"{"cmd":"dump","pane":0}"#));
     }
 
-    /// Parent-deferred handler returns the right issue reference.
+    /// `dump` requests parse cleanly into the [`IpcRequestExt`]
+    /// vocabulary — the inline parent-deferred error path was removed
+    /// in v0.13 (RFC #103). The real handler lives in
+    /// `crate::server::ext_handlers::handle_dump`.
     #[test]
-    fn dump_handler_is_parent_deferred() {
-        let response = handle_ext_request(r#"{"cmd":"dump","pane":0}"#);
-        assert!(!response.ok);
-        let err = response.error.unwrap();
-        assert!(err.contains("#88"), "got: {err}");
-        assert!(err.contains("dump"), "got: {err}");
+    fn dump_request_parses_for_main_loop_dispatch() {
+        let req: IpcRequestExt = serde_json::from_str(r#"{"cmd":"dump","pane":0}"#).unwrap();
+        assert!(matches!(req, IpcRequestExt::Dump { pane: 0, .. }));
     }
 
     /// `DumpPayload` round-trips, including non-ASCII bytes and ANSI
@@ -820,15 +813,18 @@ mod tests {
         assert!(is_ext_command(r#"{"cmd":"send_keys","pane":0,"text":"x"}"#));
     }
 
-    /// Parent-deferred handler returns the right issue reference.
+    /// `send_keys` parses cleanly into the [`IpcRequestExt`]
+    /// vocabulary. The actual daemon-side hook still returns a
+    /// "not yet wired" error (issue #81 is out of scope for the
+    /// v0.13 dump/ls wiring) — but the dispatch path runs through
+    /// [`IpcCommand::Ext`] now.
     #[test]
-    fn send_keys_handler_is_parent_deferred() {
-        let response =
-            handle_ext_request(r#"{"cmd":"send_keys","pane":0,"text":"echo","await_prompt":true}"#);
-        assert!(!response.ok);
-        let err = response.error.unwrap();
-        assert!(err.contains("#81"), "got: {err}");
-        assert!(err.contains("send-keys"), "got: {err}");
+    fn send_keys_request_parses_for_main_loop_dispatch() {
+        let req: IpcRequestExt = serde_json::from_str(
+            r#"{"cmd":"send_keys","pane":0,"text":"echo","await_prompt":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(req, IpcRequestExt::SendKeys { pane: 0, .. }));
     }
 
     /// `SendKeysOutcome` round-trips and the snake_case status enum
