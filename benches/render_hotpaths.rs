@@ -8,24 +8,24 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 // Sibling-module includes so that `use crate::*` paths inside the
 // bin sources resolve to the same modules under the bench harness.
 // Order matters: leaf-most first so dependents see siblings.
-#[path = "../src/hooks.rs"]
-mod hooks;
-#[path = "../src/keymap.rs"]
-mod keymap;
-#[path = "../src/terminal_state.rs"]
-mod terminal_state;
-#[path = "../src/theme.rs"]
-mod theme;
 #[path = "../src/config.rs"]
 mod config;
 #[path = "../src/fuzzy.rs"]
 mod fuzzy;
+#[path = "../src/hooks.rs"]
+mod hooks;
+#[path = "../src/keymap.rs"]
+mod keymap;
 #[path = "../src/layout.rs"]
 mod layout;
 #[path = "../src/pane.rs"]
 mod pane;
 #[path = "../src/render.rs"]
 mod render;
+#[path = "../src/terminal_state.rs"]
+mod terminal_state;
+#[path = "../src/theme.rs"]
+mod theme;
 
 use layout::{Layout, Rect};
 use pane::{Pane, PaneLaunch};
