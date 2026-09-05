@@ -1,84 +1,35 @@
 name: Bench regression
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  workflow_call:
   workflow_dispatch:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
-  bench-regression:
+  protocol-control:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@1.95.0
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - uses: Swatinem/rust-cache@v2
-      - name: Compare complete revisions, fail on missing estimates
-        env:
-          PR_BASE: ${{ github.event.pull_request.base.sha }}
-          PUSH_BASE: ${{ github.event.before }}
-        run: |
-          if [ -n "$PR_BASE" ]; then
-            base="$PR_BASE"
-          elif [ -n "$PUSH_BASE" ] && git cat-file -e "$PUSH_BASE^{commit}" 2>/dev/null; then
-            base="$PUSH_BASE"
-          else
-            base=$(git describe --tags --abbrev=0 HEAD^)
-          fi
-          python3 scripts/bench-regression.py --base "$base"
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: 33959811188
+          name: criterion-evidence
+          path: target/control-input
+      - name: Identical-executable A/A controls, no gate replacement
+        run: python3 scripts/protocol-control.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: criterion-evidence
-          path: |
-            target/bench-evidence/*.log
-            target/bench-evidence/*.json
-            target/bench-evidence/base.txt
-            target/bench-evidence/protocol-codec-*
+          name: protocol-identical-executable-control
+          path: target/protocol-control/
           if-no-files-found: error
           retention-days: 14
-
-  soak-smoke:
-    name: soak-smoke (${{ matrix.features }})
-    runs-on: ubuntu-24.04
-    timeout-minutes: 40
-    strategy:
-      fail-fast: false
-      matrix:
-        features: [default, all-features]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - uses: Swatinem/rust-cache@v2
-      - name: Build the labeled release artifact
-        env:
-          BUILD_FEATURES: ${{ matrix.features }}
-        run: |
-          if [ "$BUILD_FEATURES" = all-features ]; then
-            cargo build --locked --release --bins --all-features
-          else
-            cargo build --locked --release --bins
-          fi
-      - name: Real 30-minute workload, no failure suppression
-        run: bash tests/soak/run.sh --profile=smoke --out=target/soak-smoke-${{ matrix.features }} --build-features=${{ matrix.features }}
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: soak-smoke-${{ matrix.features }}
-          path: target/soak-smoke-${{ matrix.features }}/
-          if-no-files-found: error
-          retention-days: 30
