@@ -55,6 +55,9 @@ Entries are written in **functional-only style**: every bullet describes an obse
   Border caches use a bounded dense representation for normal terminal sizes.
 - Frame decoding avoids redundant stack copies while bounding advertised-length
   allocation. The optional ANSI diff path falls back on unsupported frames.
+- Payloads up to 8 KiB use the standard library's length-limited Vec fill;
+  short reads and frame boundaries remain checked, with medium and large
+  allocation limits unchanged.
 - Real PTY, SSH, coverage, fuzz, soak and benchmark checks preserve failure
   statuses. Proxy benchmarks are distinguished from runtime memory evidence.
 - README and translations remove unverified tmux/Zellij speed comparisons and

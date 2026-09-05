@@ -234,8 +234,22 @@ pub fn read_msg_limited(r: &mut impl Read, limit: usize) -> io::Result<(u8, Vec<
             format!("message too large: {} bytes", len),
         ));
     }
-    // A small advertised frame reserves at most one bounded control-size
-    // buffer. Large advertised frames still need payload progress to grow.
+    // Take preserves the next frame while allowing Read's standard Vec-fill
+    // specialization for small payloads. Generic readers still get initialized
+    // buffers from the standard library.
+    if len <= READ_WINDOW {
+        let mut payload = Vec::with_capacity(len);
+        r.take(len as u64).read_to_end(&mut payload)?;
+        if payload.len() != len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "incomplete frame payload",
+            ));
+        }
+        return Ok((header[0], payload));
+    }
+    // Medium frames use one bounded read buffer; large advertised frames
+    // still need payload progress before additional allocation.
     if len <= GROWTH_WINDOW {
         let mut payload = vec![0u8; len];
         r.read_exact(&mut payload)?;
@@ -642,6 +656,75 @@ mod tests {
             io::ErrorKind::UnexpectedEof
         );
         assert_eq!(reader.requested, GROWTH_WINDOW);
+    }
+
+    #[test]
+    fn small_vec_fill_retries_interrupts_and_preserves_frame_boundaries() {
+        struct Fragmented {
+            wire: std::io::Cursor<Vec<u8>>,
+            chunk: usize,
+            interrupt: bool,
+        }
+        impl Read for Fragmented {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if std::mem::replace(&mut self.interrupt, false) {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                self.interrupt = true;
+                let count = buffer.len().min(self.chunk);
+                self.wire.read(&mut buffer[..count])
+            }
+        }
+        for size in [0, 1, 257, 4096, READ_WINDOW] {
+            for chunk in [1, 7, 1024] {
+                let expected: Vec<u8> = (0..size).map(|i| i as u8).collect();
+                let mut wire = Vec::new();
+                write_msg(&mut wire, S_OUTPUT, &expected).unwrap();
+                write_msg(&mut wire, S_EXIT, &[]).unwrap();
+                let mut reader = Fragmented {
+                    wire: std::io::Cursor::new(wire),
+                    chunk,
+                    interrupt: true,
+                };
+                let (tag, payload) = read_msg(&mut reader).unwrap();
+                assert_eq!(tag, S_OUTPUT);
+                assert_eq!(payload, expected);
+                assert!(payload.capacity() <= READ_WINDOW);
+                assert_eq!(reader.wire.position(), (size + 5) as u64);
+                assert_eq!(read_msg(&mut reader).unwrap(), (S_EXIT, Vec::new()));
+            }
+        }
+    }
+
+    #[test]
+    fn small_vec_fill_exposes_only_initialized_bounded_storage() {
+        struct HeaderOnly {
+            header: std::io::Cursor<[u8; 5]>,
+            requested: usize,
+        }
+        impl Read for HeaderOnly {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if self.header.position() < 5 {
+                    return self.header.read(buffer);
+                }
+                self.requested = buffer.len();
+                assert!(buffer.len() <= READ_WINDOW);
+                assert!(buffer.iter().all(|byte| *byte == 0));
+                Ok(0)
+            }
+        }
+        for size in [1, 4096, READ_WINDOW] {
+            let bytes = (size as u32).to_be_bytes();
+            let mut reader = HeaderOnly {
+                header: std::io::Cursor::new([S_OUTPUT, bytes[0], bytes[1], bytes[2], bytes[3]]),
+                requested: 0,
+            };
+            assert_eq!(
+                read_msg(&mut reader).unwrap_err().kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+            assert!(reader.requested > 0 && reader.requested <= size);
+        }
     }
 
     #[test]
