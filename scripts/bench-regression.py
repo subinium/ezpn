@@ -13,6 +13,100 @@ import tempfile
 BENCHES = ["render_hotpaths", "protocol_codec", "snapshot_io", "rss_proxy"]
 
 
+def protocol_compiler_artifact(log_path, target_dir):
+    """Select only the benchmark executable reported by this Cargo invocation."""
+    target_dir = target_dir.resolve(strict=True)
+    artifacts = {}
+    with log_path.open(errors="replace") as log:
+        for line in log:
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(message, dict) or message.get("reason") != "compiler-artifact":
+                continue
+            target = message.get("target")
+            if not isinstance(target, dict) or target.get("name") != "protocol_codec" or target.get("kind") != ["bench"]:
+                continue
+            executable = message.get("executable")
+            if executable is None:
+                continue
+            if not isinstance(executable, str) or not executable or not Path(executable).is_absolute():
+                raise ValueError("protocol_codec executable must be an absolute Cargo-reported path")
+            path = Path(executable).resolve(strict=True)
+            if not path.is_relative_to(target_dir) or not path.is_file() or not os.access(path, os.X_OK):
+                raise ValueError(f"invalid protocol_codec executable outside the dedicated target or not executable: {path}")
+            artifacts[path] = message
+    if len(artifacts) != 1:
+        raise ValueError(f"expected exactly one Cargo-reported protocol_codec executable, found {len(artifacts)}")
+    return next(iter(artifacts.items()))
+
+
+def preserve_protocol_executable(log_path, target_dir, out, label, command, failure=None):
+    cargo_options = command[:command.index("--")] if "--" in command else command
+    unmeasured = "--no-run" in cargo_options
+    if label not in ["baseline", "candidate-1", "candidate-2", "candidate-3"] and not (label == "smoke-unmeasured" and unmeasured):
+        raise ValueError(f"unexpected benchmark label: {label}")
+    executable, cargo_artifact = protocol_compiler_artifact(log_path, target_dir)
+    digest = hashlib.sha256(executable.read_bytes()).hexdigest()
+
+    def copy_with_metadata(artifact_name):
+        destination = out / artifact_name
+        if destination.is_symlink():
+            raise ValueError(f"refusing symlink artifact destination: {destination}")
+        shutil.copy2(executable, destination)
+        if hashlib.sha256(destination.read_bytes()).hexdigest() != digest:
+            raise ValueError("protocol_codec executable changed while copying")
+        metadata = {
+            "label": label,
+            "artifact": destination.name,
+            "source_executable": str(executable),
+            "dedicated_target": str(target_dir.resolve()),
+            "sha256": digest,
+            "size_bytes": destination.stat().st_size,
+            "cargo_log": log_path.name,
+            "command": list(map(str, command)),
+            "execution_kind": "unmeasured-no-run" if unmeasured else "benchmark",
+            "cargo_exit_code": getattr(failure, "returncode", None) if failure else 0,
+            "timed_out": isinstance(failure, subprocess.TimeoutExpired),
+            "package_id": cargo_artifact.get("package_id"),
+            "target": cargo_artifact["target"],
+            "profile": cargo_artifact.get("profile"),
+            "features": cargo_artifact.get("features"),
+            "fresh": cargo_artifact.get("fresh"),
+        }
+        (out / f"{artifact_name}.json").write_text(json.dumps(metadata, indent=2) + "\n")
+
+    # Preserve each candidate run even if a future Cargo invocation relinks it.
+    copy_with_metadata(f"protocol-codec-{label}")
+    if label == "candidate-1":
+        copy_with_metadata("protocol-codec-candidate")
+
+
+def run_benchmark(command, *, source, env, target, log_path, out, label, capture_protocol):
+    failure = None
+    try:
+        with log_path.open("w") as log:
+            subprocess.run(command, cwd=source, env=env, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=600)
+    except (subprocess.SubprocessError, OSError) as error:
+        failure = error
+    if capture_protocol:
+        try:
+            preserve_protocol_executable(log_path, target, out, label, command, failure)
+        except (ValueError, OSError) as error:
+            try:
+                (out / f"protocol-codec-{label}-capture-error.json").write_text(json.dumps({
+                    "label": label, "error": str(error), "cargo_log": log_path.name,
+                }, indent=2) + "\n")
+            except OSError as report_error:
+                print(f"could not record protocol artifact error: {report_error}", file=sys.stderr)
+            if failure is None:
+                raise
+            print(f"protocol artifact capture also failed: {error}", file=sys.stderr)
+    if failure is not None:
+        raise failure
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", required=True)
@@ -38,8 +132,11 @@ def main():
             env[key] = str(path)
         env.pop("EZPN", None)
         for name in BENCHES:
-            with (out / f"{label}-{name}.log").open("w") as log:
-                subprocess.run(["cargo", "bench", "--locked", "--all-features", "--bench", name, "--", *arguments], cwd=source, env=env, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=600)
+            command = ["cargo", "bench", "--locked", "--all-features", "--bench", name,
+                       "--message-format=json-render-diagnostics", "--", *arguments]
+            run_benchmark(command, source=source, env=env, target=target,
+                          log_path=out / f"{label}-{name}.log", out=out,
+                          label=label, capture_protocol=name == "protocol_codec")
 
     # Never check out files over the developer's worktree. The baseline needs
     # its src/ as well as benches/ and lockfile, otherwise it is a self-compare.

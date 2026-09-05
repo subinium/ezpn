@@ -56,6 +56,10 @@ impl Terminal {
         self.writer.write_all(text.as_bytes()).unwrap();
         self.writer.flush().unwrap();
     }
+    fn expect_text(&self, text: &str) {
+        let size = self.master.get_size().unwrap();
+        wait_for_visible_text(&self.output, size.cols, size.rows, text);
+    }
     fn prefix(&mut self, key: char) {
         self.write(&format!("\x02{key}"));
     }
@@ -127,6 +131,34 @@ fn file_text(env: &TestEnv, name: &str, output: &Capture) -> String {
     .unwrap_or_else(|error| panic!("{error}: {}", captured(output)))
 }
 
+fn visible_text(output: &Capture, cols: u16, rows: u16) -> String {
+    let bytes = output.lock().unwrap().clone();
+    let mut screen = vt100::Parser::new(rows.max(1), cols.max(1), 0);
+    screen.process(&bytes);
+    screen.screen().contents()
+}
+
+fn wait_for_visible_text(output: &Capture, cols: u16, rows: u16, needle: &str) {
+    // ANSI deltas may reuse unchanged cells between parts of a word. A raw
+    // byte substring is not an oracle for the terminal's displayed text.
+    wait_for(&format!("visible text {needle:?}"), DEFAULT_TIMEOUT, || {
+        visible_text(output, cols, rows)
+            .contains(needle)
+            .then_some(())
+    })
+    .unwrap_or_else(|error| panic!("{error}; screen: {:?}", visible_text(output, cols, rows)));
+}
+
+#[test]
+fn visible_text_oracle_reconstructs_words_across_cursor_deltas() {
+    let output = Arc::new(Mutex::new(
+        b"\x1b[1;4Hr\x1b[1;7Ht\x1b[Hque\x1b[Cy-\x1b[Carget".to_vec(),
+    ));
+    assert!(!captured(&output).contains("query-target"));
+    assert_eq!(visible_text(&output, 80, 24), "query-target");
+    wait_for_visible_text(&output, 80, 24, "query-target");
+}
+
 #[test]
 fn pty_detach_reattach_preserves_shell_and_restores_terminal() {
     for term in [
@@ -139,7 +171,7 @@ fn pty_detach_reattach_preserves_shell_and_restores_terminal() {
         let mut daemon = spawn_daemon(&env, "pty");
         let mut first = Terminal::attach(&env, "pty", "--shared", 100, 32, term);
         first.write("RETAINED=live-state; printf 'visible-%s\\n' ready\r");
-        wait_for_output(&first.output, "visible-ready", DEFAULT_TIMEOUT).unwrap();
+        first.expect_text("visible-ready");
         let before = first.probe(&env, "before");
         assert!(before.ends_with(":live-state\n"));
         first.prefix('d');
@@ -207,8 +239,8 @@ fn pty_shared_readonly_resize_and_prefix_detach_are_client_local() {
         "prefix-d detached another shared client"
     );
     second.write("printf 'still-%s\\n' writable\r");
-    wait_for_output(&second.output, "still-writable", DEFAULT_TIMEOUT).unwrap();
-    wait_for_output(&readonly.output, "still-writable", DEFAULT_TIMEOUT).unwrap();
+    second.expect_text("still-writable");
+    readonly.expect_text("still-writable");
     assert_eq!(second.size(&env, "remaining-writer-size"), shared);
     second.resize(140, 48);
     wait_for("writer resize received by daemon", DEFAULT_TIMEOUT, || {
@@ -296,7 +328,7 @@ fn readonly_kill_frame_cannot_terminate_daemon() {
     let mut writer = attach_with_mode(&daemon, 80, 24, "shared");
     write_msg(&mut reader.stream, 0x04, &[]).unwrap();
     type_text(&mut writer, "printf 'kill-ignored-%s\\n' alive\n").unwrap();
-    wait_for_output(&reader.output(), "kill-ignored-alive", DEFAULT_TIMEOUT).unwrap();
+    wait_for_visible_text(&reader.output(), 80, 24, "kill-ignored-alive");
     daemon.assert_alive();
 }
 
@@ -334,7 +366,7 @@ fn inactive_tab_output_larger_than_pty_queue_completes() {
     })
     .unwrap();
     client.write("printf 'returned-%s\\n' alive\r");
-    wait_for_output(&client.output, "returned-alive", DEFAULT_TIMEOUT).unwrap();
+    client.expect_text("returned-alive");
 }
 
 #[test]
@@ -483,12 +515,7 @@ fn rename_alias_cleanup_preserves_reused_original_session_name() {
         "printf 'replacement-%s\\n' ready\n",
     )
     .unwrap();
-    wait_for_output(
-        &replacement_client.output(),
-        "replacement-ready",
-        DEFAULT_TIMEOUT,
-    )
-    .unwrap();
+    wait_for_visible_text(&replacement_client.output(), 80, 24, "replacement-ready");
     let replacement_metadata = std::fs::symlink_metadata(&original_path).unwrap();
     let replacement_inode = (replacement_metadata.dev(), replacement_metadata.ino());
     assert_ne!(replacement_inode, original_inode);
@@ -512,7 +539,7 @@ fn rename_alias_cleanup_preserves_reused_original_session_name() {
     // must still accept fresh clients and route commands to the live shell.
     let mut reattached = attach_with_mode(&replacement, 80, 24, "shared");
     type_text(&mut reattached, "printf 'surviving-%s\\n' A\n").unwrap();
-    wait_for_output(&reattached.output(), "surviving-A", DEFAULT_TIMEOUT).unwrap();
+    wait_for_visible_text(&reattached.output(), 80, 24, "surviving-A");
     replacement.assert_alive();
     let sessions = ls(&env);
     assert!(
@@ -596,7 +623,7 @@ fn integration_review_copy_search_enter_accepts_query_before_yank() {
     let mut daemon = spawn_daemon(&env, "search-enter");
     let mut terminal = Terminal::attach(&env, "search-enter", "--shared", 80, 24, "xterm-256color");
     terminal.write("printf '\\033[2J\\033[H'; printf 'query-%s\\n' target\r");
-    wait_for_output(&terminal.output, "query-target", DEFAULT_TIMEOUT).unwrap();
+    terminal.expect_text("query-target");
     terminal.prefix('[');
     terminal.write("/query-target\rVy");
     let copied = wait_for("search result copied after Enter", DEFAULT_TIMEOUT, || {
@@ -607,7 +634,7 @@ fn integration_review_copy_search_enter_accepts_query_before_yank() {
     .unwrap_or_else(|error| panic!("{error}: {}", captured(&terminal.output)));
     assert_eq!(copied.trim_end_matches('\n'), "query-target");
     terminal.write("printf 'search-finished-%s\\n' ready\r");
-    wait_for_output(&terminal.output, "search-finished-ready", DEFAULT_TIMEOUT).unwrap();
+    terminal.expect_text("search-finished-ready");
     daemon.assert_alive();
 }
 

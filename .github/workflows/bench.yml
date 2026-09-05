@@ -45,6 +45,7 @@ jobs:
             target/bench-evidence/*.log
             target/bench-evidence/*.json
             target/bench-evidence/base.txt
+            target/bench-evidence/protocol-codec-*
           if-no-files-found: error
           retention-days: 14
 
