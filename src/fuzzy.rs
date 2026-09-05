@@ -26,6 +26,7 @@ use nucleo_matcher::{
     Matcher,
 };
 use serde::{Deserialize, Serialize};
+use std::io::{Read, Write};
 use std::path::PathBuf;
 
 /// Source of an entry in the unified candidate list.
@@ -171,6 +172,8 @@ impl FuzzyIndex {
 pub const HISTORY_CAP: usize = 200;
 /// How many recent entries to surface in the palette by default.
 pub const HISTORY_VIEW_CAP: usize = 20;
+const HISTORY_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const HISTORY_MAX_COMMAND: usize = 4096;
 
 /// Persisted history file shape.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -186,7 +189,7 @@ impl History {
     /// history); existing duplicates further back are collapsed up.
     pub fn push(&mut self, command: impl Into<String>) {
         let cmd = command.into();
-        if cmd.trim().is_empty() {
+        if cmd.trim().is_empty() || cmd.len() > HISTORY_MAX_COMMAND {
             return;
         }
         // Remove existing copies (collapses duplicates anywhere in the list).
@@ -209,12 +212,24 @@ impl History {
     }
 
     pub fn load(path: &std::path::Path) -> Self {
-        let raw = match std::fs::read_to_string(path) {
-            Ok(s) => s,
-            // Missing or unreadable file is a normal first-run condition.
-            Err(_) => return Self::default(),
+        let Ok(file) = std::fs::File::open(path) else {
+            return Self::default();
         };
-        toml::from_str(&raw).unwrap_or_default()
+        let mut raw = String::new();
+        if file
+            .take(HISTORY_MAX_BYTES + 1)
+            .read_to_string(&mut raw)
+            .is_err()
+            || raw.len() as u64 > HISTORY_MAX_BYTES
+        {
+            return Self::default();
+        }
+        let decoded: Self = toml::from_str(&raw).unwrap_or_default();
+        let mut history = Self::default();
+        for command in decoded.commands.into_iter().take(HISTORY_CAP).rev() {
+            history.push(command);
+        }
+        history
     }
 
     pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
@@ -223,7 +238,31 @@ impl History {
         }
         let body = toml::to_string(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(path, body)
+        static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if body.len() as u64 > HISTORY_MAX_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "history exceeds size limit",
+            ));
+        }
+        let seq = NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temp = path.with_extension(format!("tmp-{}-{seq}", std::process::id()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp)?;
+        let result = file
+            .write_all(body.as_bytes())
+            .and_then(|_| file.sync_all())
+            .and_then(|_| std::fs::rename(&temp, path));
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        result
     }
 }
 
@@ -248,6 +287,28 @@ pub fn history_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reliability_history_limits_loaded_bytes_and_private_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.toml");
+        let mut history = History::default();
+        history.push("x".repeat(HISTORY_MAX_COMMAND + 1));
+        assert!(history.commands.is_empty());
+        history.push("display-message ready");
+        history.save(&path).unwrap();
+        assert_eq!(History::load(&path).commands, history.commands);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::write(&path, vec![b' '; HISTORY_MAX_BYTES as usize + 1]).unwrap();
+        assert!(History::load(&path).commands.is_empty());
+    }
 
     fn cmd(s: &str) -> Entry {
         Entry::new(EntryKind::Command, s)

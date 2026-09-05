@@ -150,9 +150,7 @@ impl BufferStore {
         })?;
         let mut opts = OpenOptions::new();
         opts.write(true).create(true);
-        if truncate {
-            opts.truncate(true);
-        } else {
+        if !truncate {
             opts.create_new(true);
         }
         #[cfg(unix)]
@@ -160,11 +158,33 @@ impl BufferStore {
             use std::os::unix::fs::OpenOptionsExt;
             // Mode 0600 — never world- or group-readable. Matches the
             // socket permissions hardened in #57.
-            opts.mode(0o600);
+            opts.mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         }
         let mut f = opts.open(path).map_err(|e| SaveError::Io {
             path: path.to_path_buf(),
             source: e,
+        })?;
+        let prepare = || -> std::io::Result<()> {
+            if !f.metadata()?.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "buffer destination must be a regular file",
+                ));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            if truncate {
+                f.set_len(0)?;
+            }
+            Ok(())
+        };
+        prepare().map_err(|source| SaveError::Io {
+            path: path.to_path_buf(),
+            source,
         })?;
         f.write_all(entry.text.as_bytes())
             .map_err(|e| SaveError::Io {
@@ -175,10 +195,16 @@ impl BufferStore {
     }
 
     fn next_seq(&mut self) -> u64 {
+        if self.next_seq == u64::MAX {
+            let mut entries: Vec<_> = self.buffers.values_mut().collect();
+            entries.sort_unstable_by_key(|entry| entry.created_at);
+            for (seq, entry) in entries.iter_mut().enumerate() {
+                entry.created_at = seq as u64;
+            }
+            self.next_seq = entries.len() as u64;
+        }
         let seq = self.next_seq;
-        // Defensive wrap — in practice we never hit u64::MAX yanks but
-        // we still keep the counter well-defined.
-        self.next_seq = self.next_seq.wrapping_add(1);
+        self.next_seq += 1;
         seq
     }
 
@@ -248,6 +274,38 @@ impl std::error::Error for SaveError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn reliability_save_existing_file_is_private_and_rejects_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut store = BufferStore::new();
+        store.set("", "private").unwrap();
+        store.save("", &path, true).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let link = dir.path().join("link");
+        symlink(&path, &link).unwrap();
+        assert!(store.save("", &link, true).is_err());
+    }
+
+    #[test]
+    fn reliability_sequence_rollover_keeps_oldest_first_eviction() {
+        let mut store = BufferStore::new();
+        store.set("old", "a").unwrap();
+        store.set("newer", "b").unwrap();
+        store.next_seq = u64::MAX;
+        store.set("newest", "c").unwrap();
+        store.evict_oldest();
+        assert!(store.get("old").is_none());
+        assert!(store.get("newer").unwrap().created_at < store.get("newest").unwrap().created_at);
+    }
 
     #[test]
     fn set_and_get_default_buffer() {

@@ -10,6 +10,8 @@
 //! `ResolvedPalette` field today and stay hardcoded — v0.14 may extend the
 //! theme schema with `hint_fg`, `close_fg`, `drag_indicator`, and `muted_fg`.
 
+use crate::vt100;
+
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
@@ -17,17 +19,84 @@ use unicode_width::UnicodeWidthStr;
 
 use crossterm::{
     cursor, queue,
-    style::{
-        Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
-    },
+    style::{Attribute, Color, Print, ResetColor, SetAttribute},
     terminal::{self, ClearType},
 };
 use serde::{Deserialize, Serialize};
 
+use crate::copy_mode::CopyModeState;
 use crate::fuzzy;
 use crate::layout::{Layout, Rect};
 use crate::pane::Pane;
 use crate::theme::{Resolved, ResolvedPalette};
+
+/// UI colour commands using actual ANSI-16 SGR for palette indices 0..15.
+/// Crossterm's built-in named colours otherwise also emit 256-colour SGR.
+pub struct AnsiForeground(pub Color);
+pub struct AnsiBackground(pub Color);
+
+fn write_ui_color(
+    out: &mut impl std::fmt::Write,
+    color: Color,
+    foreground: bool,
+) -> std::fmt::Result {
+    if crossterm::style::Colored::ansi_color_disabled_memoized() {
+        return Ok(());
+    }
+    let index = match color {
+        Color::Black => Some(0),
+        Color::DarkRed => Some(1),
+        Color::DarkGreen => Some(2),
+        Color::DarkYellow => Some(3),
+        Color::DarkBlue => Some(4),
+        Color::DarkMagenta => Some(5),
+        Color::DarkCyan => Some(6),
+        Color::Grey => Some(7),
+        Color::DarkGrey => Some(8),
+        Color::Red => Some(9),
+        Color::Green => Some(10),
+        Color::Yellow => Some(11),
+        Color::Blue => Some(12),
+        Color::Magenta => Some(13),
+        Color::Cyan => Some(14),
+        Color::White => Some(15),
+        Color::AnsiValue(i) if i < 16 => Some(i),
+        _ => None,
+    };
+    if let Some(index) = index {
+        let base = if foreground { 30 } else { 40 };
+        return write!(
+            out,
+            "\x1b[{}m",
+            base + u16::from(index % 8) + if index >= 8 { 60 } else { 0 }
+        );
+    }
+    if foreground {
+        crossterm::Command::write_ansi(&crossterm::style::SetForegroundColor(color), out)
+    } else {
+        crossterm::Command::write_ansi(&crossterm::style::SetBackgroundColor(color), out)
+    }
+}
+
+impl crossterm::Command for AnsiForeground {
+    fn write_ansi(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
+        write_ui_color(out, self.0, true)
+    }
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> std::io::Result<()> {
+        crossterm::Command::execute_winapi(&crossterm::style::SetForegroundColor(self.0))
+    }
+}
+
+impl crossterm::Command for AnsiBackground {
+    fn write_ansi(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
+        write_ui_color(out, self.0, false)
+    }
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> std::io::Result<()> {
+        crossterm::Command::execute_winapi(&crossterm::style::SetBackgroundColor(self.0))
+    }
+}
 
 // ─── Palette helpers (#85) ─────────────────────────────────
 
@@ -254,37 +323,74 @@ impl BorderCache {
 // ─── Border Map ────────────────────────────────────────────
 
 struct BorderMap {
-    cells: HashMap<(u16, u16), [bool; 4]>,
+    width: u16,
+    height: u16,
+    dense: Vec<u8>,
+    sparse: HashMap<(u16, u16), u8>,
 }
 
 impl BorderMap {
-    fn new() -> Self {
+    fn new(width: u16, height: u16) -> Self {
+        let size = usize::from(width) * usize::from(height);
         Self {
-            cells: HashMap::new(),
+            width,
+            height,
+            // Runtime dimensions fit this budget. Keep sparse fallback for
+            // defensive callers with extreme u16 rectangles.
+            dense: if size <= 512 * 1024 {
+                vec![0; size]
+            } else {
+                Vec::new()
+            },
+            sparse: HashMap::new(),
         }
+    }
+
+    fn mark(&mut self, x: u16, y: u16, bits: u8) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        if self.dense.is_empty() {
+            *self.sparse.entry((x, y)).or_default() |= bits | 16;
+        } else {
+            self.dense[usize::from(y) * usize::from(self.width) + usize::from(x)] |= bits | 16;
+        }
+    }
+
+    fn into_cells(self) -> Vec<BorderCell> {
+        let cell = |x, y, bits: u8| BorderCell {
+            x,
+            y,
+            flags: [1, 2, 4, 8].map(|flag| bits & flag != 0),
+        };
+        if !self.dense.is_empty() {
+            let width = usize::from(self.width);
+            return self
+                .dense
+                .into_iter()
+                .enumerate()
+                .filter(|(_, bits)| *bits != 0)
+                .map(|(i, bits)| cell((i % width) as u16, (i / width) as u16, bits))
+                .collect();
+        }
+        let mut cells: Vec<_> = self
+            .sparse
+            .into_iter()
+            .map(|((x, y), bits)| cell(x, y, bits))
+            .collect();
+        cells.sort_unstable_by_key(|cell| (cell.y, cell.x));
+        cells
     }
 
     fn add_h_line(&mut self, x1: u16, x2: u16, y: u16) {
         for x in x1..=x2 {
-            let e = self.cells.entry((x, y)).or_insert([false; 4]);
-            if x > x1 {
-                e[2] = true;
-            }
-            if x < x2 {
-                e[3] = true;
-            }
+            self.mark(x, y, (u8::from(x > x1) * 4) | (u8::from(x < x2) * 8));
         }
     }
 
     fn add_v_line(&mut self, x: u16, y1: u16, y2: u16) {
         for y in y1..=y2 {
-            let e = self.cells.entry((x, y)).or_insert([false; 4]);
-            if y > y1 {
-                e[0] = true;
-            }
-            if y < y2 {
-                e[1] = true;
-            }
+            self.mark(x, y, u8::from(y > y1) | (u8::from(y < y2) * 2));
         }
     }
 }
@@ -308,19 +414,17 @@ fn border_char<'a>(flags: &[bool; 4], ch: &'a BorderChars) -> &'a str {
     }
 }
 
-pub fn build_border_cache(
-    layout: &Layout,
-    show_status_bar: bool,
-    term_w: u16,
-    term_h: u16,
-) -> BorderCache {
-    build_border_cache_with_style(
-        layout,
-        show_status_bar,
-        term_w,
-        term_h,
-        BorderStyle::Rounded,
-    )
+/// Pane content inside the terminal area supplied by the caller.
+/// Subtract a visible tab-bar row from `term_h` before calling this helper.
+pub fn content_area(term_w: u16, term_h: u16, show_status_bar: bool, style: BorderStyle) -> Rect {
+    let border_h = term_h.saturating_sub(u16::from(show_status_bar));
+    let side = u16::from(!style.is_none());
+    Rect {
+        x: side.min(term_w),
+        y: 1.min(border_h),
+        w: term_w.saturating_sub(side * 2),
+        h: border_h.saturating_sub(1 + side),
+    }
 }
 
 pub fn build_border_cache_with_style(
@@ -340,28 +444,17 @@ pub fn build_border_cache_with_style(
         w: term_w,
         h: border_h,
     };
-    // Borderless: full width, y=1 for title strip row
-    let inner = if borderless {
-        Rect {
-            x: 0,
-            y: 1,
-            w: term_w,
-            h: border_h.saturating_sub(1),
-        }
-    } else {
-        Rect {
-            x: 1,
-            y: 1,
-            w: term_w.saturating_sub(2),
-            h: border_h.saturating_sub(2),
-        }
-    };
+    let inner = content_area(term_w, term_h, show_status_bar, style);
 
     let pane_order = layout.pane_ids();
     let pane_rects = layout.pane_rects(&inner);
     let separators = layout.separators(&inner, &outer);
 
-    let mut bmap = BorderMap::new();
+    let mut bmap = if borderless && separators.is_empty() {
+        BorderMap::new(0, 0)
+    } else {
+        BorderMap::new(term_w, border_h)
+    };
     // Only draw outer frame for bordered styles
     if !borderless && outer.w > 0 && outer.h > 0 {
         bmap.add_h_line(outer.x, outer.x + outer.w - 1, outer.y);
@@ -378,11 +471,7 @@ pub fn build_border_cache_with_style(
         }
     }
 
-    let cells = bmap
-        .cells
-        .into_iter()
-        .map(|((x, y), flags)| BorderCell { x, y, flags })
-        .collect();
+    let cells = bmap.into_cells();
 
     BorderCache {
         inner,
@@ -416,7 +505,15 @@ pub fn render_panes(
     broadcast: bool,
     palette: Option<&ResolvedPalette>,
 ) -> anyhow::Result<()> {
-    queue!(stdout, cursor::Hide)?;
+    if term_w == 0 || term_h == 0 {
+        return Ok(());
+    }
+    queue!(
+        stdout,
+        cursor::Hide,
+        SetAttribute(Attribute::Reset),
+        ResetColor
+    )?;
 
     if full_redraw {
         queue!(stdout, terminal::Clear(ClearType::All))?;
@@ -427,13 +524,13 @@ pub fn render_panes(
 
     // Terminal too small
     if inner.w == 0 || inner.h == 0 {
-        let msg = "Terminal too small";
+        let msg = truncate_label("Terminal too small", term_w as usize);
         let mx = term_w.saturating_sub(msg.len() as u16) / 2;
         let my = term_h / 2;
         queue!(
             stdout,
             cursor::MoveTo(mx, my),
-            SetForegroundColor(Color::Red),
+            AnsiForeground(Color::Red),
             Print(msg)
         )?;
         queue!(stdout, ResetColor)?;
@@ -470,7 +567,7 @@ pub fn render_panes(
             queue!(
                 stdout,
                 cursor::MoveTo(cell.x, cell.y),
-                SetForegroundColor(color),
+                AnsiForeground(color),
                 Print(border_char(&cell.flags, &chars))
             )?;
         }
@@ -483,9 +580,11 @@ pub fn render_panes(
             continue;
         }
         if let Some(rect) = pane_rects.get(&pid) {
+            if rect.w == 0 || rect.h == 0 {
+                continue;
+            }
             if !full_redraw {
-                clear_rect(stdout, rect)?;
-                clear_title(stdout, rect)?;
+                clear_title(stdout, rect, &chars)?;
             }
             let is_active = pid == active_id;
             let pane_ref = panes.get(&pid);
@@ -511,6 +610,8 @@ pub fn render_panes(
                     .filter(|(sel_pid, ..)| *sel_pid == pid)
                     .map(|(_, sr, sc, er, ec)| (sr, sc, er, ec));
                 draw_content(stdout, pane, rect, is_alive, pane_sel)?;
+            } else {
+                clear_rect(stdout, rect)?;
             }
             // Dead pane overlay
             if !is_alive {
@@ -527,17 +628,7 @@ pub fn render_panes(
 
     // Cursor
     if let (Some(rect), Some(pane)) = (pane_rects.get(&active_id), panes.get(&active_id)) {
-        if pane.is_alive() {
-            let screen = pane.screen();
-            let (cr, cc) = screen.cursor_position();
-            if cc < rect.w && cr < rect.h {
-                queue!(
-                    stdout,
-                    cursor::MoveTo(rect.x + cc, rect.y + cr),
-                    cursor::Show
-                )?;
-            }
-        }
+        draw_pane_cursor(stdout, pane, rect)?;
     }
 
     queue!(stdout, ResetColor, SetAttribute(Attribute::Reset))?;
@@ -562,23 +653,29 @@ fn clear_rect(stdout: &mut impl Write, rect: &Rect) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn clear_title(stdout: &mut impl Write, rect: &Rect) -> anyhow::Result<()> {
+fn clear_title(stdout: &mut impl Write, rect: &Rect, chars: &BorderChars) -> anyhow::Result<()> {
     if rect.w == 0 {
         return Ok(());
     }
 
     let y = rect.y.saturating_sub(1);
     let x = rect.x;
-    let blanks = " ".repeat(rect.w as usize);
-    queue!(stdout, cursor::MoveTo(x, y), ResetColor, Print(&blanks))?;
+    let line = chars.h.repeat(rect.w as usize);
+    queue!(
+        stdout,
+        cursor::MoveTo(x, y),
+        SetAttribute(Attribute::Reset),
+        AnsiForeground(BORDER_COLOR),
+        Print(&line)
+    )?;
     Ok(())
 }
 
 fn is_pane_border(x: u16, y: u16, r: &Rect) -> bool {
     let top = r.y.saturating_sub(1);
-    let bot = r.y + r.h;
+    let bot = r.y.saturating_add(r.h);
     let left = r.x.saturating_sub(1);
-    let right = r.x + r.w;
+    let right = r.x.saturating_add(r.w);
     (y == top || y == bot) && x >= left && x <= right
         || (x == left || x == right) && y >= top && y <= bot
 }
@@ -639,12 +736,14 @@ fn draw_pane_title(
             format!(" {}:{}{} ", idx + 1, short, scroll_ind)
         }
     };
-    let tlen = title.len();
-    let show_buttons = avail >= tlen + 13;
+    // Keep visibility identical to title_button_hit, independent of label length.
+    let show_buttons = avail >= 13;
     let btn_len = if show_buttons { 11 } else { 0 };
-    let show_close = !show_buttons && avail >= tlen + 4;
+    let show_close = !show_buttons && avail >= 4;
     let close_len = if show_close { 2 } else { 0 };
     let right_len = btn_len + close_len;
+    let title = truncate_label(&title, avail.saturating_sub(1 + right_len));
+    let tlen = title.width();
 
     if avail >= tlen + 1 + right_len {
         let color = if is_active {
@@ -652,6 +751,11 @@ fn draw_pane_title(
         } else {
             BORDER_COLOR
         };
+        queue!(
+            stdout,
+            SetAttribute(Attribute::Reset),
+            AnsiForeground(color)
+        )?;
 
         // Borderless: fill title row with subtle background for visual separation
         if borderless {
@@ -671,7 +775,7 @@ fn draw_pane_title(
             queue!(
                 stdout,
                 cursor::MoveTo(title_x, title_y),
-                SetBackgroundColor(title_bg),
+                AnsiBackground(title_bg),
             )?;
             let blanks = " ".repeat(avail);
             queue!(stdout, Print(&blanks))?;
@@ -680,7 +784,7 @@ fn draw_pane_title(
             queue!(
                 stdout,
                 cursor::MoveTo(title_x, title_y),
-                SetForegroundColor(color)
+                AnsiForeground(color)
             )?;
             queue!(stdout, Print(chars.h))?;
         }
@@ -688,12 +792,12 @@ fn draw_pane_title(
         if is_active {
             queue!(
                 stdout,
-                SetForegroundColor(Color::White),
+                AnsiForeground(Color::White),
                 SetAttribute(Attribute::Bold)
             )?;
         }
         if !is_alive {
-            queue!(stdout, SetForegroundColor(DEAD_FG))?;
+            queue!(stdout, AnsiForeground(DEAD_FG))?;
         }
         queue!(stdout, Print(&title))?;
         queue!(stdout, SetAttribute(Attribute::Reset))?;
@@ -713,9 +817,9 @@ fn draw_pane_title(
                     b: 28,
                 }
             };
-            queue!(stdout, SetBackgroundColor(title_bg))?;
+            queue!(stdout, AnsiBackground(title_bg))?;
         }
-        queue!(stdout, SetForegroundColor(color))?;
+        queue!(stdout, AnsiForeground(color))?;
 
         let leading = if borderless { 0 } else { 1 };
         let fill = avail.saturating_sub(tlen + leading + right_len);
@@ -733,9 +837,9 @@ fn draw_pane_title(
             }
             queue!(
                 stdout,
-                SetForegroundColor(btn_fg),
+                AnsiForeground(btn_fg),
                 Print("[━] [┃] "),
-                SetForegroundColor(CLOSE_COLOR),
+                AnsiForeground(CLOSE_COLOR),
                 Print("[×]")
             )?;
         } else if show_close {
@@ -743,7 +847,7 @@ fn draw_pane_title(
                 let btn_x = title_x + (avail as u16).saturating_sub(2);
                 queue!(stdout, cursor::MoveTo(btn_x, title_y))?;
             }
-            queue!(stdout, SetForegroundColor(CLOSE_COLOR), Print(" ×"))?;
+            queue!(stdout, AnsiForeground(CLOSE_COLOR), Print(" ×"))?;
         }
     }
 
@@ -758,6 +862,9 @@ fn truncate_label(label: &str, max_cols: usize) -> String {
     let mut out = String::new();
     let mut width = 0usize;
     for ch in label.chars() {
+        if ch.is_control() {
+            continue;
+        }
         let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
         if width + cw > max_cols {
             break;
@@ -766,6 +873,23 @@ fn truncate_label(label: &str, max_cols: usize) -> String {
         width += cw;
     }
     out
+}
+
+fn tail_label(label: &str, max_cols: usize) -> String {
+    let clean = truncate_label(label, usize::MAX);
+    let mut width = 0;
+    let mut start = clean.len();
+    for (index, ch) in clean.char_indices().rev() {
+        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + cw > max_cols {
+            break;
+        }
+        width += cw;
+        start = index;
+    }
+    clean[start..]
+        .trim_start_matches(|ch| unicode_width::UnicodeWidthChar::width(ch) == Some(0))
+        .to_string()
 }
 
 /// Draw dimmed overlay on dead panes with centered message.
@@ -784,7 +908,7 @@ fn draw_dead_overlay(stdout: &mut impl Write, rect: &Rect) -> anyhow::Result<()>
         queue!(
             stdout,
             cursor::MoveTo(rect.x, rect.y + row),
-            SetBackgroundColor(dim_bg),
+            AnsiBackground(dim_bg),
         )?;
         for _ in 0..rect.w {
             queue!(stdout, Print(" "))?;
@@ -795,13 +919,13 @@ fn draw_dead_overlay(stdout: &mut impl Write, rect: &Rect) -> anyhow::Result<()>
 
     // "Process exited" label
     if rect.h >= 3 {
-        let label = "Process exited";
+        let label = truncate_label("Process exited", rect.w as usize);
         let lx = rect.x + rect.w.saturating_sub(label.len() as u16) / 2;
         queue!(
             stdout,
             cursor::MoveTo(lx, my.saturating_sub(1)),
-            SetBackgroundColor(dim_bg),
-            SetForegroundColor(Color::Rgb {
+            AnsiBackground(dim_bg),
+            AnsiForeground(Color::Rgb {
                 r: 120,
                 g: 60,
                 b: 60
@@ -813,13 +937,13 @@ fn draw_dead_overlay(stdout: &mut impl Write, rect: &Rect) -> anyhow::Result<()>
     }
 
     // "Press Enter to respawn" hint
-    let msg = "Press Enter to respawn";
+    let msg = truncate_label("Press Enter to respawn", rect.w as usize);
     let mx = rect.x + rect.w.saturating_sub(msg.len() as u16) / 2;
     queue!(
         stdout,
         cursor::MoveTo(mx, my),
-        SetBackgroundColor(dim_bg),
-        SetForegroundColor(Color::DarkGrey),
+        AnsiBackground(dim_bg),
+        AnsiForeground(Color::DarkGrey),
         SetAttribute(Attribute::Italic),
         Print(msg),
         SetAttribute(Attribute::Reset),
@@ -834,35 +958,57 @@ fn draw_content(
     is_alive: bool,
     selection: Option<(u16, u16, u16, u16)>,
 ) -> anyhow::Result<()> {
-    let screen = pane.screen();
+    draw_screen_content(stdout, pane.screen(), rect, is_alive, selection)
+}
+
+fn draw_screen_content(
+    stdout: &mut impl Write,
+    screen: &vt100::Screen,
+    rect: &Rect,
+    is_alive: bool,
+    selection: Option<(u16, u16, u16, u16)>,
+) -> anyhow::Result<()> {
+    draw_screen_content_with_matches(stdout, screen, rect, is_alive, selection, &[])
+}
+
+fn draw_screen_content_with_matches(
+    stdout: &mut impl Write,
+    screen: &vt100::Screen,
+    rect: &Rect,
+    is_alive: bool,
+    selection: Option<(u16, u16, u16, u16)>,
+    matches: &[(u16, u16, u16)],
+) -> anyhow::Result<()> {
     if rect.w == 0 || rect.h == 0 {
         return Ok(());
     }
 
-    let mut last_fg = Color::Reset;
-    let mut last_bg = Color::Reset;
-    let mut has_attrs = false;
+    queue!(stdout, SetAttribute(Attribute::Reset), ResetColor)?;
+    let mut last_style = None;
     // Reusable buffer: batch consecutive plain-text cells into one Print call
     let mut buf = String::with_capacity(rect.w as usize);
 
     for r in 0..rect.h {
         queue!(stdout, cursor::MoveTo(rect.x, rect.y + r))?;
         buf.clear();
+        let mut match_index = matches.partition_point(|(row, _, _)| *row < r);
 
         for c in 0..rect.w {
-            let is_selected = selection.is_some_and(|(sr, sc, er, ec)| {
-                if r < sr || r > er {
-                    false
-                } else if r == sr && r == er {
-                    c >= sc && c <= ec
-                } else if r == sr {
-                    c >= sc
-                } else if r == er {
-                    c <= ec
-                } else {
-                    true
-                }
-            });
+            let selected = |column| {
+                selection.is_some_and(|(sr, sc, er, ec)| {
+                    if r < sr || r > er {
+                        false
+                    } else if r == sr && r == er {
+                        column >= sc && column <= ec
+                    } else if r == sr {
+                        column >= sc
+                    } else if r == er {
+                        column <= ec
+                    } else {
+                        true
+                    }
+                })
+            };
 
             if let Some(cell) = screen.cell(r, c) {
                 // Skip wide character continuation cells — the wide char itself
@@ -871,35 +1017,42 @@ fn draw_content(
                     continue;
                 }
 
-                // If this is a wide char at the last column, it would overflow.
-                // Print a space instead to stay within bounds.
-                if cell.is_wide() && c + 1 >= rect.w {
-                    buf.push(' ');
-                    continue;
+                let is_selected = selected(c) || (cell.is_wide() && selected(c + 1));
+                while matches
+                    .get(match_index)
+                    .is_some_and(|&(row, col, len)| row == r && col.saturating_add(len) <= c)
+                {
+                    match_index += 1;
                 }
-
-                let (mut fg, bg) = if is_selected {
-                    // Invert colors for selection highlight
-                    let f = vt100_to_crossterm(cell.bgcolor());
-                    let b = vt100_to_crossterm(cell.fgcolor());
-                    // Use readable defaults if both are Reset
-                    (
-                        if f == Color::Reset { Color::Black } else { f },
-                        if b == Color::Reset { Color::White } else { b },
-                    )
+                let match_hit = matches.get(match_index).is_some_and(|&(row, col, len)| {
+                    row == r
+                        && len > 0
+                        && col < c.saturating_add(if cell.is_wide() { 2 } else { 1 })
+                        && col.saturating_add(len) > c
+                });
+                let mut fg = if match_hit {
+                    vt100::Color::Idx(0)
                 } else {
-                    (
-                        vt100_to_crossterm(cell.fgcolor()),
-                        vt100_to_crossterm(cell.bgcolor()),
-                    )
+                    cell.fgcolor()
+                };
+                let bg = if match_hit {
+                    vt100::Color::Idx(3)
+                } else {
+                    cell.bgcolor()
                 };
                 if !is_alive {
-                    fg = Color::DarkGrey;
+                    fg = vt100::Color::Idx(8);
                 }
 
-                let ca = cell.bold() || cell.italic() || cell.underline() || cell.inverse();
-                let style_changed =
-                    fg != last_fg || bg != last_bg || (ca && !has_attrs) || (!ca && has_attrs);
+                let attrs = (
+                    is_alive && cell.bold(),
+                    is_alive && cell.italic(),
+                    is_alive && cell.underline(),
+                    (is_alive && cell.inverse()) ^ is_selected,
+                    is_alive && cell.dim(),
+                );
+                let style = (fg, bg, attrs);
+                let style_changed = last_style != Some(style);
 
                 // Flush buffer if style changes
                 if style_changed && !buf.is_empty() {
@@ -907,54 +1060,57 @@ fn draw_content(
                     buf.clear();
                 }
 
-                if fg != last_fg {
-                    queue!(stdout, SetForegroundColor(fg))?;
-                    last_fg = fg;
-                }
-                if bg != last_bg {
-                    queue!(stdout, SetBackgroundColor(bg))?;
-                    last_bg = bg;
-                }
-
-                if ca && is_alive {
-                    if !has_attrs {
-                        if cell.bold() {
-                            queue!(stdout, SetAttribute(Attribute::Bold))?;
+                if style_changed {
+                    // Reset before colours: SGR 0 resets colours as well as attributes.
+                    queue!(stdout, SetAttribute(Attribute::Reset))?;
+                    write_pane_color(stdout, fg, true)?;
+                    write_pane_color(stdout, bg, false)?;
+                    for (enabled, attr) in [
+                        (attrs.0, Attribute::Bold),
+                        (attrs.1, Attribute::Italic),
+                        (attrs.2, Attribute::Underlined),
+                        (attrs.3, Attribute::Reverse),
+                        (attrs.4, Attribute::Dim),
+                    ] {
+                        if enabled {
+                            queue!(stdout, SetAttribute(attr))?;
                         }
-                        if cell.italic() {
-                            queue!(stdout, SetAttribute(Attribute::Italic))?;
-                        }
-                        if cell.underline() {
-                            queue!(stdout, SetAttribute(Attribute::Underlined))?;
-                        }
-                        if cell.inverse() {
-                            queue!(stdout, SetAttribute(Attribute::Reverse))?;
-                        }
-                        has_attrs = true;
                     }
-                    // Attributed cells: print individually (attrs may differ per cell)
-                    let contents = cell.contents();
-                    if contents.is_empty() {
-                        queue!(stdout, Print(" "))?;
-                    } else {
-                        queue!(stdout, Print(contents))?;
-                    }
+                    last_style = Some(style);
+                }
+                let contents = cell.contents();
+                if contents.is_empty() || (cell.is_wide() && c + 1 >= rect.w) {
+                    buf.push(' ');
+                } else if contents.is_ascii() {
+                    buf.push_str(contents);
                 } else {
-                    if has_attrs {
-                        queue!(stdout, SetAttribute(Attribute::Reset))?;
-                        last_fg = Color::Reset;
-                        last_bg = Color::Reset;
-                        has_attrs = false;
+                    // Anchor Unicode cells to the parser's columns. Adjacent emoji
+                    // cells must not collapse subsequent columns into a ZWJ cluster.
+                    if !buf.is_empty() {
+                        queue!(stdout, Print(&buf))?;
+                        buf.clear();
                     }
-                    // Plain cells: batch into buffer
-                    let contents = cell.contents();
-                    if contents.is_empty() {
-                        buf.push(' ');
-                    } else {
-                        buf.push_str(&contents);
+                    queue!(
+                        stdout,
+                        cursor::MoveTo(rect.x + c, rect.y + r),
+                        Print(contents)
+                    )?;
+                    let next = c + if cell.is_wide() { 2 } else { 1 };
+                    if next < rect.w {
+                        queue!(stdout, cursor::MoveTo(rect.x + next, rect.y + r))?;
                     }
                 }
             } else {
+                if last_style.is_some() {
+                    queue!(
+                        stdout,
+                        Print(&buf),
+                        SetAttribute(Attribute::Reset),
+                        ResetColor
+                    )?;
+                    buf.clear();
+                    last_style = None;
+                }
                 buf.push(' ');
             }
         }
@@ -967,6 +1123,53 @@ fn draw_content(
     }
 
     queue!(stdout, ResetColor, SetAttribute(Attribute::Reset))?;
+    Ok(())
+}
+
+/// Draw from the currently synchronized scrollback view, after pane chrome.
+/// Search matches are the row/column-sorted display spans produced by copy mode.
+pub fn draw_copy_mode_overlay(
+    stdout: &mut impl Write,
+    screen: &vt100::Screen,
+    rect: &Rect,
+    state: &CopyModeState,
+) -> anyhow::Result<()> {
+    draw_screen_content_with_matches(
+        stdout,
+        screen,
+        rect,
+        true,
+        state.selection(),
+        &state.search_matches,
+    )?;
+    queue!(stdout, cursor::Hide)?;
+    if state.cursor_row < rect.h && state.cursor_col < rect.w {
+        queue!(
+            stdout,
+            cursor::MoveTo(rect.x + state.cursor_col, rect.y + state.cursor_row),
+            cursor::Show
+        )?;
+    }
+    Ok(())
+}
+
+/// Restore the application's cursor after status/tab rendering moved it.
+pub fn draw_pane_cursor(stdout: &mut impl Write, pane: &Pane, rect: &Rect) -> anyhow::Result<()> {
+    queue!(stdout, cursor::Hide)?;
+    let screen = pane.screen();
+    let (row, col) = screen.cursor_position();
+    if pane.is_alive()
+        && !pane.is_scrolled()
+        && !screen.hide_cursor()
+        && row < rect.h
+        && col < rect.w
+    {
+        queue!(
+            stdout,
+            cursor::MoveTo(rect.x + col, rect.y + row),
+            cursor::Show
+        )?;
+    }
     Ok(())
 }
 
@@ -995,6 +1198,9 @@ pub fn draw_status_bar_full(
     selection_chars: usize,
     palette: Option<&ResolvedPalette>,
 ) -> anyhow::Result<()> {
+    if term_w == 0 || term_h == 0 {
+        return Ok(());
+    }
     let y = term_h - 1;
     let w = term_w as usize;
 
@@ -1004,19 +1210,21 @@ pub fn draw_status_bar_full(
 
     queue!(
         stdout,
+        SetAttribute(Attribute::Reset),
         cursor::MoveTo(0, y),
-        SetBackgroundColor(status_bg),
-        SetForegroundColor(status_fg)
+        AnsiBackground(status_bg),
+        AnsiForeground(status_fg)
     )?;
-    for _ in 0..w {
-        queue!(stdout, Print(" "))?;
-    }
+    queue!(stdout, Print(" ".repeat(w)))?;
+    let left_x = usize::from(w > 1);
+    let clock_space = if w > 8 { 7 } else { 0 };
+    let left_limit = w.saturating_sub(clock_space);
 
     // Left: pane info + name
     queue!(
         stdout,
-        cursor::MoveTo(1, y),
-        SetForegroundColor(accent),
+        cursor::MoveTo(left_x as u16, y),
+        AnsiForeground(accent),
         SetAttribute(Attribute::Bold)
     )?;
     let left = if pane_name.is_empty() {
@@ -1024,51 +1232,54 @@ pub fn draw_status_bar_full(
     } else {
         format!("Pane {}/{} {}", active_idx + 1, total, pane_name)
     };
+    let left = truncate_label(&left, left_limit.saturating_sub(left_x));
     queue!(stdout, Print(&left))?;
-    let mut left_end = 1 + left.len();
+    let mut left_end = left_x + left.width();
 
     // Mode indicator or selection char count
-    if selection_chars > 0 {
+    if selection_chars > 0 && left_end < left_limit {
         let sel_label = format!("{} chars", selection_chars);
+        let badge = truncate_label(&format!(" {} ", sel_label), left_limit - left_end);
         queue!(
             stdout,
             SetAttribute(Attribute::Reset),
-            SetBackgroundColor(Color::Rgb {
+            AnsiBackground(Color::Rgb {
                 r: 40,
                 g: 20,
                 b: 60
             }),
-            SetForegroundColor(Color::Rgb {
+            AnsiForeground(Color::Rgb {
                 r: 200,
                 g: 160,
                 b: 255
             }),
             SetAttribute(Attribute::Bold),
-            Print(format!(" {} ", sel_label)),
+            Print(&badge),
             SetAttribute(Attribute::Reset),
-            SetBackgroundColor(status_bg),
+            AnsiBackground(status_bg),
         )?;
-        left_end += sel_label.len() + 2;
-    } else if !mode_label.is_empty() {
+        left_end += badge.width();
+    } else if !mode_label.is_empty() && left_end < left_limit {
+        let badge = truncate_label(&format!(" {} ", mode_label), left_limit - left_end);
         queue!(
             stdout,
             SetAttribute(Attribute::Reset),
-            SetBackgroundColor(Color::Rgb {
+            AnsiBackground(Color::Rgb {
                 r: 60,
                 g: 40,
                 b: 10
             }),
-            SetForegroundColor(Color::Rgb {
+            AnsiForeground(Color::Rgb {
                 r: 255,
                 g: 200,
                 b: 50
             }),
             SetAttribute(Attribute::Bold),
-            Print(format!(" {} ", mode_label)),
+            Print(&badge),
             SetAttribute(Attribute::Reset),
-            SetBackgroundColor(status_bg),
+            AnsiBackground(status_bg),
         )?;
-        left_end += mode_label.len() + 2;
+        left_end += badge.width();
     }
 
     // Clock (HH:MM) on the far right
@@ -1082,7 +1293,7 @@ pub fn draw_status_bar_full(
     queue!(
         stdout,
         SetAttribute(Attribute::Reset),
-        SetBackgroundColor(status_bg)
+        AnsiBackground(status_bg)
     )?;
     let hints: &[&str] = match mode_label {
         "PREFIX" => &[
@@ -1117,18 +1328,18 @@ pub fn draw_status_bar_full(
         "KILL SESSION? y/n" => &["y kill session", "any key cancel"],
         "CLOSE PANE? y/n" => &["y close pane", "any key cancel"],
         "CLOSE TAB? y/n" => &["y close tab", "any key cancel"],
-        "ZOOM" => &["Ctrl+B z unzoom", "Ctrl+D/E split", "type normally"],
+        "ZOOM" => &["Ctrl+B z unzoom", "Ctrl+B %/\" split", "type normally"],
         "BROADCAST" => &["typing in ALL panes", "Ctrl+B B stop broadcast"],
         ":" => &["↑↓ navigate", "Enter select", "Tab complete", "Esc cancel"],
         "RENAME" => &["Enter confirm", "Esc cancel"],
         _ => &[
-            "Ctrl+D/E split",
-            "Ctrl+N next",
             "Ctrl+B prefix",
-            "Ctrl+B p palette",
+            "Ctrl+B %/\" split",
+            "Ctrl+B o next",
+            "Ctrl+B : palette",
             "drag text→copy",
             "scroll↕output",
-            "Ctrl+G settings",
+            "F1 settings",
             "Ctrl+B ? help",
         ],
     };
@@ -1140,9 +1351,9 @@ pub fn draw_status_bar_full(
     let mut total_len = 0usize;
     for hint in hints.iter() {
         let added = if fitted.is_empty() {
-            hint.len()
+            hint.width()
         } else {
-            sep_len + hint.len()
+            sep_len + hint.width()
         };
         if total_len + added <= max_w {
             total_len += added;
@@ -1166,42 +1377,42 @@ pub fn draw_status_bar_full(
         };
         for (i, hint) in fitted.iter().enumerate() {
             if i > 0 {
-                queue!(stdout, SetForegroundColor(desc_fg), Print(separator))?;
+                queue!(stdout, AnsiForeground(desc_fg), Print(separator))?;
             }
             // Split hint at first space: key part (bold) + desc part (dim)
             if let Some(sp) = hint.find(' ') {
                 let (key, desc) = hint.split_at(sp);
                 queue!(
                     stdout,
-                    SetForegroundColor(key_fg),
+                    AnsiForeground(key_fg),
                     SetAttribute(Attribute::Bold),
                     Print(key),
                     SetAttribute(Attribute::Reset),
-                    SetBackgroundColor(status_bg),
-                    SetForegroundColor(desc_fg),
+                    AnsiBackground(status_bg),
+                    AnsiForeground(desc_fg),
                     Print(desc),
                 )?;
             } else {
                 queue!(
                     stdout,
-                    SetForegroundColor(key_fg),
+                    AnsiForeground(key_fg),
                     SetAttribute(Attribute::Bold),
                     Print(*hint),
                     SetAttribute(Attribute::Reset),
-                    SetBackgroundColor(status_bg),
+                    AnsiBackground(status_bg),
                 )?;
             }
         }
     }
 
     // Draw clock at far right
-    if clock_len + 1 < w {
+    if clock_space > 0 {
         let cx = (w as u16).saturating_sub(clock_len as u16);
         queue!(
             stdout,
             cursor::MoveTo(cx, y),
-            SetBackgroundColor(status_bg),
-            SetForegroundColor(HINT_FG),
+            AnsiBackground(status_bg),
+            AnsiForeground(HINT_FG),
             Print(&clock),
         )?;
     }
@@ -1298,15 +1509,19 @@ pub fn draw_flash_overlay(
         msg.to_string()
     };
 
-    let pill = format!(" {} ", truncated);
+    let pill = truncate_label(&format!(" {} ", truncated), term_w as usize);
     let pill_len = pill.width() as u16;
-    let x = if pill_len + 2 < term_w { 2 } else { 0 };
+    let x = if usize::from(pill_len) + 2 < usize::from(term_w) {
+        2
+    } else {
+        0
+    };
 
     queue!(
         stdout,
         cursor::MoveTo(x, y),
-        SetBackgroundColor(bg),
-        SetForegroundColor(fg),
+        AnsiBackground(bg),
+        AnsiForeground(fg),
         SetAttribute(Attribute::Bold),
         Print(&pill),
         SetAttribute(Attribute::Reset),
@@ -1323,8 +1538,15 @@ pub fn draw_text_input(
     prompt: &str,
     buffer: &str,
 ) -> anyhow::Result<()> {
+    if term_w == 0 || term_h == 0 {
+        return Ok(());
+    }
     let y = term_h - 1;
     let w = term_w as usize;
+    let x = usize::from(w > 1);
+    let prompt = truncate_label(prompt, w.saturating_sub(x + 1));
+    let room = w.saturating_sub(x + prompt.width() + 1);
+    let buffer = tail_label(buffer, room);
 
     let input_bg = Color::Rgb {
         r: 30,
@@ -1344,32 +1566,35 @@ pub fn draw_text_input(
     };
 
     // Clear row
-    queue!(stdout, cursor::MoveTo(0, y), SetBackgroundColor(input_bg),)?;
-    for _ in 0..w {
-        queue!(stdout, Print(" "))?;
-    }
+    queue!(
+        stdout,
+        SetAttribute(Attribute::Reset),
+        cursor::MoveTo(0, y),
+        AnsiBackground(input_bg),
+        Print(" ".repeat(w))
+    )?;
 
     // Prompt
     queue!(
         stdout,
-        cursor::MoveTo(1, y),
-        SetBackgroundColor(input_bg),
-        SetForegroundColor(prompt_fg),
+        cursor::MoveTo(x as u16, y),
+        AnsiBackground(input_bg),
+        AnsiForeground(prompt_fg),
         SetAttribute(Attribute::Bold),
-        Print(prompt),
+        Print(&prompt),
         SetAttribute(Attribute::Reset),
-        SetBackgroundColor(input_bg),
-        SetForegroundColor(text_fg),
-        Print(buffer),
+        AnsiBackground(input_bg),
+        AnsiForeground(text_fg),
+        Print(&buffer),
     )?;
 
     // Cursor block
-    let cursor_x = 1 + prompt.len() as u16 + buffer.len() as u16;
+    let cursor_x = (x + prompt.width() + buffer.width()) as u16;
     if (cursor_x as usize) < w {
         queue!(
             stdout,
             cursor::MoveTo(cursor_x, y),
-            SetBackgroundColor(cursor_bg),
+            AnsiBackground(cursor_bg),
             Print(" "),
         )?;
     }
@@ -1473,7 +1698,7 @@ pub fn draw_palette_overlay(
         queue!(
             stdout,
             cursor::MoveTo(0, top + dy),
-            SetBackgroundColor(bg),
+            AnsiBackground(bg),
             Print(&blank)
         )?;
     }
@@ -1482,15 +1707,15 @@ pub fn draw_palette_overlay(
     queue!(
         stdout,
         cursor::MoveTo(1, top),
-        SetBackgroundColor(bg),
-        SetForegroundColor(prompt_fg),
+        AnsiBackground(bg),
+        AnsiForeground(prompt_fg),
         SetAttribute(Attribute::Bold),
         Print(":"),
         SetAttribute(Attribute::Reset),
-        SetBackgroundColor(bg),
-        SetForegroundColor(row_fg),
+        AnsiBackground(bg),
+        AnsiForeground(row_fg),
         Print(" "),
-        Print(query),
+        Print(tail_label(query, w.saturating_sub(4))),
     )?;
 
     // Match rows.
@@ -1499,16 +1724,17 @@ pub fn draw_palette_overlay(
         queue!(
             stdout,
             cursor::MoveTo(2, top + 2),
-            SetBackgroundColor(bg),
-            SetForegroundColor(dim_fg),
+            AnsiBackground(bg),
+            AnsiForeground(dim_fg),
             SetAttribute(Attribute::Italic),
-            Print("(no matches)"),
+            Print(truncate_label("(no matches)", w.saturating_sub(2))),
             SetAttribute(Attribute::Reset),
         )?;
     } else {
-        for (i, m) in matches_.iter().take(visible_rows).enumerate() {
+        let first = selected.saturating_sub(visible_rows - 1);
+        for (i, m) in matches_.iter().skip(first).take(visible_rows).enumerate() {
             let row_y = top + 2 + i as u16;
-            let is_sel = i == selected;
+            let is_sel = i + first == selected;
             let row_bg = if is_sel { select_bg } else { bg };
             let label_fg = if is_sel { select_fg } else { row_fg };
 
@@ -1516,7 +1742,7 @@ pub fn draw_palette_overlay(
             queue!(
                 stdout,
                 cursor::MoveTo(0, row_y),
-                SetBackgroundColor(row_bg),
+                AnsiBackground(row_bg),
                 Print(&blank),
                 cursor::MoveTo(2, row_y),
             )?;
@@ -1534,24 +1760,26 @@ pub fn draw_palette_overlay(
             // Icon
             queue!(
                 stdout,
-                SetForegroundColor(if is_sel { select_fg } else { kind_fg }),
+                AnsiForeground(if is_sel { select_fg } else { kind_fg }),
                 SetAttribute(Attribute::Bold),
                 Print(icon),
                 SetAttribute(Attribute::Reset),
-                SetBackgroundColor(row_bg),
-                SetForegroundColor(label_fg),
+                AnsiBackground(row_bg),
+                AnsiForeground(label_fg),
                 Print(" "),
             )?;
 
             // Display text + faded payload tail (when payload != display).
             let display = entry.map(|e| e.display.as_str()).unwrap_or("?");
-            queue!(stdout, Print(display))?;
+            let display = truncate_label(display, w.saturating_sub(4));
+            queue!(stdout, Print(&display))?;
             if let Some(e) = entry {
                 if e.payload != e.display {
                     let tail = format!("  {}", e.payload);
+                    let tail = truncate_label(&tail, w.saturating_sub(4 + display.width()));
                     queue!(
                         stdout,
-                        SetForegroundColor(if is_sel { select_fg } else { dim_fg }),
+                        AnsiForeground(if is_sel { select_fg } else { dim_fg }),
                         Print(&tail),
                     )?;
                 }
@@ -1615,8 +1843,8 @@ pub fn draw_osc52_confirm_overlay(
     queue!(
         stdout,
         cursor::MoveTo(0, y),
-        SetBackgroundColor(bg),
-        SetForegroundColor(fg),
+        AnsiBackground(bg),
+        AnsiForeground(fg),
         SetAttribute(Attribute::Bold),
         Print(&truncated),
         SetAttribute(Attribute::Reset),
@@ -1638,8 +1866,12 @@ pub fn draw_flash_message(
     term_h: u16,
     text: &str,
 ) -> anyhow::Result<()> {
+    if term_w == 0 || term_h == 0 {
+        return Ok(());
+    }
     let y = term_h.saturating_sub(1);
     let w = term_w as usize;
+    let x = usize::from(w > 1);
 
     // Yellow-on-dark — same family as the existing PREFIX badge so the row
     // reads as "ephemeral status" rather than a popup error dialog.
@@ -1654,16 +1886,16 @@ pub fn draw_flash_message(
         b: 80,
     };
 
-    queue!(stdout, cursor::MoveTo(0, y), SetBackgroundColor(bg))?;
+    queue!(stdout, cursor::MoveTo(0, y), AnsiBackground(bg))?;
     for _ in 0..w {
         queue!(stdout, Print(" "))?;
     }
     queue!(
         stdout,
-        cursor::MoveTo(1, y),
-        SetForegroundColor(fg),
+        cursor::MoveTo(x as u16, y),
+        AnsiForeground(fg),
         SetAttribute(Attribute::Bold),
-        Print(text),
+        Print(truncate_label(text, w.saturating_sub(x))),
         SetAttribute(Attribute::Reset),
         ResetColor,
     )?;
@@ -1686,11 +1918,10 @@ pub fn tab_bar_hit(x: u16, tabs: &[(usize, String, bool)], term_w: u16) -> Optio
         return None;
     }
     let w = term_w as usize;
-    let mut col = 2usize;
+    let mut col = 1usize;
     for (idx, name, _) in tabs {
-        let name_w = UnicodeWidthStr::width(name.as_str());
-        let tab_width = 4 + name_w + 2; // "  N:" + name + "  "
-        if col + tab_width >= w {
+        let (_, _, tab_width) = tab_label_parts(*idx, name);
+        if col + tab_width + 2 > w {
             break;
         }
         if (x as usize) >= col && (x as usize) < col + tab_width {
@@ -1699,6 +1930,13 @@ pub fn tab_bar_hit(x: u16, tabs: &[(usize, String, bool)], term_w: u16) -> Optio
         col += tab_width + 2; // tab + " │"
     }
     None
+}
+
+fn tab_label_parts(index: usize, name: &str) -> (String, String, usize) {
+    let prefix = format!("  {}: ", index.saturating_add(1));
+    let name = truncate_label(name, usize::MAX);
+    let width = prefix.len() + name.width() + 2;
+    (prefix, name, width)
 }
 
 /// Draw tab indicators in the status bar area.
@@ -1716,7 +1954,7 @@ pub fn draw_tab_bar(
     show_status_bar: bool,
     palette: Option<&ResolvedPalette>,
 ) -> anyhow::Result<()> {
-    if tabs.len() <= 1 {
+    if tabs.len() <= 1 || term_w == 0 || term_h <= u16::from(show_status_bar) {
         return Ok(());
     }
 
@@ -1763,33 +2001,32 @@ pub fn draw_tab_bar(
     };
 
     // Clear the row
-    queue!(stdout, cursor::MoveTo(0, y), SetBackgroundColor(tab_bg),)?;
+    queue!(stdout, cursor::MoveTo(0, y), AnsiBackground(tab_bg),)?;
     for _ in 0..w {
         queue!(stdout, Print(" "))?;
     }
 
     // Render tabs with generous spacing: "  N : name  │"
     queue!(stdout, cursor::MoveTo(1, y))?;
-    let mut col = 2usize;
+    let mut col = 1usize;
 
     for (idx, name, is_active) in tabs {
-        let name_w = UnicodeWidthStr::width(name.as_str());
-        let tab_width = 4 + name_w + 2; // "  N:" + name + "  "
-        if col + tab_width + 1 >= w {
+        let (prefix, name, tab_width) = tab_label_parts(*idx, name);
+        if col + tab_width + 2 > w {
             break;
         }
 
         let bg = if *is_active { active_tab_bg } else { tab_bg };
 
-        queue!(stdout, SetBackgroundColor(bg), SetForegroundColor(index_fg),)?;
+        queue!(stdout, AnsiBackground(bg), AnsiForeground(index_fg),)?;
         if *is_active {
             queue!(stdout, SetAttribute(Attribute::Bold))?;
         }
-        queue!(stdout, Print(format!("  {}: ", idx + 1)))?;
+        queue!(stdout, Print(prefix))?;
 
         queue!(
             stdout,
-            SetForegroundColor(if *is_active {
+            AnsiForeground(if *is_active {
                 active_tab_fg
             } else {
                 inactive_fg
@@ -1805,8 +2042,8 @@ pub fn draw_tab_bar(
         // Separator
         queue!(
             stdout,
-            SetBackgroundColor(tab_bg),
-            SetForegroundColor(sep_fg),
+            AnsiBackground(tab_bg),
+            AnsiForeground(sep_fg),
             Print(" │"),
         )?;
         col += tab_width + 2; // tab + " │"
@@ -1924,7 +2161,7 @@ pub fn title_button_hit(x: u16, y: u16, layout: &Layout, inner: &Rect) -> Option
     let rects = layout.pane_rects(inner);
     for (&pid, rect) in &rects {
         let btn_y = rect.y.saturating_sub(1);
-        if y != btn_y {
+        if y != btn_y || rect.w == 0 || rect.h == 0 {
             continue;
         }
         let avail = rect.w as usize;
@@ -1981,63 +2218,55 @@ pub fn render_zoomed_pane(
     }
 
     // Draw outer border
-    let mut bmap = BorderMap::new();
-    if term_w > 0 && border_h > 0 {
+    let mut bmap = if border_style.is_none() {
+        BorderMap::new(0, 0)
+    } else {
+        BorderMap::new(term_w, border_h)
+    };
+    if !border_style.is_none() {
         bmap.add_h_line(0, term_w - 1, 0);
         bmap.add_h_line(0, term_w - 1, border_h - 1);
         bmap.add_v_line(0, 0, border_h - 1);
         bmap.add_v_line(term_w - 1, 0, border_h - 1);
     }
-    for ((x, y), flags) in &bmap.cells {
+    for cell in bmap.into_cells() {
         queue!(
             stdout,
-            cursor::MoveTo(*x, *y),
-            SetForegroundColor(ACTIVE_COLOR),
-            Print(border_char(flags, &chars))
+            cursor::MoveTo(cell.x, cell.y),
+            AnsiForeground(ACTIVE_COLOR),
+            Print(border_char(&cell.flags, &chars))
         )?;
     }
 
     // Title bar
-    let title = format!(" {}:{} [ZOOM] ", pane_idx + 1, label);
-    let avail = term_w.saturating_sub(2) as usize;
-    if avail > title.len() + 1 {
+    let rect = content_area(term_w, term_h, show_status_bar, border_style);
+    let avail = rect.w as usize;
+    let title = truncate_label(
+        &format!(" {}:{} [ZOOM] ", pane_idx + 1, label),
+        avail.saturating_sub(1),
+    );
+    if avail > title.width() {
         queue!(
             stdout,
-            cursor::MoveTo(1, 0),
-            SetForegroundColor(ACTIVE_COLOR),
+            cursor::MoveTo(rect.x, 0),
+            AnsiForeground(ACTIVE_COLOR),
             Print(chars.h),
-            SetForegroundColor(Color::White),
+            AnsiForeground(Color::White),
             SetAttribute(Attribute::Bold),
             Print(&title),
             SetAttribute(Attribute::Reset),
-            SetForegroundColor(ACTIVE_COLOR),
+            AnsiForeground(ACTIVE_COLOR),
         )?;
-        for _ in 0..avail - title.len() - 1 {
+        for _ in 0..avail - title.width() - 1 {
             queue!(stdout, Print(chars.h))?;
         }
     }
 
     // Content area
-    let rect = Rect {
-        x: 1,
-        y: 1,
-        w: term_w.saturating_sub(2),
-        h: border_h.saturating_sub(2),
-    };
     draw_content(stdout, pane, &rect, pane.is_alive(), None)?;
 
     // Cursor
-    if pane.is_alive() {
-        let screen = pane.screen();
-        let (cr, cc) = screen.cursor_position();
-        if cc < rect.w && cr < rect.h {
-            queue!(
-                stdout,
-                cursor::MoveTo(rect.x + cc, rect.y + cr),
-                cursor::Show
-            )?;
-        }
-    }
+    draw_pane_cursor(stdout, pane, &rect)?;
 
     queue!(stdout, ResetColor, SetAttribute(Attribute::Reset))?;
     Ok(())
@@ -2046,16 +2275,15 @@ pub fn render_zoomed_pane(
 // ─── Help Overlay ──────────────────────────────────────────
 
 pub fn draw_help_overlay(stdout: &mut impl Write, term_w: u16, term_h: u16) -> anyhow::Result<()> {
+    if term_w == 0 || term_h == 0 {
+        return Ok(());
+    }
     let help_lines = [
         "",
-        "  DIRECT SHORTCUTS",
-        "  Ctrl+D        Split left|right",
-        "  Ctrl+E        Split top/bottom",
-        "  Ctrl+N        Next pane",
-        "  Ctrl+G / F1   Settings panel",
+        "  DEFAULT SHORTCUTS",
+        "  F1            Settings panel",
         "  F2            Equalize all pane sizes",
         "  Alt+Arrow     Navigate directional",
-        "  Ctrl+W        Quit",
         "",
         "  PREFIX MODE (Ctrl+B then)",
         "  TABS:",
@@ -2074,6 +2302,8 @@ pub fn draw_help_overlay(stdout: &mut impl Write, term_w: u16, term_h: u16) -> a
         "  [             Copy mode (hjkl/v/y/search, q)",
         "  d             Detach session",
         "  s             Toggle status bar",
+        "  r             Reload global config",
+        "  :             Command palette",
         "  ?             This help",
         "",
         "  MOUSE",
@@ -2094,8 +2324,8 @@ pub fn draw_help_overlay(stdout: &mut impl Write, term_w: u16, term_h: u16) -> a
         "          Press any key to close",
     ];
 
-    let w: usize = 50;
-    let h = help_lines.len() + 2; // +2 for top/bottom border
+    let w = 50.min(term_w as usize);
+    let h = (help_lines.len() + 2).min(term_h as usize);
     let ox = term_w.saturating_sub(w as u16) / 2;
     let oy = term_h.saturating_sub(h as u16) / 2;
 
@@ -2113,7 +2343,7 @@ pub fn draw_help_overlay(stdout: &mut impl Write, term_w: u16, term_h: u16) -> a
     // Backdrop
     queue!(
         stdout,
-        SetBackgroundColor(Color::Rgb { r: 4, g: 5, b: 8 }),
+        AnsiBackground(Color::Rgb { r: 4, g: 5, b: 8 }),
         terminal::Clear(ClearType::All)
     )?;
 
@@ -2123,7 +2353,7 @@ pub fn draw_help_overlay(stdout: &mut impl Write, term_w: u16, term_h: u16) -> a
         queue!(
             stdout,
             cursor::MoveTo(ox, oy + dy),
-            SetBackgroundColor(bg),
+            AnsiBackground(bg),
             Print(&blank)
         )?;
     }
@@ -2132,29 +2362,31 @@ pub fn draw_help_overlay(stdout: &mut impl Write, term_w: u16, term_h: u16) -> a
     queue!(
         stdout,
         cursor::MoveTo(ox, oy),
-        SetBackgroundColor(bg),
-        SetForegroundColor(border_fg),
+        AnsiBackground(bg),
+        AnsiForeground(border_fg),
     )?;
-    let title = " Help (Ctrl+B ?) ";
+    let title = truncate_label(" Help (Ctrl+B ?) ", w);
     let pad = w.saturating_sub(title.len() + 2);
     let lp = pad / 2;
     let rp = pad - lp;
     queue!(
         stdout,
         Print("─".repeat(lp)),
-        SetForegroundColor(Color::White),
+        AnsiForeground(Color::White),
         SetAttribute(Attribute::Bold),
         Print(title),
         SetAttribute(Attribute::Reset),
-        SetForegroundColor(border_fg),
-        SetBackgroundColor(bg),
+        AnsiForeground(border_fg),
+        AnsiBackground(bg),
         Print("─".repeat(rp)),
     )?;
 
     // Content
-    for (i, line) in help_lines.iter().enumerate() {
+    for (i, line) in help_lines.iter().take(h.saturating_sub(2)).enumerate() {
+        let line = truncate_label(line, w);
+        let line = format!("{}{}", line, " ".repeat(w.saturating_sub(line.width())));
         let y = oy + 1 + i as u16;
-        queue!(stdout, cursor::MoveTo(ox, y), SetBackgroundColor(bg))?;
+        queue!(stdout, cursor::MoveTo(ox, y), AnsiBackground(bg))?;
 
         if line.contains("SHORTCUTS")
             || line.contains("PREFIX MODE")
@@ -2163,7 +2395,7 @@ pub fn draw_help_overlay(stdout: &mut impl Write, term_w: u16, term_h: u16) -> a
         {
             queue!(
                 stdout,
-                SetForegroundColor(Color::Rgb {
+                AnsiForeground(Color::Rgb {
                     r: 102,
                     g: 217,
                     b: 239
@@ -2175,7 +2407,7 @@ pub fn draw_help_overlay(stdout: &mut impl Write, term_w: u16, term_h: u16) -> a
         } else if line.contains("Press any key") {
             queue!(
                 stdout,
-                SetForegroundColor(Color::Rgb {
+                AnsiForeground(Color::Rgb {
                     r: 90,
                     g: 98,
                     b: 110
@@ -2186,7 +2418,7 @@ pub fn draw_help_overlay(stdout: &mut impl Write, term_w: u16, term_h: u16) -> a
             // Split at first run of spaces >= 8 for key/description alignment
             queue!(
                 stdout,
-                SetForegroundColor(Color::Rgb {
+                AnsiForeground(Color::Rgb {
                     r: 190,
                     g: 200,
                     b: 212,
@@ -2200,8 +2432,8 @@ pub fn draw_help_overlay(stdout: &mut impl Write, term_w: u16, term_h: u16) -> a
     queue!(
         stdout,
         cursor::MoveTo(ox, oy + h as u16 - 1),
-        SetBackgroundColor(bg),
-        SetForegroundColor(border_fg),
+        AnsiBackground(bg),
+        AnsiForeground(border_fg),
         Print("─".repeat(w)),
     )?;
 
@@ -2222,6 +2454,9 @@ pub fn draw_pane_numbers(
     layout: &Layout,
     inner: &Rect,
 ) -> anyhow::Result<()> {
+    if inner.w == 0 || inner.h == 0 {
+        return Ok(());
+    }
     let rects = layout.pane_rects(inner);
     let ids = layout.pane_ids();
 
@@ -2233,11 +2468,11 @@ pub fn draw_pane_numbers(
             let num = num.to_string();
             let num_w = num.len() as u16;
 
-            if rect.w < num_w + 2 || rect.h < 3 {
+            if rect.w < num_w + 4 || rect.h < 3 {
                 continue;
             }
 
-            let cx = rect.x + (rect.w - num_w - 2) / 2;
+            let cx = rect.x + (rect.w - num_w - 4) / 2;
             let cy = rect.y + rect.h / 2 - 1;
 
             let bg = Color::Rgb {
@@ -2257,7 +2492,7 @@ pub fn draw_pane_numbers(
                 queue!(
                     stdout,
                     cursor::MoveTo(cx, cy + dy),
-                    SetBackgroundColor(bg),
+                    AnsiBackground(bg),
                     Print(" ".repeat(box_w)),
                 )?;
             }
@@ -2266,8 +2501,8 @@ pub fn draw_pane_numbers(
             queue!(
                 stdout,
                 cursor::MoveTo(cx + 2, cy + 1),
-                SetBackgroundColor(bg),
-                SetForegroundColor(fg),
+                AnsiBackground(bg),
+                AnsiForeground(fg),
                 SetAttribute(Attribute::Bold),
                 Print(&num),
                 SetAttribute(Attribute::Reset),
@@ -2276,13 +2511,16 @@ pub fn draw_pane_numbers(
     }
 
     // Hint at bottom
-    let hint = "Press 1-9 or 0 to jump, any other key to cancel";
+    let hint = truncate_label(
+        "Press 1-9 or 0 to jump, any other key to cancel",
+        inner.w as usize,
+    );
     let hx = inner.x + inner.w.saturating_sub(hint.len() as u16) / 2;
-    let hy = inner.y + inner.h;
+    let hy = inner.y.saturating_add(inner.h.saturating_sub(1));
     queue!(
         stdout,
         cursor::MoveTo(hx, hy),
-        SetForegroundColor(Color::Rgb {
+        AnsiForeground(Color::Rgb {
             r: 90,
             g: 98,
             b: 110,
@@ -2303,11 +2541,17 @@ fn quick_jump_label(index: usize) -> Option<char> {
     }
 }
 
-fn vt100_to_crossterm(color: vt100::Color) -> Color {
+/// Child output must not inherit crossterm's process-wide NO_COLOR filtering.
+fn write_pane_color(
+    stdout: &mut impl Write,
+    color: vt100::Color,
+    foreground: bool,
+) -> std::io::Result<()> {
+    let slot = if foreground { 38 } else { 48 };
     match color {
-        vt100::Color::Default => Color::Reset,
-        vt100::Color::Idx(i) => Color::AnsiValue(i),
-        vt100::Color::Rgb(r, g, b) => Color::Rgb { r, g, b },
+        vt100::Color::Default => write!(stdout, "\x1b[{}m", slot + 1),
+        vt100::Color::Idx(i) => write!(stdout, "\x1b[{slot};5;{i}m"),
+        vt100::Color::Rgb(r, g, b) => write!(stdout, "\x1b[{slot};2;{r};{g};{b}m"),
     }
 }
 
@@ -2323,6 +2567,232 @@ mod partial_redraw_tests {
     //!      blinks on the bar row.
 
     use super::*;
+
+    #[test]
+    fn bounded_dense_border_map_matches_sparse_flags_and_order() {
+        let mut dense = BorderMap::new(80, 24);
+        let mut sparse = BorderMap::new(80, 24);
+        sparse.dense.clear();
+        for map in [&mut dense, &mut sparse] {
+            map.add_h_line(0, 79, 0);
+            map.add_h_line(0, 79, 23);
+            map.add_h_line(8, 60, 12);
+            map.add_v_line(0, 0, 23);
+            map.add_v_line(40, 0, 23);
+            map.add_v_line(79, 0, 23);
+        }
+        let flatten = |map: BorderMap| {
+            map.into_cells()
+                .into_iter()
+                .map(|c| (c.x, c.y, c.flags))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(flatten(dense), flatten(sparse));
+        assert!(BorderMap::new(u16::MAX, u16::MAX).dense.is_empty());
+    }
+
+    #[test]
+    fn reliability_ansi16_commands_use_legacy_sgr_or_no_color() {
+        let mut output = String::new();
+        write_ui_color(&mut output, Color::AnsiValue(1), true).unwrap();
+        write_ui_color(&mut output, Color::White, false).unwrap();
+        if crossterm::style::Colored::ansi_color_disabled_memoized() {
+            assert!(output.is_empty());
+        } else {
+            assert_eq!(output, "\x1b[31m\x1b[107m");
+        }
+    }
+
+    #[test]
+    fn reliability_copy_overlay_highlights_display_spans_and_shows_cursor() {
+        let mut source = vt100::Parser::new(2, 10, 0);
+        source.process("한 test".as_bytes());
+        let mut state = CopyModeState::new(2, 10);
+        state.cursor_row = 0;
+        state.cursor_col = 3;
+        state.search_matches = vec![(0, 0, 2)];
+        state.phase = crate::copy_mode::Phase::VisualChar {
+            anchor_row: 0,
+            anchor_col: 3,
+        };
+        let mut output = Vec::new();
+        draw_copy_mode_overlay(
+            &mut output,
+            source.screen(),
+            &Rect {
+                x: 1,
+                y: 1,
+                w: 10,
+                h: 2,
+            },
+            &state,
+        )
+        .unwrap();
+        let mut actual = vt100::Parser::new(4, 12, 0);
+        actual.process(&output);
+        assert_eq!(
+            actual.screen().cell(1, 1).unwrap().bgcolor(),
+            vt100::Color::Idx(3)
+        );
+        assert!(actual.screen().cell(1, 4).unwrap().inverse());
+        assert_eq!(actual.screen().cursor_position(), (1, 4));
+        assert!(!actual.screen().hide_cursor());
+    }
+
+    #[test]
+    fn reliability_zero_sized_bars_emit_nothing() {
+        for (w, h) in [(0, 24), (80, 0)] {
+            let mut buf = Vec::new();
+            draw_status_bar(&mut buf, w, h, 0, 1, "").unwrap();
+            draw_text_input(&mut buf, w, h, ":", "text").unwrap();
+            draw_flash_message(&mut buf, w, h, "message").unwrap();
+            assert!(buf.is_empty());
+        }
+    }
+
+    #[test]
+    fn reliability_labels_cannot_inject_terminal_controls() {
+        assert_eq!(truncate_label("hi\x1b\n\r\u{7}there", 20), "hithere");
+    }
+
+    #[test]
+    fn reliability_text_input_uses_display_width_and_stays_on_row() {
+        let mut buf = Vec::new();
+        draw_text_input(&mut buf, 8, 3, ":", "한e\u{301}").unwrap();
+        let mut parser = vt100::Parser::new(3, 8, 0);
+        parser.process(&buf);
+        assert_eq!(parser.screen().cursor_position(), (2, 6));
+        buf.clear();
+        draw_text_input(&mut buf, 8, 3, ":", &"x".repeat(100)).unwrap();
+        parser.process(&buf);
+        assert!(parser.screen().rows(0, 8).take(2).all(|row| row.is_empty()));
+    }
+
+    #[test]
+    fn reliability_content_preserves_attributes_colours_and_unicode() {
+        let mut source = vt100::Parser::new(2, 20, 0);
+        source.process(
+            "\x1b[1;31mA\x1b[22;3mB\x1b[23;4mC\x1b[24mD\x1b[7mE\x1b[0m한e\u{301}🙂X".as_bytes(),
+        );
+        let mut output = Vec::new();
+        let rect = Rect {
+            x: 1,
+            y: 1,
+            w: 20,
+            h: 2,
+        };
+        draw_screen_content(&mut output, source.screen(), &rect, true, None).unwrap();
+        let mut actual = vt100::Parser::new(4, 22, 0);
+        actual.process(b"\x1b[1;32;45m");
+        actual.process(&output);
+        for row in 0..2 {
+            for col in 0..20 {
+                let expected = source.screen().cell(row, col).unwrap();
+                let got = actual.screen().cell(row + 1, col + 1).unwrap();
+                assert_eq!(
+                    got.contents(),
+                    if expected.contents().is_empty() && !expected.is_wide_continuation() {
+                        " "
+                    } else {
+                        expected.contents()
+                    },
+                    "cell {row},{col}"
+                );
+                assert_eq!(
+                    (got.bold(), got.italic(), got.underline(), got.inverse()),
+                    (
+                        expected.bold(),
+                        expected.italic(),
+                        expected.underline(),
+                        expected.inverse()
+                    ),
+                    "attributes {row},{col}"
+                );
+                assert_eq!(
+                    (got.fgcolor(), got.bgcolor()),
+                    (expected.fgcolor(), expected.bgcolor()),
+                    "colours {row},{col}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reliability_clipped_wide_cell_stays_inside_pane() {
+        let mut source = vt100::Parser::new(1, 4, 0);
+        source.process("a한".as_bytes());
+        let mut buf = Vec::new();
+        draw_screen_content(
+            &mut buf,
+            source.screen(),
+            &Rect {
+                x: 1,
+                y: 0,
+                w: 2,
+                h: 1,
+            },
+            true,
+            None,
+        )
+        .unwrap();
+        let mut actual = vt100::Parser::new(2, 6, 0);
+        actual.process(b"......\r\n......");
+        actual.process(&buf);
+        assert_eq!(actual.screen().cell(0, 3).unwrap().contents(), ".");
+        assert_eq!(actual.screen().cell(0, 2).unwrap().contents(), " ");
+    }
+
+    #[test]
+    fn reliability_border_cache_and_content_geometry_agree() {
+        for style in [BorderStyle::Rounded, BorderStyle::None] {
+            for status in [false, true] {
+                for w in 0..10 {
+                    for h in 0..10 {
+                        let layout = Layout::from_grid(3, 3);
+                        let cache = build_border_cache_with_style(&layout, status, w, h, style);
+                        let area = content_area(w, h, status, style);
+                        assert_eq!(
+                            (cache.inner.x, cache.inner.y, cache.inner.w, cache.inner.h),
+                            (area.x, area.y, area.w, area.h)
+                        );
+                        for cell in &cache.cells {
+                            assert!(
+                                cell.x < w && cell.y < h.saturating_sub(u16::from(status)),
+                                "border cell {},{} in {w}x{h}",
+                                cell.x,
+                                cell.y
+                            );
+                        }
+                        for rect in cache.pane_rects.values() {
+                            assert!(rect.x + rect.w <= w && rect.y + rect.h <= h);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reliability_tab_hits_match_multi_digit_and_cjk_labels() {
+        let tabs = vec![(9, "한".to_string(), true), (10, "log".to_string(), false)];
+        let mut output = Vec::new();
+        draw_tab_bar(&mut output, 40, 3, &tabs, true, None).unwrap();
+        let mut parser = vt100::Parser::new(3, 40, 0);
+        parser.process(&output);
+        let first_end = 1 + tab_label_parts(9, "한").2;
+        assert_eq!(tab_bar_hit(1, &tabs, 40), Some(9));
+        assert_eq!(tab_bar_hit(first_end as u16 - 1, &tabs, 40), Some(9));
+        assert_eq!(tab_bar_hit(first_end as u16, &tabs, 40), None);
+        assert_eq!(tab_bar_hit(first_end as u16 + 2, &tabs, 40), Some(10));
+        assert_eq!(
+            parser
+                .screen()
+                .cell(1, first_end as u16 + 1)
+                .unwrap()
+                .contents(),
+            "│"
+        );
+    }
 
     #[test]
     fn redraw_status_only_emits_bytes_and_hides_cursor() {
@@ -2348,6 +2818,25 @@ mod partial_redraw_tests {
         let mut buf: Vec<u8> = Vec::new();
         redraw_status_only(&mut buf, 80, 24, 0, 1, "", "", 0, None).expect("succeeds");
         assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn reliability_default_hints_do_not_advertise_shell_editing_keys() {
+        for mode in ["", "ZOOM"] {
+            let mut output = Vec::new();
+            draw_status_bar(&mut output, 300, 4, 0, 1, mode).unwrap();
+            let text = String::from_utf8_lossy(&output);
+            for old_binding in ["Ctrl+D", "Ctrl+E", "Ctrl+N", "Ctrl+G", "Ctrl+B p"] {
+                assert!(!text.contains(old_binding), "{mode}: stale {old_binding}");
+            }
+            assert!(text.contains("Ctrl+B"));
+        }
+        let mut output = Vec::new();
+        draw_help_overlay(&mut output, 100, 100).unwrap();
+        let text = String::from_utf8_lossy(&output);
+        for old_binding in ["Ctrl+D", "Ctrl+E", "Ctrl+N", "Ctrl+G", "Ctrl+W"] {
+            assert!(!text.contains(old_binding), "help: stale {old_binding}");
+        }
     }
 
     #[test]

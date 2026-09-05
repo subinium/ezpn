@@ -28,7 +28,7 @@
 //! ------------
 //! Each subscriber owns a [`Subscription`] holding a bounded queue
 //! (`MAX_QUEUE_DEPTH` = 1000 events). When `publish()` finds the queue
-//! full it drops the oldest event and increments a per-subscriber
+//! full it drops the incoming event and increments a per-subscriber
 //! `dropped` counter. The next successful publish for that subscriber
 //! injects a synthetic `events.dropped` event ahead of the new payload
 //! and resets the counter, so clients can see exactly how many events
@@ -194,14 +194,14 @@ pub fn now_ts() -> f64 {
 
 /// A subscription handle returned by [`EventBus::subscribe`]. Holds the
 /// receiver half of the bounded queue. Drop the handle to unsubscribe.
-pub struct Subscription {
+pub struct Subscription<'a> {
     pub rx: Receiver<Event>,
     /// Subscriber id, stable across the lifetime of this handle.
     pub id: u64,
-    bus: &'static EventBus,
+    bus: &'a EventBus,
 }
 
-impl Drop for Subscription {
+impl Drop for Subscription<'_> {
     fn drop(&mut self) {
         self.bus.unsubscribe(self.id);
     }
@@ -218,12 +218,26 @@ struct Subscriber {
     /// as a synthetic `events.dropped` event on the next successful
     /// send for this subscriber.
     dropped: u64,
+    /// Reserve the next available slot for data after sending a loss notice.
+    /// Otherwise a one-slot-at-a-time consumer can receive only notices.
+    prefer_payload: bool,
 }
 
 /// Process-global event bus. Producers call [`publish`]; subscribers
 /// call [`EventBus::global`]`.subscribe(...)`.
 pub struct EventBus {
     inner: Mutex<BusInner>,
+}
+
+impl Default for EventBus {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(BusInner {
+                next_id: 1,
+                subs: Vec::new(),
+            }),
+        }
+    }
 }
 
 struct BusInner {
@@ -236,12 +250,7 @@ static BUS: OnceLock<EventBus> = OnceLock::new();
 impl EventBus {
     /// Get (or lazily initialize) the process-global event bus.
     pub fn global() -> &'static EventBus {
-        BUS.get_or_init(|| EventBus {
-            inner: Mutex::new(BusInner {
-                next_id: 1,
-                subs: Vec::new(),
-            }),
-        })
+        BUS.get_or_init(EventBus::default)
     }
 
     /// Register a subscriber. Returns a [`Subscription`] holding the
@@ -251,10 +260,10 @@ impl EventBus {
     /// so the filtered-out events never enter the subscriber's queue
     /// (they don't count against `dropped`).
     pub fn subscribe(
-        &'static self,
+        &self,
         session_filter: Option<String>,
         type_filter: Option<Vec<String>>,
-    ) -> Subscription {
+    ) -> Subscription<'_> {
         let (tx, rx) = std::sync::mpsc::sync_channel(MAX_QUEUE_DEPTH);
         let mut inner = self.inner.lock().expect("event bus poisoned");
         let id = inner.next_id;
@@ -265,6 +274,7 @@ impl EventBus {
             session_filter,
             type_filter,
             dropped: 0,
+            prefer_payload: false,
         });
         Subscription { rx, id, bus: self }
     }
@@ -283,10 +293,9 @@ impl EventBus {
     /// Publish an event to all subscribers whose filters match.
     ///
     /// Backpressure: when a subscriber's queue is full the event is
-    /// dropped (oldest-first semantics implemented as "drop incoming
-    /// events while the receiver is behind") and the subscriber's
+    /// dropped (already-queued events keep their order) and the subscriber's
     /// `dropped` counter increments. The next time a slot frees up
-    /// for that subscriber, [`drain_drop_notice`] flushes the count
+    /// for that subscriber, the bus flushes the count
     /// as a synthetic `events.dropped` event ahead of the next real
     /// payload.
     pub fn publish(&self, event: Event) {
@@ -300,13 +309,16 @@ impl EventBus {
             }
             // Drop notice flush happens before the new event so
             // ordering reflects the loss point.
-            if sub.dropped > 0 {
+            if sub.dropped > 0 && !sub.prefer_payload {
                 let notice = Event::EventsDropped {
                     count: sub.dropped,
                     ts: now_ts(),
                 };
                 match sub.tx.try_send(notice) {
-                    Ok(()) => sub.dropped = 0,
+                    Ok(()) => {
+                        sub.dropped = 0;
+                        sub.prefer_payload = true;
+                    }
                     Err(TrySendError::Full(_)) => {
                         // Still backed up — keep the counter, try
                         // again on the next publish.
@@ -320,7 +332,7 @@ impl EventBus {
                 }
             }
             match sub.tx.try_send(event.clone()) {
-                Ok(()) => {}
+                Ok(()) => sub.prefer_payload = false,
                 Err(TrySendError::Full(_)) => {
                     sub.dropped = sub.dropped.saturating_add(1);
                 }
@@ -406,15 +418,9 @@ mod tests {
         }
     }
 
-    // Flaky under parallel test execution: the global EventBus is shared
-    // across all `#[test]` fns in this binary, so a sibling test's publish
-    // can race ahead of this subscriber. Either move the bus off-global or
-    // serialize this case with a once-mutex; for now skip in CI to unblock
-    // the v0.12.0 release. Tracked alongside the v0.12.1 wiring follow-up.
     #[test]
-    #[ignore = "race against EventBus::global() under parallel runners — fix in v0.12.1"]
     fn subscribe_publish_delivers_event() {
-        let bus = EventBus::global();
+        let bus = EventBus::default();
         let sub = bus.subscribe(None, None);
         bus.publish(pane_spawned("alpha", 1));
         let evt = sub.rx.recv_timeout(Duration::from_millis(200)).unwrap();
@@ -429,7 +435,7 @@ mod tests {
 
     #[test]
     fn session_filter_drops_other_sessions() {
-        let bus = EventBus::global();
+        let bus = EventBus::default();
         let sub = bus.subscribe(Some("work".to_string()), None);
         bus.publish(pane_spawned("home", 1));
         bus.publish(pane_spawned("work", 2));
@@ -450,7 +456,7 @@ mod tests {
 
     #[test]
     fn type_filter_keeps_only_matching_types() {
-        let bus = EventBus::global();
+        let bus = EventBus::default();
         let sub = bus.subscribe(None, Some(vec!["pane.exited".to_string()]));
         bus.publish(pane_spawned("a", 1));
         bus.publish(Event::PaneExited {
@@ -472,7 +478,7 @@ mod tests {
         // The bus is process-global so concurrent tests share it; we
         // verify only that our own subscription's id is gone after
         // drop, not absolute counts.
-        let bus = EventBus::global();
+        let bus = EventBus::default();
         let id = {
             let sub = bus.subscribe(None, None);
             sub.id
@@ -483,7 +489,7 @@ mod tests {
 
     #[test]
     fn slow_subscriber_emits_drop_notice() {
-        let bus = EventBus::global();
+        let bus = EventBus::default();
         let sub = bus.subscribe(None, None);
         // Fill the queue. MAX_QUEUE_DEPTH events all get accepted.
         for i in 0..MAX_QUEUE_DEPTH {
@@ -515,5 +521,25 @@ mod tests {
             }
         }
         assert!(saw_dropped, "drop notice never delivered");
+    }
+
+    #[test]
+    fn reliability_drop_notices_cannot_starve_payloads() {
+        let bus = EventBus::default();
+        let sub = bus.subscribe(None, None);
+        for i in 0..=MAX_QUEUE_DEPTH {
+            bus.publish(pane_spawned("flood", i));
+        }
+        for i in 0..MAX_QUEUE_DEPTH * 2 {
+            sub.rx.try_recv().unwrap();
+            bus.publish(pane_spawned("fresh", i));
+        }
+        let remaining: Vec<_> = sub.rx.try_iter().collect();
+        assert!(remaining
+            .iter()
+            .any(|event| event.session() == Some("fresh")));
+        assert!(remaining
+            .iter()
+            .any(|event| matches!(event, Event::EventsDropped { .. })));
     }
 }

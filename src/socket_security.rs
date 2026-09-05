@@ -25,11 +25,107 @@
 // loading. Keeping the allow() narrow avoids hiding genuinely-dead code.
 #![allow(dead_code)]
 
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
+
+/// Unlike a blocking UnixStream::connect, this also bounds a full listener
+/// backlog (notably during daemon startup or under connection floods).
+pub fn connect_with_timeout(
+    path: &Path,
+    timeout: std::time::Duration,
+) -> std::io::Result<UnixStream> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.is_empty() || bytes.contains(&0) || bytes.len() >= address.sun_path.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid Unix socket path",
+        ));
+    }
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (dest, byte) in address.sun_path.iter_mut().zip(bytes) {
+        *dest = *byte as libc::c_char;
+    }
+    let len =
+        (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1) as libc::socklen_t;
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: socket() returned a new, uniquely-owned descriptor.
+    let stream = unsafe { UnixStream::from_raw_fd(fd) };
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    stream.set_nonblocking(true)?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let rc = unsafe { libc::connect(fd, &address as *const _ as *const libc::sockaddr, len) };
+        if rc == 0 {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EAGAIN) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "socket connect deadline exceeded",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Some(libc::EINPROGRESS) | Some(libc::EINTR) => {
+                loop {
+                    let remaining = deadline
+                        .checked_duration_since(std::time::Instant::now())
+                        .ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "socket connect deadline exceeded",
+                            )
+                        })?;
+                    let mut poll = libc::pollfd {
+                        fd: stream.as_raw_fd(),
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    };
+                    let rc = unsafe {
+                        libc::poll(
+                            &mut poll,
+                            1,
+                            remaining.as_millis().max(1).min(i32::MAX as u128) as i32,
+                        )
+                    };
+                    if rc < 0 {
+                        let error = std::io::Error::last_os_error();
+                        if error.kind() == std::io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                    if rc == 0 {
+                        continue;
+                    }
+                    if let Some(error) = stream.take_error()? {
+                        return Err(error);
+                    }
+                    stream.peer_addr()?;
+                    break;
+                }
+                break;
+            }
+            _ => return Err(error),
+        }
+    }
+    stream.set_nonblocking(false)?;
+    Ok(stream)
+}
 
 /// Inspect the directory that will host the daemon socket.
 ///
@@ -67,6 +163,10 @@ pub fn harden_socket_dir(path: &Path) -> Result<()> {
     let perm = meta.mode() & 0o777;
     let sticky = meta.mode() & 0o1000 != 0;
 
+    if meta.uid() == 0 && sticky {
+        // Root-owned sticky shared directories are also valid for root.
+        return Ok(());
+    }
     if owned_by_us {
         // Our own dir: nothing in group/other should ever have access.
         if perm & 0o077 != 0 {
@@ -80,9 +180,9 @@ pub fn harden_socket_dir(path: &Path) -> Result<()> {
         // Foreign-owned dir (e.g. /tmp owned by root). We accept it only
         // if the sticky bit is set, which is the OS contract that
         // protects against symlink/rename attacks across users.
-        if !sticky {
+        if !sticky || meta.uid() != 0 {
             bail!(
-                "socket dir {} is owned by uid {} (not {}) and lacks the sticky bit — refusing to bind",
+                "socket dir {} is owned by untrusted uid {} (not {}) or lacks the sticky bit — refusing to bind",
                 path.display(),
                 meta.uid(),
                 our_uid
@@ -102,11 +202,25 @@ pub fn harden_socket_dir(path: &Path) -> Result<()> {
 pub fn fix_socket_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
+    let before = std::fs::symlink_metadata(path)?;
+    if !before.file_type().is_socket() || before.uid() != unsafe { libc::getuid() } {
+        bail!(
+            "refusing to chmod non-socket or foreign-owned socket: {}",
+            path.display()
+        );
+    }
+
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("chmod 0600 failed for {}", path.display()))?;
 
-    let meta = std::fs::metadata(path)
+    let meta = std::fs::symlink_metadata(path)
         .with_context(|| format!("socket stat failed: {}", path.display()))?;
+    if meta.dev() != before.dev() || meta.ino() != before.ino() || !meta.file_type().is_socket() {
+        bail!(
+            "socket changed while setting permissions: {}",
+            path.display()
+        );
+    }
 
     let perm = meta.mode() & 0o777;
     if perm != 0o600 {
@@ -128,6 +242,90 @@ pub fn fix_socket_permissions(path: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Remove only an owned, unchanged socket that the kernel reports refused.
+/// Timeouts, permission errors, successful connects and ordinary files are
+/// never evidence that a live session can safely be replaced.
+pub fn remove_stale_socket(path: &Path) -> Result<()> {
+    let before = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    if !before.file_type().is_socket() || before.uid() != unsafe { libc::getuid() } {
+        bail!(
+            "refusing to replace non-socket or foreign socket: {}",
+            path.display()
+        );
+    }
+    match connect_with_timeout(path, std::time::Duration::from_millis(200)) {
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
+        Err(e) => return Err(e).context("cannot establish that socket is stale"),
+        Ok(_) => bail!("session socket is already in use: {}", path.display()),
+    }
+    let after = std::fs::symlink_metadata(path)?;
+    if after.dev() != before.dev() || after.ino() != before.ino() {
+        bail!("socket changed during stale check: {}", path.display());
+    }
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+/// Cleanup only the inode this daemon bound, including failed startup.
+pub struct SocketCleanupGuard {
+    path: std::path::PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+impl SocketCleanupGuard {
+    pub fn new(path: &Path) -> Result<Self> {
+        let meta = std::fs::symlink_metadata(path)?;
+        if !meta.file_type().is_socket() || meta.uid() != unsafe { libc::getuid() } {
+            bail!("not an owned socket: {}", path.display());
+        }
+        Ok(Self {
+            path: path.to_owned(),
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })
+    }
+}
+
+impl Drop for SocketCleanupGuard {
+    fn drop(&mut self) {
+        if std::fs::symlink_metadata(&self.path).is_ok_and(|meta| {
+            meta.dev() == self.dev && meta.ino() == self.ino && meta.file_type().is_socket()
+        }) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+        if self
+            .path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("ezpn-session-"))
+        {
+            if let Some(parent) = self.path.parent() {
+                for entry in std::fs::read_dir(parent).into_iter().flatten().flatten() {
+                    if !entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("ezpn-session-")
+                    {
+                        continue;
+                    }
+                    let path = entry.path();
+                    if std::fs::symlink_metadata(&path).is_ok_and(|meta| {
+                        meta.file_type().is_socket()
+                            && meta.dev() == self.dev
+                            && meta.ino() == self.ino
+                    }) {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Compose the abstract-namespace socket name for a session.
@@ -231,6 +429,53 @@ pub fn peer_uid(stream: &UnixStream) -> Result<u32> {
     }
 }
 
+/// Startup readiness must come from the child we launched, not a daemon
+/// that already owned the requested session name.
+pub fn peer_pid(stream: &UnixStream) -> Result<u32> {
+    use std::os::fd::AsRawFd;
+    #[cfg(target_os = "linux")]
+    {
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut cred as *mut libc::ucred).cast(),
+                &mut len,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        u32::try_from(cred.pid).context("invalid peer pid")
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        let mut pid: libc::pid_t = 0;
+        let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERPID,
+                (&mut pid as *mut libc::pid_t).cast(),
+                &mut len,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        u32::try_from(pid).context("invalid peer pid")
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+    {
+        let _ = stream;
+        bail!("peer pid check not implemented on this platform");
+    }
+}
+
 /// Verify that a secrets file is owned by us and mode `0o600`.
 ///
 /// Intended for `$XDG_RUNTIME_DIR/ezpn/secrets.toml` (and any future
@@ -239,7 +484,7 @@ pub fn peer_uid(stream: &UnixStream) -> Result<u32> {
 /// is the kind of bug that should fail loud, not be re-implemented in
 /// each call site.
 pub fn verify_secrets_file(path: &Path) -> Result<()> {
-    let meta = std::fs::metadata(path)
+    let meta = std::fs::symlink_metadata(path)
         .with_context(|| format!("secrets file stat failed: {}", path.display()))?;
 
     if !meta.is_file() {
@@ -273,6 +518,62 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
+
+    #[test]
+    fn bounded_connect_roundtrips_and_rejects_invalid_path() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("connect.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let stream = connect_with_timeout(&path, std::time::Duration::from_millis(100)).unwrap();
+        assert_eq!(peer_uid(&stream).unwrap(), unsafe { libc::getuid() });
+        assert_eq!(peer_pid(&stream).unwrap(), std::process::id());
+        let (_peer, _) = listener.accept().unwrap();
+        assert!(connect_with_timeout(Path::new(""), std::time::Duration::from_millis(1)).is_err());
+    }
+
+    #[test]
+    fn stale_socket_cleanup_preserves_non_socket_files() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("socket");
+        std::fs::write(&path, b"keep").unwrap();
+        assert!(remove_stale_socket(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn socket_guard_does_not_remove_replacement_inode() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("socket");
+        let _first = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let guard = SocketCleanupGuard::new(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let _replacement = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        drop(guard);
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn socket_chmod_refuses_symlink_without_touching_target() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("socket");
+        std::fs::write(&target, b"keep").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(fix_socket_permissions(&link).is_err());
+        assert_eq!(std::fs::metadata(&target).unwrap().mode() & 0o777, 0o644);
+    }
+
+    #[test]
+    fn secrets_refuses_symlink() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("secrets.toml");
+        std::fs::write(&target, b"secret").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(verify_secrets_file(&link).is_err());
+    }
 
     #[test]
     fn harden_socket_dir_accepts_0700() {
@@ -311,7 +612,7 @@ mod tests {
     fn fix_socket_permissions_chmods_and_verifies() {
         let dir = tempdir().unwrap();
         let p = dir.path().join("sock");
-        std::fs::write(&p, b"").unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(&p).unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         fix_socket_permissions(&p).expect("chmod must succeed");

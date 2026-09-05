@@ -6,11 +6,14 @@
 //! ([`copy`]) that the yank path calls. When no tool is available the
 //! caller is expected to fall back to OSC 52 (current behaviour).
 //!
-//! Detection order, first available wins:
+//! Auto-detection is disabled for SSH daemons (`SSH_CONNECTION` or `SSH_TTY`)
+//! so user-triggered copies fall back to the attached terminal's OSC 52 path.
+//! Only an explicit, non-empty command override opts into a remote tool.
+//! Detection order for local sessions, first available wins:
 //!   1. `$WAYLAND_DISPLAY` set + `wl-copy` on `PATH` → `wl-copy`.
 //!   2. `$DISPLAY` set + `xclip` on `PATH` → `xclip -selection clipboard`.
 //!   3. `$DISPLAY` set + `xsel` on `PATH` → `xsel --clipboard --input`.
-//!   4. `cfg(target_os = "macos")` (or `uname -s == Darwin`) → `pbcopy`.
+//!   4. `cfg(target_os = "macos")` → `pbcopy`.
 //!   5. None — caller falls back to OSC 52.
 //!
 //! User overrides come from `[clipboard]` in the config file:
@@ -30,14 +33,16 @@
 //! Detection runs in the **daemon** process. When the daemon was
 //! launched over SSH, environment variables and PATH refer to the
 //! remote machine, so the clipboard exec lands in the SSH server's
-//! clipboard — almost never what the user wanted. The per-attach
-//! `--clipboard-mode local|daemon` flag is the eventual mitigation;
-//! see `docs/clipboard.md` (TODO).
+//! clipboard. Auto-detection therefore opts out on SSH daemons. A daemon
+//! launched locally and later attached over SSH cannot be identified from
+//! this environment alone; per-attachment forwarding policy belongs to the
+//! caller. This module does not authorize clipboard requests from child apps.
 
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 /// A resolved clipboard command: program path + leading argv tail.
 ///
@@ -93,10 +98,16 @@ impl CopyCommand {
 /// auto-detect).
 ///
 /// Detection result is **cached for the daemon process lifetime** —
-/// re-resolving on every yank would fork three child processes for the
-/// PATH lookup. The cache is keyed on the override slice so calls with
-/// `None`/empty share a single slot.
+/// repeated PATH metadata probes are unnecessary on every yank. Explicit
+/// overrides bypass the cache; `None`/empty share a single local slot.
 pub fn resolve(override_argv: Option<&[String]>) -> Option<CopyCommand> {
+    resolve_for_session(
+        override_argv,
+        env_set("SSH_CONNECTION") || env_set("SSH_TTY"),
+    )
+}
+
+fn resolve_for_session(override_argv: Option<&[String]>, remote: bool) -> Option<CopyCommand> {
     if let Some(argv) = override_argv {
         if !argv.is_empty() {
             // No PATH check — trust user. Empty program is rejected.
@@ -108,6 +119,10 @@ pub fn resolve(override_argv: Option<&[String]>) -> Option<CopyCommand> {
             let args: Vec<String> = iter.collect();
             return Some(CopyCommand::new_override(program, args));
         }
+    }
+
+    if remote {
+        return None;
     }
 
     static AUTO: OnceLock<Option<CopyCommand>> = OnceLock::new();
@@ -182,34 +197,91 @@ fn is_executable(path: &std::path::Path) -> bool {
 /// to fall back to OSC 52. Errors here are non-fatal.
 pub fn copy(text: &str, override_argv: Option<&[String]>) -> Result<String, ClipboardError> {
     let cmd = resolve(override_argv).ok_or(ClipboardError::NoCommand)?;
+    copy_with_timeout(text, &cmd, Duration::from_secs(2))
+}
+
+fn copy_with_timeout(
+    text: &str,
+    cmd: &CopyCommand,
+    timeout: Duration,
+) -> Result<String, ClipboardError> {
     let label = cmd.label();
-    let mut child = Command::new(&cmd.program)
+    let mut command = Command::new(&cmd.program);
+    command
         .args(&cmd.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| ClipboardError::Spawn {
-            program: cmd.program.clone(),
-            source: e,
-        })?;
+        .stderr(Stdio::null());
+    #[cfg(unix)]
     {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .ok_or(ClipboardError::StdinUnavailable)?;
-        stdin
-            .write_all(text.as_bytes())
-            .map_err(ClipboardError::Write)?;
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
     }
-    let status = child.wait().map_err(ClipboardError::Wait)?;
-    if !status.success() {
-        return Err(ClipboardError::ExitStatus {
-            program: cmd.program.clone(),
-            code: status.code(),
-        });
+    let mut child = command.spawn().map_err(|e| ClipboardError::Spawn {
+        program: cmd.program.clone(),
+        source: e,
+    })?;
+    let result = (|| {
+        let mut stdin = child.stdin.take().ok_or(ClipboardError::StdinUnavailable)?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let fd = stdin.as_raw_fd();
+            // The pipe must not block before the child-wait deadline is checked.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+            {
+                return Err(ClipboardError::Write(std::io::Error::last_os_error()));
+            }
+        }
+        let deadline = Instant::now() + timeout;
+        let mut remaining = text.as_bytes();
+        while !remaining.is_empty() {
+            if Instant::now() >= deadline {
+                return Err(ClipboardError::Timeout {
+                    program: cmd.program.clone(),
+                });
+            }
+            match stdin.write(remaining) {
+                Ok(0) => return Err(ClipboardError::Write(std::io::ErrorKind::WriteZero.into())),
+                Ok(n) => remaining = &remaining[n..],
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => return Err(ClipboardError::Write(e)),
+            }
+        }
+        drop(stdin);
+        loop {
+            if let Some(status) = child.try_wait().map_err(ClipboardError::Wait)? {
+                return if status.success() {
+                    Ok(label)
+                } else {
+                    Err(ClipboardError::ExitStatus {
+                        program: cmd.program.clone(),
+                        code: status.code(),
+                    })
+                };
+            }
+            if Instant::now() >= deadline {
+                return Err(ClipboardError::Timeout {
+                    program: cmd.program.clone(),
+                });
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    })();
+    if result.is_err() && child.try_wait().ok().flatten().is_none() {
+        // Reap on every failure, including broken pipes and deadline expiry.
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
     }
-    Ok(label)
+    result
 }
 
 /// Errors surfaced by [`copy`]. All variants are non-fatal — the
@@ -229,6 +301,8 @@ pub enum ClipboardError {
     Write(std::io::Error),
     /// `child.wait` failed.
     Wait(std::io::Error),
+    /// The command did not accept the payload or exit within the deadline.
+    Timeout { program: String },
     /// Child exited non-zero.
     ExitStatus { program: String, code: Option<i32> },
 }
@@ -243,6 +317,7 @@ impl std::fmt::Display for ClipboardError {
             Self::StdinUnavailable => write!(f, "child stdin unavailable"),
             Self::Write(e) => write!(f, "failed to write to clipboard: {e}"),
             Self::Wait(e) => write!(f, "wait on clipboard child failed: {e}"),
+            Self::Timeout { program } => write!(f, "{program} clipboard command timed out"),
             Self::ExitStatus { program, code } => match code {
                 Some(c) => write!(f, "{program} exited with {c}"),
                 None => write!(f, "{program} terminated by signal"),
@@ -256,6 +331,41 @@ impl std::error::Error for ClipboardError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reliability_ssh_only_runs_explicit_clipboard_commands() {
+        assert!(resolve_for_session(None, true).is_none());
+        assert!(resolve_for_session(Some(&[]), true).is_none());
+        let argv = vec!["remote-copy".to_string(), "--explicit".to_string()];
+        let command = resolve_for_session(Some(&argv), true).unwrap();
+        assert_eq!(command.source, CopySource::Override);
+        assert_eq!(command.program, "remote-copy");
+        assert_eq!(command.args, vec!["--explicit"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reliability_copy_nonreading_child_times_out() {
+        let cmd =
+            CopyCommand::new_override("/bin/sh".into(), vec!["-c".into(), "exec sleep 5".into()]);
+        let start = Instant::now();
+        let result = copy_with_timeout(&"x".repeat(1024 * 1024), &cmd, Duration::from_millis(100));
+        assert!(matches!(result, Err(ClipboardError::Timeout { .. })));
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reliability_copy_closes_stdin_and_checks_exit() {
+        let cmd =
+            CopyCommand::new_override("/bin/sh".into(), vec!["-c".into(), "cat >/dev/null".into()]);
+        assert!(copy_with_timeout("payload", &cmd, Duration::from_secs(2)).is_ok());
+        let cmd = CopyCommand::new_override("/bin/sh".into(), vec!["-c".into(), "exit 7".into()]);
+        assert!(matches!(
+            copy_with_timeout("", &cmd, Duration::from_secs(2)),
+            Err(ClipboardError::ExitStatus { code: Some(7), .. })
+        ));
+    }
 
     #[test]
     fn override_with_program_and_args_is_used_verbatim() {

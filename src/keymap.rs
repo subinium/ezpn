@@ -38,9 +38,9 @@
 //! - Named keys: `Enter`, `Escape`/`Esc`, `Tab`, `Backspace`, `Delete`,
 //!   `Home`, `End`, `PageUp`, `PageDown`, `Up`, `Down`, `Left`, `Right`,
 //!   `Insert`, `Space`, `F1`-`F12`.
-//! - Single character: literal key (`a`, `0`, `?`). Case-significant only
-//!   when paired with `S-`; unmodified `A` and `a` are normalized to lower
-//!   case to match crossterm's reporting.
+//! - Single character: literal key (`a`, `0`, `?`). Uppercase letters imply
+//!   Shift (except control-letter spellings); shifted symbols such as `%`
+//!   match legacy and enhanced terminal reports consistently.
 //!
 //! # Action vocabulary
 //!
@@ -48,7 +48,7 @@
 //! command-palette parser in `commands.rs` so users never need to learn two
 //! vocabularies.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -453,6 +453,22 @@ pub struct KeyChord {
 
 impl KeyChord {
     pub fn new(code: KeyCode, mods: KeyModifiers) -> Self {
+        let mut mods = mods;
+        let code = match code {
+            KeyCode::Char(c) if c.is_ascii_alphabetic() => {
+                if c.is_ascii_uppercase() && !mods.contains(KeyModifiers::CONTROL) {
+                    mods.insert(KeyModifiers::SHIFT);
+                }
+                KeyCode::Char(c.to_ascii_lowercase())
+            }
+            KeyCode::Char(c) => {
+                // The character already includes the shifted glyph (e.g. '%').
+                // Legacy and enhanced terminals differ in reporting SHIFT here.
+                mods.remove(KeyModifiers::SHIFT);
+                KeyCode::Char(c)
+            }
+            other => other,
+        };
         Self { code, mods }
     }
 
@@ -460,16 +476,7 @@ impl KeyChord {
     /// match on (super, hyper, num-pad markers) so the lookup doesn't care.
     pub fn from_event(ev: KeyEvent) -> Self {
         let mods = ev.modifiers & (KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT);
-        // Normalize unmodified single-char keys to lower-case so `a` and
-        // `A` only differ when SHIFT is explicit. Crossterm reports `A`
-        // with SHIFT and `a` without on most platforms; we collapse those.
-        let code = match ev.code {
-            KeyCode::Char(c) if !mods.contains(KeyModifiers::SHIFT) => {
-                KeyCode::Char(c.to_ascii_lowercase())
-            }
-            other => other,
-        };
-        Self { code, mods }
+        Self::new(ev.code, mods)
     }
 }
 
@@ -571,17 +578,12 @@ pub fn parse_chord(input: &str) -> Result<KeyChord, KeyParseError> {
             let c = s.chars().next().unwrap();
             // If SHIFT was specified explicitly, keep the literal case
             // (parser-side we trust the user). Otherwise normalize lower.
-            let c = if mods.contains(KeyModifiers::SHIFT) {
-                c
-            } else {
-                c.to_ascii_lowercase()
-            };
             KeyCode::Char(c)
         }
         other => return Err(KeyParseError::UnknownNamedKey(other.to_string())),
     };
 
-    Ok(KeyChord { code, mods })
+    Ok(KeyChord::new(code, mods))
 }
 
 // ─── Tables and the Keymap container ───────────────────────────────────
@@ -629,6 +631,7 @@ impl KeymapTable {
 #[derive(Debug, Clone, Default)]
 pub struct Keymap {
     tables: BTreeMap<KeymapTable, HashMap<KeyChord, Action>>,
+    cleared: BTreeSet<KeymapTable>,
 }
 
 impl Keymap {
@@ -669,9 +672,14 @@ impl Keymap {
 
     /// Drop every binding in a table. Driven by `clear = true` in TOML.
     pub fn clear(&mut self, table: KeymapTable) {
+        self.cleared.insert(table);
         if let Some(t) = self.tables.get_mut(&table) {
             t.clear();
         }
+    }
+
+    pub fn allows_builtin_fallback(&self, table: KeymapTable) -> bool {
+        !self.cleared.contains(&table)
     }
 }
 
@@ -1029,10 +1037,10 @@ mod tests {
             parse_chord("?"),
             Ok(chord(KeyCode::Char('?'), KeyModifiers::NONE))
         );
-        // Unmodified `A` normalizes to `a`.
+        // Capital letters preserve their meaning even on legacy input.
         assert_eq!(
             parse_chord("A"),
-            Ok(chord(KeyCode::Char('a'), KeyModifiers::NONE))
+            Ok(chord(KeyCode::Char('a'), KeyModifiers::SHIFT))
         );
     }
 
@@ -1110,11 +1118,11 @@ mod tests {
         let ev = KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE);
         let c = KeyChord::from_event(ev);
         assert_eq!(c.code, KeyCode::Char('a'));
-        assert!(c.mods.is_empty());
+        assert_eq!(c.mods, KeyModifiers::SHIFT);
 
         let ev = KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT);
         let c = KeyChord::from_event(ev);
-        assert_eq!(c.code, KeyCode::Char('A'));
+        assert_eq!(c.code, KeyCode::Char('a'));
         assert_eq!(c.mods, KeyModifiers::SHIFT);
     }
 

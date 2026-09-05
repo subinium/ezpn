@@ -70,7 +70,7 @@ pub(super) enum InputMode {
 /// Tab action requested by the key handler. The main loop handles the switch.
 pub(crate) enum TabAction {
     None,
-    NewTab,
+    NewTab(Option<String>),
     NextTab,
     PrevTab,
     GoToTab(usize),
@@ -172,7 +172,7 @@ pub(super) fn process_event(
     ctx: &mut RuntimeCtx<'_>,
 ) {
     match event {
-        Event::Key(key) if key.kind == KeyEventKind::Press => {
+        Event::Key(key) if key.kind != KeyEventKind::Release => {
             process_key(
                 key,
                 mode,
@@ -246,16 +246,49 @@ pub(super) fn process_event(
             }
         }
         Event::Paste(text) => {
-            // Forward paste to active pane, with bracketed paste wrapping if enabled
-            if let Some(pane) = panes.get_mut(active) {
-                if pane.is_alive() {
-                    if pane.bracketed_paste() {
-                        pane.write_bytes(b"\x1b[200~");
-                        pane.write_bytes(text.as_bytes());
-                        pane.write_bytes(b"\x1b[201~");
-                    } else {
-                        pane.write_bytes(text.as_bytes());
+            if ctx.osc52_confirm.is_some() || settings.visible {
+                return;
+            }
+            match mode {
+                InputMode::RenameTab { buffer } | InputMode::CommandPalette { buffer } => {
+                    for c in text.chars().filter(|c| !c.is_control()) {
+                        if buffer.len() + c.len_utf8() > 4096 {
+                            break;
+                        }
+                        buffer.push(c);
                     }
+                    if matches!(mode, InputMode::CommandPalette { .. }) {
+                        if let InputMode::CommandPalette { buffer } = mode {
+                            *ctx.palette_query = buffer.clone();
+                        }
+                    }
+                    update.full_redraw = true;
+                }
+                InputMode::Normal => {
+                    for (&id, pane) in panes.iter_mut() {
+                        if pane.is_alive() && (*broadcast || id == *active) {
+                            if pane.bracketed_paste() {
+                                pane.write_bytes(b"\x1b[200~");
+                            }
+                            pane.write_bytes(text.as_bytes());
+                            if pane.bracketed_paste() {
+                                pane.write_bytes(b"\x1b[201~");
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Event::Key(key)
+            if key.kind == KeyEventKind::Release
+                && matches!(mode, InputMode::Normal)
+                && !settings.visible
+                && ctx.osc52_confirm.is_none() =>
+        {
+            for (&id, pane) in panes.iter_mut() {
+                if pane.is_alive() && (*broadcast || id == *active) {
+                    pane.write_key(key);
                 }
             }
         }
@@ -266,7 +299,7 @@ pub(super) fn process_event(
 /// Process a key event. This is the core input handler shared between modes.
 #[allow(clippy::too_many_arguments, unused_variables)]
 pub(super) fn process_key(
-    key: KeyEvent,
+    mut key: KeyEvent,
     mode: &mut InputMode,
     layout: &mut Layout,
     panes: &mut HashMap<usize, Pane>,
@@ -289,9 +322,6 @@ pub(super) fn process_key(
     clipboard_copy_argv: Option<&[String]>,
     ctx: &mut RuntimeCtx<'_>,
 ) {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
-
     // ── OSC 52 confirm prompt (#79) ──
     // Modal: while a payload is queued, all keys route here. y/n
     // resolve the prompt; Esc re-queues. Status bar shows "OSC52".
@@ -335,6 +365,29 @@ pub(super) fn process_key(
         return;
     }
 
+    if matches!(mode, InputMode::CopyMode(state) if !matches!(state.phase, crate::copy_mode::Phase::Search { .. }))
+    {
+        let action = ctx.keymap.lookup(
+            crate::keymap::KeymapTable::CopyMode,
+            &crate::keymap::KeyChord::from_event(key),
+        );
+        let mapped = match action {
+            Some(crate::keymap::Action::Cancel) => Some(KeyCode::Esc),
+            Some(crate::keymap::Action::BeginSelection) => Some(KeyCode::Char('v')),
+            Some(crate::keymap::Action::CopySelectionAndCancel) => Some(KeyCode::Char('y')),
+            _ => None,
+        };
+        if let Some(code) = mapped {
+            key = KeyEvent::new(code, KeyModifiers::NONE);
+        } else if !ctx
+            .keymap
+            .allows_builtin_fallback(crate::keymap::KeymapTable::CopyMode)
+        {
+            return;
+        }
+    }
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
     // ── Keymap dispatch (#84) ──
     // Look up the user-bound chord BEFORE the hardcoded match so users
     // can override builtins. On miss we fall through to the legacy
@@ -343,7 +396,7 @@ pub(super) fn process_key(
     let chord = crate::keymap::KeyChord::from_event(key);
     let table = match mode {
         InputMode::Prefix { .. } => Some(crate::keymap::KeymapTable::Prefix),
-        InputMode::CopyMode(_) => Some(crate::keymap::KeymapTable::CopyMode),
+        InputMode::CopyMode(_) => None,
         InputMode::Normal if !settings.visible => Some(crate::keymap::KeymapTable::Normal),
         _ => None,
     };
@@ -353,6 +406,16 @@ pub(super) fn process_key(
             // rather than mutating data, so handle those before the
             // execute_action shim. The shim returns Ok(None) for these.
             match &action {
+                crate::keymap::Action::KillPane => {
+                    *mode = InputMode::CloseConfirm;
+                    update.full_redraw = true;
+                    return;
+                }
+                crate::keymap::Action::KillWindow => {
+                    *mode = InputMode::CloseTabConfirm;
+                    update.full_redraw = true;
+                    return;
+                }
                 crate::keymap::Action::CommandPrompt => {
                     enter_command_palette(mode, ctx, panes, layout, settings, update);
                     if matches!(t, crate::keymap::KeymapTable::Prefix) {
@@ -430,6 +493,11 @@ pub(super) fn process_key(
             if matches!(t, crate::keymap::KeymapTable::Prefix) {
                 *mode = InputMode::Normal;
             }
+            return;
+        }
+        if t == crate::keymap::KeymapTable::Prefix && !ctx.keymap.allows_builtin_fallback(t) {
+            *mode = InputMode::Normal;
+            update.full_redraw = true;
             return;
         }
     }
@@ -513,7 +581,7 @@ pub(super) fn process_key(
     // ── Rename tab mode ──
     if let InputMode::RenameTab { buffer } = mode {
         match key.code {
-            KeyCode::Char(c) if !ctrl => {
+            KeyCode::Char(c) if !ctrl && buffer.len() < 4096 => {
                 buffer.push(c);
                 update.full_redraw = true;
             }
@@ -755,6 +823,14 @@ pub(super) fn process_key(
 
     // ── Prefix mode ──
     if matches!(mode, InputMode::Prefix { .. }) {
+        if ctrl && key.code == KeyCode::Char(prefix_key) {
+            if let Some(pane) = panes.get_mut(active) {
+                pane.write_key(key);
+            }
+            *mode = InputMode::Normal;
+            update.full_redraw = true;
+            return;
+        }
         update.full_redraw = true;
         let mut next_mode = InputMode::Normal;
         match key.code {
@@ -794,25 +870,25 @@ pub(super) fn process_key(
                 *active = layout.next_pane(*active);
             }
             KeyCode::Left => {
-                let i = crate::make_inner(tw, th, settings.show_status_bar);
+                let i = crate::bootstrap::terminal_content_area(tw, th, settings);
                 if let Some(n) = layout.navigate(*active, NavDir::Left, &i) {
                     *active = n;
                 }
             }
             KeyCode::Right => {
-                let i = crate::make_inner(tw, th, settings.show_status_bar);
+                let i = crate::bootstrap::terminal_content_area(tw, th, settings);
                 if let Some(n) = layout.navigate(*active, NavDir::Right, &i) {
                     *active = n;
                 }
             }
             KeyCode::Up => {
-                let i = crate::make_inner(tw, th, settings.show_status_bar);
+                let i = crate::bootstrap::terminal_content_area(tw, th, settings);
                 if let Some(n) = layout.navigate(*active, NavDir::Up, &i) {
                     *active = n;
                 }
             }
             KeyCode::Down => {
-                let i = crate::make_inner(tw, th, settings.show_status_bar);
+                let i = crate::bootstrap::terminal_content_area(tw, th, settings);
                 if let Some(n) = layout.navigate(*active, NavDir::Down, &i) {
                     *active = n;
                 }
@@ -915,7 +991,7 @@ pub(super) fn process_key(
             }
             // New tab (tmux c = new window)
             KeyCode::Char('c') => {
-                *tab_action = TabAction::NewTab;
+                *tab_action = TabAction::NewTab(None);
             }
             // Next tab (tmux n)
             KeyCode::Char('n') => {
@@ -969,17 +1045,6 @@ pub(super) fn process_key(
             entered_at: Instant::now(),
         };
         update.full_redraw = true;
-    } else if (key.code == KeyCode::Char('g') && ctrl) || key.code == KeyCode::F(1) {
-        settings.toggle();
-        update.full_redraw = true;
-    } else if ctrl
-        && (key.code == KeyCode::Char('\\')
-            || key.code == KeyCode::Char('q')
-            || key.code == KeyCode::Char('w'))
-    {
-        // Confirm before killing session
-        *mode = InputMode::QuitConfirm;
-        update.full_redraw = true;
     } else if settings.visible {
         let prev_border = settings.border_style;
         let prev_status = settings.show_status_bar;
@@ -997,67 +1062,6 @@ pub(super) fn process_key(
             update.mark_all(layout);
         }
         update.full_redraw = true;
-    } else if key.code == KeyCode::Char('d') && ctrl {
-        let _ = crate::do_split(
-            layout,
-            panes,
-            *active,
-            Direction::Horizontal,
-            default_shell,
-            tw,
-            th,
-            settings,
-            scrollback,
-        );
-        update.mark_all(layout);
-        update.border_dirty = true;
-    } else if key.code == KeyCode::Char('e') && ctrl {
-        let _ = crate::do_split(
-            layout,
-            panes,
-            *active,
-            Direction::Vertical,
-            default_shell,
-            tw,
-            th,
-            settings,
-            scrollback,
-        );
-        update.mark_all(layout);
-        update.border_dirty = true;
-    } else if ctrl && (key.code == KeyCode::Char(']') || key.code == KeyCode::Char('n')) {
-        *active = layout.next_pane(*active);
-        update.full_redraw = true;
-    } else if key.code == KeyCode::F(2) {
-        layout.equalize();
-        crate::resize_all(panes, layout, tw, th, settings);
-        update.mark_all(layout);
-        update.border_dirty = true;
-    } else if alt {
-        let inner = crate::make_inner(tw, th, settings.show_status_bar);
-        let nav = match key.code {
-            KeyCode::Left => Some(NavDir::Left),
-            KeyCode::Right => Some(NavDir::Right),
-            KeyCode::Up => Some(NavDir::Up),
-            KeyCode::Down => Some(NavDir::Down),
-            _ => None,
-        };
-        if let Some(dir) = nav {
-            if let Some(next) = layout.navigate(*active, dir, &inner) {
-                *active = next;
-                update.full_redraw = true;
-            }
-        } else if *broadcast {
-            for pane in panes.values_mut() {
-                if pane.is_alive() {
-                    pane.write_key(key);
-                }
-            }
-        } else if let Some(pane) = panes.get_mut(active) {
-            if pane.is_alive() {
-                pane.write_key(key);
-            }
-        }
     } else if key.code == KeyCode::Enter && panes.get(active).is_some_and(|p| !p.is_alive()) {
         let (launch, old_name, pane_shell) = panes
             .get(active)

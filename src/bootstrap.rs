@@ -18,6 +18,8 @@
 //!
 //! Pure structural extraction from `src/main.rs` — no behaviour change.
 
+use crate::vt100;
+
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
@@ -50,32 +52,41 @@ enum InputMode {
 }
 
 pub(crate) fn run_direct(config: &Config) -> anyhow::Result<()> {
+    crate::client::require_terminal()?;
+    require_project_trust(config)?;
     terminal::enable_raw_mode()?;
+    let _terminal_guard = DirectTerminalGuard;
     let mut stdout = io::stdout();
     execute!(
         stdout,
         EnterAlternateScreen,
         event::EnableMouseCapture,
         event::EnableFocusChange,
+        event::EnableBracketedPaste,
         event::PushKeyboardEnhancementFlags(
             event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
         ),
         cursor::Hide
     )?;
 
-    let result = run(&mut stdout, config);
+    run(&mut stdout, config)
+}
 
-    let _ = execute!(
-        io::stdout(),
-        event::PopKeyboardEnhancementFlags,
-        event::DisableFocusChange,
-        cursor::Show,
-        event::DisableMouseCapture,
-        LeaveAlternateScreen
-    );
-    let _ = terminal::disable_raw_mode();
-
-    result
+struct DirectTerminalGuard;
+impl Drop for DirectTerminalGuard {
+    fn drop(&mut self) {
+        let _ = execute!(
+            io::stdout(),
+            event::PopKeyboardEnhancementFlags,
+            event::DisableFocusChange,
+            event::DisableBracketedPaste,
+            cursor::Show,
+            event::DisableMouseCapture,
+            LeaveAlternateScreen
+        );
+        let _ = terminal::disable_raw_mode();
+        ipc::cleanup();
+    }
 }
 
 pub(crate) fn cmd_init() -> anyhow::Result<()> {
@@ -230,9 +241,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
         )?;
         let active = tab.active_pane;
         (layout, panes, active)
-    } else if config.commands.is_empty()
-        && matches!(config.layout, LayoutSpec::Grid { rows: 1, cols: 2 })
-    {
+    } else if config.commands.is_empty() && !config.has_layout_override {
         // No explicit args — try loading .ezpn.toml from current directory
         if let Some(result) = project::load_project() {
             let proj = result.map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -305,18 +314,21 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
     let mut text_selection: Option<TextSelection> = None;
 
     let mut restart_state: HashMap<usize, (Instant, u32)> = HashMap::new(); // (last_death, retries)
-    const MAX_RESTART_RETRIES: u32 = 10;
-    const RESTART_DELAY: Duration = Duration::from_secs(2);
-    const RESTART_BACKOFF_THRESHOLD: u32 = 3; // after this many rapid restarts, increase delay
 
     // Set window title
     let _ = write!(stdout, "\x1b]0;ezpn\x07");
     let _ = stdout.flush();
     let mut mode = InputMode::Normal;
-    let ipc_rx = ipc::start_listener()
+    let ipc_rx = ipc::start_listener(crate::pane::wake_main_loop)
         .map_err(|e| eprintln!("ezpn: IPC unavailable ({e}), ezpn-ctl disabled"))
         .ok();
-    let mut border_cache = render::build_border_cache(&layout, settings.show_status_bar, tw, th);
+    let mut border_cache = render::build_border_cache_with_style(
+        &layout,
+        settings.show_status_bar,
+        tw,
+        crate::bootstrap::terminal_render_height(th, &settings),
+        settings.border_style,
+    );
     let mut last_title_state: Option<(usize, usize)> = None;
     let initial_dirty = layout.pane_ids().into_iter().collect::<HashSet<_>>();
     render_frame(
@@ -338,7 +350,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
     )?;
 
     let mut prev_active = active;
-    loop {
+    'runtime: loop {
         // Track last-active pane for Ctrl+B ;
         if active != prev_active {
             last_active = prev_active;
@@ -353,76 +365,18 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
             }
         }
 
-        // Auto-restart dead panes with restart policy
-        {
-            let dead_restartable: Vec<usize> = panes
-                .iter()
-                .filter(|(pid, pane)| {
-                    !pane.is_alive()
-                        && restart_policies.get(pid).is_some_and(|p| {
-                            *p == project::RestartPolicy::Always
-                                || *p == project::RestartPolicy::OnFailure
-                        })
-                })
-                .map(|(&pid, _)| pid)
-                .collect();
-
-            for pid in dead_restartable {
-                let (last_death, retries) = restart_state
-                    .entry(pid)
-                    .or_insert((Instant::now() - RESTART_DELAY, 0));
-
-                if *retries >= MAX_RESTART_RETRIES {
-                    continue; // give up after too many retries
-                }
-
-                let delay = if *retries >= RESTART_BACKOFF_THRESHOLD {
-                    RESTART_DELAY * (*retries - RESTART_BACKOFF_THRESHOLD + 1)
-                } else {
-                    RESTART_DELAY
-                };
-
-                if last_death.elapsed() < delay {
-                    continue; // wait before restarting
-                }
-
-                let (launch, old_name, pane_shell) = panes
-                    .get(&pid)
-                    .map(|p| {
-                        (
-                            p.launch().clone(),
-                            p.name().map(String::from),
-                            p.initial_shell().map(String::from),
-                        )
-                    })
-                    .unwrap_or((PaneLaunch::Shell, None, None));
-                let eff_shell = pane_shell.as_deref().unwrap_or(&default_shell);
-                if replace_pane(
-                    &mut panes,
-                    &layout,
-                    pid,
-                    launch,
-                    eff_shell,
-                    tw,
-                    th,
-                    &settings,
-                    effective_scrollback,
-                )
-                .is_ok()
-                {
-                    // Preserve pane name and shell override
-                    if let Some(pane) = panes.get_mut(&pid) {
-                        pane.set_name(old_name);
-                        if let Some(ref s) = pane_shell {
-                            pane.set_initial_shell(Some(s.clone()));
-                        }
-                    }
-                    *retries += 1;
-                    *last_death = Instant::now();
-                    update.dirty_panes.insert(pid);
-                }
-            }
-        }
+        let restarted = restart_panes(
+            &mut panes,
+            &layout,
+            &restart_policies,
+            &mut restart_state,
+            &default_shell,
+            tw,
+            th,
+            &settings,
+            effective_scrollback,
+        );
+        update.dirty_panes.extend(restarted);
 
         let all_dead = panes.is_empty()
             || panes.iter().all(|(pid, pane)| {
@@ -430,9 +384,9 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                     return false; // alive pane → not all dead
                 }
                 // Dead pane — check if it can be restarted
-                let has_restart = restart_policies.get(pid).is_some_and(|p| {
-                    *p == project::RestartPolicy::Always || *p == project::RestartPolicy::OnFailure
-                });
+                let has_restart = restart_policies
+                    .get(pid)
+                    .is_some_and(|p| restart_allowed(p, pane.exit_code()));
                 if !has_restart {
                     return true; // dead with no restart policy
                 }
@@ -469,14 +423,13 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
         while event::poll(Duration::from_millis(if first_poll { 8 } else { 0 }))? {
             first_poll = false;
             match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                Event::Key(key) if key.kind != KeyEventKind::Release => {
                     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                    let alt = key.modifiers.contains(KeyModifiers::ALT);
 
                     // ── Quit confirmation mode ──
                     if matches!(mode, InputMode::QuitConfirm) {
                         match key.code {
-                            KeyCode::Char('y') | KeyCode::Enter => break,
+                            KeyCode::Char('y') | KeyCode::Enter => break 'runtime,
                             _ => {
                                 mode = InputMode::Normal;
                                 update.full_redraw = true;
@@ -614,7 +567,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                         match key.code {
                             // Split
                             KeyCode::Char('%') => {
-                                do_split(
+                                if let Err(error) = do_split(
                                     &mut layout,
                                     &mut panes,
                                     active,
@@ -624,12 +577,17 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                                     th,
                                     &settings,
                                     effective_scrollback,
-                                )?;
+                                ) {
+                                    settings.set_flash(
+                                        error.to_string(),
+                                        crate::settings::FlashKind::Error,
+                                    );
+                                }
                                 update.mark_all(&layout);
                                 update.border_dirty = true;
                             }
                             KeyCode::Char('"') => {
-                                do_split(
+                                if let Err(error) = do_split(
                                     &mut layout,
                                     &mut panes,
                                     active,
@@ -639,7 +597,12 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                                     th,
                                     &settings,
                                     effective_scrollback,
-                                )?;
+                                ) {
+                                    settings.set_flash(
+                                        error.to_string(),
+                                        crate::settings::FlashKind::Error,
+                                    );
+                                }
                                 update.mark_all(&layout);
                                 update.border_dirty = true;
                             }
@@ -648,25 +611,25 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                                 active = layout.next_pane(active);
                             }
                             KeyCode::Left => {
-                                let i = make_inner(tw, th, settings.show_status_bar);
+                                let i = crate::bootstrap::terminal_content_area(tw, th, &settings);
                                 if let Some(n) = layout.navigate(active, NavDir::Left, &i) {
                                     active = n;
                                 }
                             }
                             KeyCode::Right => {
-                                let i = make_inner(tw, th, settings.show_status_bar);
+                                let i = crate::bootstrap::terminal_content_area(tw, th, &settings);
                                 if let Some(n) = layout.navigate(active, NavDir::Right, &i) {
                                     active = n;
                                 }
                             }
                             KeyCode::Up => {
-                                let i = make_inner(tw, th, settings.show_status_bar);
+                                let i = crate::bootstrap::terminal_content_area(tw, th, &settings);
                                 if let Some(n) = layout.navigate(active, NavDir::Up, &i) {
                                     active = n;
                                 }
                             }
                             KeyCode::Down => {
-                                let i = make_inner(tw, th, settings.show_status_bar);
+                                let i = crate::bootstrap::terminal_content_area(tw, th, &settings);
                                 if let Some(n) = layout.navigate(active, NavDir::Down, &i) {
                                     active = n;
                                 }
@@ -694,7 +657,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                             KeyCode::Char('d') => {
                                 let live = panes.values().filter(|p| p.is_alive()).count();
                                 if live == 0 {
-                                    break;
+                                    break 'runtime;
                                 }
                                 next_mode = InputMode::QuitConfirm;
                             }
@@ -770,7 +733,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                             // New pane (split + focus) — in --no-daemon mode only.
                             // Daemon mode (default) maps 'c' to new tab.
                             KeyCode::Char('c') => {
-                                do_split(
+                                if let Err(error) = do_split(
                                     &mut layout,
                                     &mut panes,
                                     active,
@@ -780,7 +743,12 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                                     th,
                                     &settings,
                                     effective_scrollback,
-                                )?;
+                                ) {
+                                    settings.set_flash(
+                                        error.to_string(),
+                                        crate::settings::FlashKind::Error,
+                                    );
+                                }
                                 // Focus the new pane
                                 active = layout.next_pane(active);
                                 update.mark_all(&layout);
@@ -800,19 +768,9 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                             update.full_redraw = true; // show [PREFIX] indicator
                         }
                         // Settings toggle (direct shortcut, kept for convenience)
-                        else if (key.code == KeyCode::Char('g') && ctrl)
-                            || key.code == KeyCode::F(1)
-                        {
+                        else if key.code == KeyCode::F(1) {
                             settings.toggle();
                             update.full_redraw = true;
-                        }
-                        // Force quit: Ctrl+\ or Ctrl+Q or Ctrl+W
-                        else if ctrl
-                            && (key.code == KeyCode::Char('\\')
-                                || key.code == KeyCode::Char('q')
-                                || key.code == KeyCode::Char('w'))
-                        {
-                            break;
                         }
                         // Settings visible
                         else if settings.visible {
@@ -836,71 +794,11 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                             {
                                 update.full_redraw = true;
                             }
-                        }
-                        // Direct shortcuts (kept alongside prefix mode)
-                        else if key.code == KeyCode::Char('d') && ctrl {
-                            do_split(
-                                &mut layout,
-                                &mut panes,
-                                active,
-                                Direction::Horizontal,
-                                &default_shell,
-                                tw,
-                                th,
-                                &settings,
-                                effective_scrollback,
-                            )?;
-                            update.mark_all(&layout);
-                            update.border_dirty = true;
-                        } else if key.code == KeyCode::Char('e') && ctrl {
-                            do_split(
-                                &mut layout,
-                                &mut panes,
-                                active,
-                                Direction::Vertical,
-                                &default_shell,
-                                tw,
-                                th,
-                                &settings,
-                                effective_scrollback,
-                            )?;
-                            update.mark_all(&layout);
-                            update.border_dirty = true;
-                        } else if ctrl
-                            && (key.code == KeyCode::Char(']') || key.code == KeyCode::Char('n'))
-                        {
-                            active = layout.next_pane(active);
-                            update.full_redraw = true;
                         } else if key.code == KeyCode::F(2) {
                             layout.equalize();
                             resize_all(&mut panes, &layout, tw, th, &settings);
                             update.mark_all(&layout);
                             update.border_dirty = true;
-                        } else if alt {
-                            let inner = make_inner(tw, th, settings.show_status_bar);
-                            let nav = match key.code {
-                                KeyCode::Left => Some(NavDir::Left),
-                                KeyCode::Right => Some(NavDir::Right),
-                                KeyCode::Up => Some(NavDir::Up),
-                                KeyCode::Down => Some(NavDir::Down),
-                                _ => None,
-                            };
-                            if let Some(dir) = nav {
-                                if let Some(next) = layout.navigate(active, dir, &inner) {
-                                    active = next;
-                                    update.full_redraw = true;
-                                }
-                            } else if broadcast {
-                                for pane in panes.values_mut() {
-                                    if pane.is_alive() {
-                                        pane.write_key(key);
-                                    }
-                                }
-                            } else if let Some(pane) = panes.get_mut(&active) {
-                                if pane.is_alive() {
-                                    pane.write_key(key);
-                                }
-                            }
                         } else if key.code == KeyCode::Enter
                             && panes.get(&active).is_some_and(|p| !p.is_alive())
                         {
@@ -959,7 +857,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                     }
                 }
                 Event::Mouse(mouse) => {
-                    let inner = make_inner(tw, th, settings.show_status_bar);
+                    let inner = crate::bootstrap::terminal_content_area(tw, th, &settings);
                     match mouse.kind {
                         MouseEventKind::Down(MouseButton::Left) => {
                             if settings.visible {
@@ -1221,7 +1119,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
         }
 
         if let Some(ref rx) = ipc_rx {
-            while let Ok((cmd, resp_tx)) = rx.try_recv() {
+            for (cmd, resp_tx) in rx.try_iter().take(64) {
                 // RFC #103: extended commands route through the same
                 // channel as legacy `IpcRequest` so handlers run with
                 // full state. Inline-mode (single-process) does not
@@ -1261,7 +1159,13 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
         }
 
         if update.border_dirty {
-            border_cache = render::build_border_cache(&layout, settings.show_status_bar, tw, th);
+            border_cache = render::build_border_cache_with_style(
+                &layout,
+                settings.show_status_bar,
+                tw,
+                crate::bootstrap::terminal_render_height(th, &settings),
+                settings.border_style,
+            );
         }
 
         if zoomed_pane.is_some() {
@@ -1311,7 +1215,7 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                         &label,
                         settings.border_style,
                         tw,
-                        th,
+                        crate::bootstrap::terminal_render_height(th, &settings),
                         settings.show_status_bar,
                     )?;
                 }
@@ -1374,13 +1278,17 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
                 stdout.flush()?;
             }
             if matches!(mode, InputMode::PaneSelect) {
-                let inner = make_inner(tw, th, settings.show_status_bar);
+                let inner = crate::bootstrap::terminal_content_area(tw, th, &settings);
                 queue!(stdout, terminal::BeginSynchronizedUpdate)?;
                 render::draw_pane_numbers(stdout, &layout, &inner)?;
                 queue!(stdout, terminal::EndSynchronizedUpdate)?;
                 stdout.flush()?;
             }
 
+            if let Some((text, _, _)) = &settings.flash_message {
+                render::draw_flash_message(stdout, tw, th, text)?;
+                stdout.flush()?;
+            }
             reset_render_targets(&mut panes, &render_targets);
         }
 
@@ -1402,21 +1310,6 @@ fn run(stdout: &mut io::Stdout, config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) fn make_inner(tw: u16, th: u16, show_status_bar: bool) -> Rect {
-    let sh = if show_status_bar { 1u16 } else { 0 };
-    Rect {
-        x: 1,
-        y: 1,
-        w: tw.saturating_sub(2),
-        h: th.saturating_sub(sh + 2),
-    }
-}
-
-fn zoomed_content_size(tw: u16, th: u16, show_status_bar: bool) -> (u16, u16) {
-    let sh = if show_status_bar { 1u16 } else { 0 };
-    (tw.saturating_sub(2), th.saturating_sub(sh + 2))
-}
-
 pub(crate) fn resize_zoomed_pane(
     panes: &mut HashMap<usize, Pane>,
     pane_id: usize,
@@ -1424,7 +1317,8 @@ pub(crate) fn resize_zoomed_pane(
     th: u16,
     settings: &Settings,
 ) {
-    let (cols, rows) = zoomed_content_size(tw, th, settings.show_status_bar);
+    let rect = crate::bootstrap::terminal_content_area(tw, th, settings);
+    let (cols, rows) = (rect.w.max(1), rect.h.max(1));
     if let Some(pane) = panes.get_mut(&pane_id) {
         pane.resize(cols, rows);
     }
@@ -1574,8 +1468,10 @@ pub(crate) fn build_initial_state(
     default_shell: &mut String,
     settings: &mut Settings,
     restart_policies: &mut HashMap<usize, project::RestartPolicy>,
+    project_hooks: &mut Vec<crate::hooks::Hook>,
     scrollback: usize,
 ) -> anyhow::Result<(Layout, HashMap<usize, Pane>, usize, Option<SnapshotExtra>)> {
+    require_project_trust(config)?;
     // Use a default terminal size for initial spawn (server doesn't have a terminal yet).
     // Panes will be resized when a client connects.
     let tw: u16 = 80;
@@ -1584,6 +1480,7 @@ pub(crate) fn build_initial_state(
     if let Some(path) = &config.restore {
         let snapshot = workspace::load_snapshot(path)?;
         let active_idx = snapshot.active_tab;
+        settings.tab_count = snapshot.tabs.len();
         let tab = &snapshot.tabs[active_idx];
         let layout = tab.layout.clone();
         *default_shell = snapshot.shell.clone();
@@ -1620,12 +1517,12 @@ pub(crate) fn build_initial_state(
         return Ok((layout, panes, active, extra));
     }
 
-    if config.commands.is_empty() && matches!(config.layout, LayoutSpec::Grid { rows: 1, cols: 2 })
-    {
+    if config.commands.is_empty() && !config.has_layout_override {
         if let Some(result) = project::load_project() {
             let proj = result.map_err(|e| anyhow::anyhow!("{e}"))?;
             let panes = spawn_project_panes(&proj, default_shell, tw, th, settings, scrollback)?;
             *restart_policies = proj.restarts.clone();
+            *project_hooks = proj.hooks.clone();
             let active = *proj.layout.pane_ids().first().unwrap_or(&0);
             return Ok((proj.layout, panes, active, None));
         } else if let Some((layout, launches)) = try_load_procfile() {
@@ -1675,6 +1572,20 @@ pub(crate) fn build_initial_state(
     Ok((layout, panes, active, None))
 }
 
+pub(crate) fn require_project_trust(config: &Config) -> anyhow::Result<()> {
+    if !config.trust_project
+        && config.restore.is_none()
+        && config.commands.is_empty()
+        && !config.has_layout_override
+        && [".ezpn.toml", "Procfile"]
+            .iter()
+            .any(|p| std::path::Path::new(p).exists())
+    {
+        anyhow::bail!("project startup can execute commands: review .ezpn.toml / Procfile, then use --trust-project; use an explicit grid (ezpn 1 2) for plain shells");
+    }
+    Ok(())
+}
+
 /// Extract selected text — server-friendly version that takes individual coords.
 pub(crate) fn extract_selected_text(
     screen: &vt100::Screen,
@@ -1707,7 +1618,7 @@ pub(crate) fn extract_selected_text(
                 if contents.is_empty() {
                     row_text.push(' ');
                 } else {
-                    row_text.push_str(&contents);
+                    row_text.push_str(contents);
                 }
             } else {
                 break;
@@ -1783,7 +1694,7 @@ pub(crate) fn spawn_layout_panes(
     settings: &Settings,
     scrollback: usize,
 ) -> anyhow::Result<HashMap<usize, Pane>> {
-    let inner = make_inner(tw, th, settings.show_status_bar);
+    let inner = crate::bootstrap::terminal_content_area(tw, th, settings);
     let rects = layout.pane_rects(&inner);
 
     // Collect spawn tasks
@@ -1804,11 +1715,19 @@ pub(crate) fn spawn_layout_panes(
                 let pid = *pid;
                 let cols = *cols;
                 let rows = *rows;
-                s.spawn(move || (pid, spawn_pane(shell, launch, cols, rows, scrollback)))
+                (
+                    pid,
+                    s.spawn(move || spawn_pane(shell, launch, cols, rows, scrollback)),
+                )
             })
             .collect();
-        for handle in handles {
-            results.push(handle.join().expect("pane spawn thread panicked"));
+        for (pid, handle) in handles {
+            results.push((
+                pid,
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("pane spawn worker panicked"))),
+            ));
         }
     });
 
@@ -1828,7 +1747,7 @@ pub(crate) fn spawn_snapshot_panes(
     settings: &Settings,
     scrollback: usize,
 ) -> anyhow::Result<HashMap<usize, Pane>> {
-    let inner = make_inner(tw, th, settings.show_status_bar);
+    let inner = crate::bootstrap::terminal_content_area(tw, th, settings);
     let rects = layout.pane_rects(&inner);
     let mut panes = HashMap::new();
 
@@ -1858,6 +1777,11 @@ pub(crate) fn spawn_snapshot_panes(
         }
         if ps.shell.is_some() {
             pane.set_initial_shell(ps.shell.clone());
+        }
+        if let Some(blob) = &ps.scrollback {
+            if let Some(rows) = blob.decode()? {
+                pane.restore_scrollback(rows.iter().map(|row| row.text.as_str()));
+            }
         }
         panes.insert(ps.id, pane);
     }
@@ -1907,7 +1831,7 @@ pub(crate) fn spawn_project_panes(
     settings: &Settings,
     scrollback: usize,
 ) -> anyhow::Result<HashMap<usize, Pane>> {
-    let inner = make_inner(tw, th, settings.show_status_bar);
+    let inner = crate::bootstrap::terminal_content_area(tw, th, settings);
     let rects = proj.layout.pane_rects(&inner);
     let mut panes = HashMap::new();
 
@@ -1931,6 +1855,8 @@ pub(crate) fn spawn_project_panes(
         if proj.shells.contains_key(&pid) {
             pane.set_initial_shell(Some(pane_shell.to_string()));
         }
+        pane.set_snapshot_sensitive(proj.snapshot_excluded_panes.contains(&pid));
+        pane.set_persist_scrollback_override(proj.persist_scrollback.get(&pid).copied());
         panes.insert(pid, pane);
     }
     Ok(panes)
@@ -1949,6 +1875,10 @@ pub(crate) fn replace_pane(
     scrollback: usize,
 ) -> anyhow::Result<()> {
     // Extract cwd/env from the old pane before replacing
+    let sensitive = panes.get(&pane_id).is_some_and(Pane::snapshot_sensitive);
+    let persist = panes
+        .get(&pane_id)
+        .and_then(Pane::persist_scrollback_override);
     let (cwd, env) = panes
         .get(&pane_id)
         .map(|p| {
@@ -1959,12 +1889,12 @@ pub(crate) fn replace_pane(
             )
         })
         .unwrap_or((None, std::collections::HashMap::new()));
-    let inner = make_inner(tw, th, settings.show_status_bar);
+    let inner = crate::bootstrap::terminal_content_area(tw, th, settings);
     let rect = layout
         .pane_rects(&inner)
         .remove(&pane_id)
         .ok_or_else(|| anyhow::anyhow!("pane rect not found"))?;
-    let new_pane = Pane::with_full_config(
+    let mut new_pane = Pane::with_full_config(
         shell,
         launch,
         rect.w.max(1),
@@ -1973,6 +1903,8 @@ pub(crate) fn replace_pane(
         cwd.as_deref(),
         &env,
     )?;
+    new_pane.set_snapshot_sensitive(sensitive);
+    new_pane.set_persist_scrollback_override(persist);
     if let Some(mut old_pane) = panes.insert(pane_id, new_pane) {
         old_pane.kill();
     }
@@ -2034,37 +1966,39 @@ pub(crate) fn do_split(
     settings: &Settings,
     scrollback: usize,
 ) -> anyhow::Result<()> {
-    let inner = make_inner(tw, th, settings.show_status_bar);
-    if let Some(rect) = layout.pane_rects(&inner).get(&active) {
-        let min_w = 6u16;
-        let min_h = 3u16;
-        let too_small = match dir {
-            Direction::Horizontal => rect.w < min_w * 2 + 1,
-            Direction::Vertical => rect.h < min_h * 2 + 1,
-        };
-        if too_small {
-            return Ok(());
-        }
-    }
-
-    // #75: new pane inherits focused pane's `live_cwd()` (OSC 7 reported
-    // cwd if fresh, else procfs, else launch-time cwd).
+    anyhow::ensure!(
+        panes.contains_key(&active) && layout.pane_ids().contains(&active),
+        "pane not found"
+    );
+    anyhow::ensure!(panes.len() < 100, "Maximum 100 panes");
+    anyhow::ensure!(layout.next_id < usize::MAX, "pane ID space exhausted");
+    let inner = crate::bootstrap::terminal_content_area(tw, th, settings);
+    let rect = layout
+        .pane_rects(&inner)
+        .remove(&active)
+        .ok_or_else(|| anyhow::anyhow!("pane rect not found"))?;
+    let fits = match dir {
+        Direction::Horizontal => rect.w >= 13 && rect.h >= 3,
+        Direction::Vertical => rect.h >= 7 && rect.w >= 6,
+    };
+    anyhow::ensure!(fits, "pane is too small to split");
     let inherit_cwd = panes.get(&active).and_then(|p| p.live_cwd());
-    let new_id = layout.split(active, dir);
-    let rects = layout.pane_rects(&inner);
-    if let Some(rect) = rects.get(&new_id) {
-        panes.insert(
-            new_id,
-            spawn_pane_in(
-                shell,
-                &PaneLaunch::Shell,
-                rect.w.max(1),
-                rect.h.max(1),
-                scrollback,
-                inherit_cwd.as_deref(),
-            )?,
-        );
-    }
+    let mut next_layout = layout.clone();
+    let new_id = next_layout.split(active, dir);
+    let rect = next_layout
+        .pane_rects(&inner)
+        .remove(&new_id)
+        .ok_or_else(|| anyhow::anyhow!("split geometry missing"))?;
+    let pane = spawn_pane_in(
+        shell,
+        &PaneLaunch::Shell,
+        rect.w.max(1),
+        rect.h.max(1),
+        scrollback,
+        inherit_cwd.as_deref(),
+    )?;
+    panes.insert(new_id, pane);
+    *layout = next_layout;
     resize_all(panes, layout, tw, th, settings);
     Ok(())
 }
@@ -2091,7 +2025,7 @@ pub(crate) fn resize_all(
     th: u16,
     settings: &Settings,
 ) {
-    let inner = make_inner(tw, th, settings.show_status_bar);
+    let inner = crate::bootstrap::terminal_content_area(tw, th, settings);
     let rects = layout.pane_rects(&inner);
     for (&pid, rect) in &rects {
         if let Some(pane) = panes.get_mut(&pid) {
@@ -2204,6 +2138,23 @@ impl RenderUpdate {
         // would never repaint.
         self.full_redraw || !self.dirty_panes.is_empty() || self.status_dirty || self.tabs_dirty
     }
+
+    /// Hold ordinary dirty output while a pane is in a synchronized batch.
+    /// Explicit full redraws retain their existing resize/UI semantics.
+    pub fn defer_dirty_panes(&mut self, mut defer: impl FnMut(usize) -> bool) -> HashSet<usize> {
+        let mut deferred = HashSet::new();
+        if !self.full_redraw {
+            self.dirty_panes.retain(|pid| {
+                if defer(*pid) {
+                    deferred.insert(*pid);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        deferred
+    }
 }
 
 // Old extract_selected_text removed — see pub(crate) extract_selected_text above.
@@ -2297,7 +2248,7 @@ pub(crate) fn handle_ipc_command(
             ipc::IpcResponse::success("equalized")
         }
         ipc::IpcRequest::List => {
-            let inner = make_inner(tw, th, settings.show_status_bar);
+            let inner = crate::bootstrap::terminal_content_area(tw, th, settings);
             let rects = layout.pane_rects(&inner);
             let panes = layout
                 .pane_ids()
@@ -2324,30 +2275,14 @@ pub(crate) fn handle_ipc_command(
                 .collect();
             ipc::IpcResponse::with_panes(panes)
         }
-        ipc::IpcRequest::Layout { spec } => match Layout::from_spec(&spec) {
-            Ok(new_layout) => {
-                match spawn_layout_panes(
-                    &new_layout,
-                    HashMap::new(),
-                    shell,
-                    tw,
-                    th,
-                    settings,
-                    scrollback,
-                ) {
-                    Ok(new_panes) => {
-                        kill_all_panes(panes);
-                        *layout = new_layout;
-                        *panes = new_panes;
-                        *active = *layout.pane_ids().first().unwrap_or(&0);
-                        update.mark_all(layout);
-                        update.border_dirty = true;
-                        ipc::IpcResponse::success("layout applied")
-                    }
-                    Err(error) => ipc::IpcResponse::error(error.to_string()),
-                }
+        ipc::IpcRequest::Layout { spec } => match reconfigure_layout(layout, &spec) {
+            Ok(()) => {
+                resize_all(panes, layout, tw, th, settings);
+                update.mark_all(layout);
+                update.border_dirty = true;
+                ipc::IpcResponse::success("layout applied; existing processes preserved")
             }
-            Err(error) => ipc::IpcResponse::error(error),
+            Err(error) => ipc::IpcResponse::error(error.to_string()),
         },
         ipc::IpcRequest::Exec { pane, command } => {
             if !panes.contains_key(&pane) {
@@ -2373,52 +2308,35 @@ pub(crate) fn handle_ipc_command(
             }
         }
         ipc::IpcRequest::Save { path } => {
-            // IPC save uses a single-tab snapshot (no TabManager available here)
-            let tab = workspace::TabSnapshot {
-                name: "1".to_string(),
-                layout: layout.clone(),
-                active_pane: *active,
-                zoomed_pane: None,
-                broadcast: false,
-                panes: layout
-                    .pane_ids()
-                    .into_iter()
-                    .map(|id| {
-                        let pane = panes.get(&id);
-                        workspace::PaneSnapshot {
-                            id,
-                            launch: pane
-                                .map(|p| p.launch().clone())
-                                .unwrap_or(PaneLaunch::Shell),
-                            name: pane.and_then(|p| p.name().map(|s| s.to_string())),
-                            cwd: pane
-                                .and_then(|p| p.live_cwd())
-                                .map(|p| p.to_string_lossy().to_string()),
-                            env: pane.map(|p| p.initial_env().clone()).unwrap_or_default(),
-                            restart: project::RestartPolicy::default(),
-                            shell: pane.and_then(|p| p.initial_shell().map(|s| s.to_string())),
-                            // Scrollback persistence (#69) is opt-in via
-                            // `[global] persist_scrollback = true`. The IPC
-                            // save path doesn't have access to that config
-                            // yet, so it always emits an empty payload —
-                            // the snapshot still validates as v3.
-                            scrollback: None,
-                            cursor_pos: None,
-                        }
-                    })
-                    .collect(),
-            };
-            let snapshot = WorkspaceSnapshot {
-                version: workspace::SNAPSHOT_VERSION,
-                shell: shell.clone(),
-                border_style: settings.border_style,
-                show_status_bar: settings.show_status_bar,
-                show_tab_bar: settings.show_tab_bar,
+            let mut snapshot = WorkspaceSnapshot::from_live(
+                &crate::tab::TabManager::new(),
+                "1",
+                layout,
+                panes,
+                *active,
+                None,
+                false,
+                &HashMap::new(),
+                shell,
+                settings.border_style,
+                settings.show_status_bar,
+                settings.show_tab_bar,
                 scrollback,
-                active_tab: 0,
-                tabs: vec![tab],
-            };
-            match workspace::save_snapshot(&path, &snapshot) {
+            );
+            let overrides = panes
+                .iter()
+                .filter_map(|(&id, pane)| {
+                    pane.persist_scrollback_override().map(|value| (id, value))
+                })
+                .collect();
+            let result = workspace::capture_tab_scrollback(
+                &mut snapshot.tabs[0],
+                panes,
+                config::load_config().persist_scrollback,
+                &overrides,
+            )
+            .and_then(|_| workspace::save_snapshot(&path, &snapshot));
+            match result {
                 Ok(()) => ipc::IpcResponse::success(format!("saved {}", path)),
                 Err(error) => ipc::IpcResponse::error(error.to_string()),
             }
@@ -2441,4 +2359,171 @@ pub(crate) fn handle_ipc_command(
     };
 
     (response, update)
+}
+
+pub(crate) const MAX_RESTART_RETRIES: u32 = 10;
+
+pub(crate) fn restart_allowed(policy: &project::RestartPolicy, exit: Option<u32>) -> bool {
+    match policy {
+        project::RestartPolicy::Never => false,
+        project::RestartPolicy::Always => true,
+        project::RestartPolicy::OnFailure => exit != Some(0),
+    }
+}
+
+/// Shared by active and background tabs; failed spawns consume retry budget too.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn restart_panes(
+    panes: &mut HashMap<usize, Pane>,
+    layout: &Layout,
+    policies: &HashMap<usize, project::RestartPolicy>,
+    state: &mut HashMap<usize, (Instant, u32)>,
+    shell: &str,
+    tw: u16,
+    th: u16,
+    settings: &Settings,
+    scrollback: usize,
+) -> Vec<usize> {
+    state.retain(|pid, (started, _)| {
+        panes
+            .get(pid)
+            .is_some_and(|p| !p.is_alive() || started.elapsed() < Duration::from_secs(30))
+    });
+    let candidates: Vec<_> = panes
+        .iter()
+        .filter(|(id, pane)| {
+            !pane.is_alive()
+                && policies
+                    .get(id)
+                    .is_some_and(|p| restart_allowed(p, pane.exit_code()))
+        })
+        .map(|(&id, _)| id)
+        .collect();
+    let mut restarted = Vec::new();
+    for id in candidates {
+        let entry = state
+            .entry(id)
+            .or_insert((Instant::now() - Duration::from_secs(2), 0));
+        let delay = Duration::from_secs(2 * u64::from(entry.1.saturating_sub(2).max(1)));
+        if entry.1 >= MAX_RESTART_RETRIES || entry.0.elapsed() < delay {
+            continue;
+        }
+        let pane = &panes[&id];
+        let launch = pane.launch().clone();
+        let name = pane.name().map(String::from);
+        let pane_shell = pane.initial_shell().map(String::from);
+        entry.0 = Instant::now();
+        entry.1 += 1;
+        match replace_pane(
+            panes,
+            layout,
+            id,
+            launch,
+            pane_shell.as_deref().unwrap_or(shell),
+            tw,
+            th,
+            settings,
+            scrollback,
+        ) {
+            Ok(()) => {
+                if let Some(pane) = panes.get_mut(&id) {
+                    pane.set_name(name);
+                    pane.set_initial_shell(pane_shell);
+                }
+                restarted.push(id);
+            }
+            Err(error) => tracing::warn!(pane = id, %error, "pane restart failed"),
+        }
+    }
+    restarted
+}
+
+/// Reflow an existing workspace without restarting its processes.
+pub(crate) fn reconfigure_layout(layout: &mut Layout, spec: &str) -> anyhow::Result<()> {
+    let mut candidate = Layout::from_spec(spec).map_err(anyhow::Error::msg)?;
+    let ids = layout.pane_ids();
+    anyhow::ensure!(
+        candidate.pane_count() == ids.len(),
+        "layout requires {} panes, but {} are running; split or close panes explicitly first",
+        candidate.pane_count(),
+        ids.len()
+    );
+    let mut pending = vec![&mut candidate.root];
+    let mut ids = ids.into_iter();
+    while let Some(node) = pending.pop() {
+        match node {
+            crate::layout::LayoutNode::Leaf { id } => {
+                *id = ids
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("layout leaf count mismatch"))?
+            }
+            crate::layout::LayoutNode::Split { first, second, .. } => {
+                pending.push(second);
+                pending.push(first);
+            }
+        }
+    }
+    candidate.next_id = layout.next_id;
+    *layout = candidate;
+    Ok(())
+}
+
+/// Tab chrome occupies the bottom border, or one content row without borders.
+pub(crate) fn terminal_render_height(height: u16, settings: &Settings) -> u16 {
+    height.saturating_sub(u16::from(
+        settings.border_style.is_none() && settings.show_tab_bar && settings.tab_count > 1,
+    ))
+}
+
+pub(crate) fn terminal_content_area(width: u16, height: u16, settings: &Settings) -> Rect {
+    render::content_area(
+        width,
+        terminal_render_height(height, settings),
+        settings.show_status_bar,
+        settings.border_style,
+    )
+}
+
+#[cfg(test)]
+mod reliability_tests {
+    #[test]
+    fn synchronized_dirty_survives_another_panes_frame_until_ready() {
+        let mut update = super::RenderUpdate::default();
+        update.dirty_panes.extend([1, 2]);
+        let deferred = update.defer_dirty_panes(|pid| pid == 1);
+        assert_eq!(update.dirty_panes, [2].into_iter().collect());
+        assert_eq!(deferred, [1].into_iter().collect());
+        // Reset after pane 2's frame, then retain pane 1 for a close/watchdog.
+        update = super::RenderUpdate::default();
+        update.dirty_panes.extend(deferred);
+        let deferred = update.defer_dirty_panes(|_| true);
+        assert!(!update.needs_render());
+        update.dirty_panes.extend(deferred);
+        assert!(update.defer_dirty_panes(|_| false).is_empty());
+        assert!(update.needs_render());
+        update.full_redraw = true;
+        assert!(update.defer_dirty_panes(|_| true).is_empty());
+        assert!(update.dirty_panes.contains(&1));
+    }
+
+    use super::*;
+    #[test]
+    fn on_failure_does_not_restart_success() {
+        assert!(!restart_allowed(
+            &project::RestartPolicy::OnFailure,
+            Some(0)
+        ));
+        assert!(restart_allowed(&project::RestartPolicy::OnFailure, Some(1)));
+        assert!(!restart_allowed(&project::RestartPolicy::Never, None));
+    }
+    #[test]
+    fn reflow_preserves_ids_and_rejects_count_changes() {
+        let mut layout = Layout::singleton(42, 50);
+        let old = serde_json::to_string(&layout).unwrap();
+        assert!(reconfigure_layout(&mut layout, "1:1").is_err());
+        assert_eq!(serde_json::to_string(&layout).unwrap(), old);
+        reconfigure_layout(&mut layout, "1").unwrap();
+        assert_eq!(layout.pane_ids(), vec![42]);
+        assert_eq!(layout.next_id, 50);
+    }
 }

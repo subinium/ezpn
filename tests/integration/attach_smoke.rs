@@ -4,15 +4,12 @@
 //! attach client, the client types `echo hello`, and the daemon's pane
 //! echoes that text back through the framed protocol.
 //!
-//! GATED: depends on `EZPN_TEST_SOCKET_DIR` being honored by the daemon.
-//! Remove `#[ignore]` once that wiring lands in `src/main.rs`.
 
 use std::time::Duration;
 
 use crate::common::{attach_client, spawn_daemon, type_text, wait_for_output, TestEnv};
 
 #[test]
-#[ignore = "requires EZPN_TEST_SOCKET_DIR support in src/main.rs (#62 follow-up commit)"]
 fn attach_smoke_echo_hello() {
     let env = TestEnv::new();
     let mut daemon = spawn_daemon(&env, "smoke");
@@ -23,7 +20,8 @@ fn attach_smoke_echo_hello() {
 
     // The shell is `/bin/sh` (forced by spawn_daemon). Type a literal echo
     // command and wait for the output to land in the pane.
-    type_text(&mut client, "echo ezpn-smoke-marker\n").expect("type into pane");
+    // The full marker is absent from the input, so terminal echo cannot pass.
+    type_text(&mut client, "printf 'ezpn-smoke-%s\\n' marker\n").expect("type into pane");
 
     wait_for_output(
         &client.output(),

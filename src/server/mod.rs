@@ -24,9 +24,11 @@
 mod actions;
 mod connection;
 mod ext_handlers;
+mod handshake;
 mod input_modes;
 mod mouse;
 mod render_glue;
+mod status_bar;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
@@ -65,6 +67,23 @@ pub(crate) struct Osc52ConfirmState {
     pub queued_payloads: Vec<Vec<u8>>,
 }
 
+struct HookShutdown<'a> {
+    executor: &'a HookExecutor,
+    session: &'a str,
+}
+
+impl Drop for HookShutdown<'_> {
+    fn drop(&mut self) {
+        self.executor.fire(
+            HookEvent::BeforeSessionDestroy,
+            &HookPayload::new().set("session.name", self.session),
+        );
+        if !self.executor.shutdown(Duration::from_secs(2)) {
+            tracing::warn!("shutdown hook deadline reached; remaining hooks cancelled");
+        }
+    }
+}
+
 /// Run the server daemon. This function does not return until all panes die
 /// or the server is killed.
 pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
@@ -84,6 +103,14 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("signal handler install failed: {e}"))?;
 
     let config = super::parse_args_from(args)?;
+    anyhow::ensure!(matches!(config.socket_kind, crate::cli::SocketKind::Path),
+        "abstract sockets are unavailable until attach, discovery and kill support them; use --socket path");
+    session::validate_name(session_name)?;
+    // Reserve the session before spawning any commands. Readiness begins
+    // only after all PTYs and the ctl listener have initialized below.
+    let sock_path = session::socket_path(session_name);
+    let listener = bind_path_socket(&sock_path)?;
+    let _socket_cleanup = crate::socket_security::SocketCleanupGuard::new(&sock_path)?;
 
     // Load config file defaults
     let file_config = config::load_config();
@@ -115,7 +142,8 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
     // Hooks executor (#83) — one instance for the daemon's lifetime,
     // hot-swappable on `Reloaded`. `from_hooks` runs in the calling
     // thread; the executor itself spawns one worker per fire.
-    let hook_executor = HookExecutor::new(config::load_hooks());
+    let global_hooks = config::load_hooks();
+    let mut project_hooks = Vec::new();
 
     // Keymap (#84). Defaults are merged with the user table at load
     // time. On parse error we surface a structured warning and fall
@@ -180,8 +208,12 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
         &mut default_shell,
         &mut settings,
         &mut restart_policies,
+        &mut project_hooks,
         effective_scrollback,
     )?;
+    let mut startup_hooks = global_hooks;
+    startup_hooks.extend(project_hooks.iter().cloned());
+    let hook_executor = HookExecutor::new(startup_hooks);
 
     // Apply byte-budget telemetry + clipboard policy to every pane
     // spawned at boot (#68/#71/#79). Newly-spawned panes from key/IPC
@@ -230,16 +262,20 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
             let mut all_spawned: Vec<Tab> = Vec::with_capacity(extra.all_tabs.len());
             let snap_scrollback = extra.scrollback;
 
-            for tab_snap in &extra.all_tabs {
-                let tab_panes = super::spawn_snapshot_panes(
-                    &tab_snap.layout,
-                    tab_snap,
-                    &default_shell,
-                    80,
-                    24,
-                    &settings,
-                    snap_scrollback,
-                )?;
+            for (idx, tab_snap) in extra.all_tabs.iter().enumerate() {
+                let tab_panes = if idx == extra.active_tab_idx {
+                    std::mem::take(&mut panes)
+                } else {
+                    super::spawn_snapshot_panes(
+                        &tab_snap.layout,
+                        tab_snap,
+                        &default_shell,
+                        80,
+                        24,
+                        &settings,
+                        snap_scrollback,
+                    )?
+                };
                 let mut tab_restart = HashMap::new();
                 for ps in &tab_snap.panes {
                     if ps.restart != project::RestartPolicy::Never {
@@ -258,12 +294,10 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                 all_spawned.push(tab);
             }
 
-            // Kill the panes from build_initial_state (we re-spawned everything)
-            super::kill_all_panes(&mut panes);
-
             // Build TabManager with correct order; active tab is unpacked
             let (new_mgr, active_tab) = TabManager::from_tabs(all_spawned, extra.active_tab_idx);
             tab_mgr = new_mgr;
+            settings.tab_count = tab_mgr.count;
             tab_name = active_tab.name;
             layout = active_tab.layout;
             panes = active_tab.panes;
@@ -280,9 +314,6 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
             broadcast = snap.broadcast;
         }
     }
-    const MAX_RESTART_RETRIES: u32 = 10;
-    const RESTART_DELAY: Duration = Duration::from_secs(2);
-    const RESTART_BACKOFF_THRESHOLD: u32 = 3;
 
     let mut mode = InputMode::Normal;
     let mut tw: u16 = 80;
@@ -292,44 +323,22 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
     let wake_rx = crate::pane::init_wake_channel();
 
     // Start IPC listener (existing ezpn-ctl support)
-    let ipc_rx = ipc::start_listener()
-        .map_err(|e| eprintln!("ezpn-server: IPC unavailable ({e})"))
-        .ok();
+    let ipc_rx = Some(ipc::start_listener(crate::pane::wake_main_loop)?);
+    let incoming_connections = handshake::start(listener, session_name)?;
 
-    // Create session socket and listen for client connections.
-    //
-    // Two bind modes (issue #65):
-    //   * `Path` (default) — pathname-based Unix socket under
-    //     `$XDG_RUNTIME_DIR` / `/tmp`. Hardened by `bind_path_socket`
-    //     with parent-dir checks, umask 0o077 across the bind, and
-    //     `chmod 0o600` re-stat after.
-    //   * `Abstract` — Linux-only abstract namespace at
-    //     `\0ezpn-<uid>-<session>`. No filesystem entry, so the
-    //     directory checks and chmod step do not apply. On non-Linux
-    //     we log a warning and fall back to `Path`.
-    let sock_path = session::socket_path(session_name);
-    let use_abstract = matches!(config.socket_kind, super::SocketKind::Abstract);
-    let listener = if use_abstract {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            let name = crate::socket_security::abstract_socket_name(session_name);
-            tracing::info!(socket = "abstract", name = %name, "binding abstract namespace socket");
-            let l = crate::socket_security::bind_abstract(&name)?;
-            l.set_nonblocking(true)?;
-            l
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        {
-            tracing::warn!("abstract namespace sockets are Linux-only; falling back to path bind");
-            bind_path_socket(&sock_path)?
-        }
-    } else {
-        bind_path_socket(&sock_path)?
+    let _hook_shutdown = HookShutdown {
+        executor: &hook_executor,
+        session: session_name,
     };
-
     let mut clients: Vec<ConnectedClient> = Vec::new();
     let mut border_cache: Option<BorderCache> = None;
     let mut render_buf: Vec<u8> = Vec::with_capacity(64 * 1024); // Reusable render buffer
+    const FRAME_INTERVAL: Duration = Duration::from_millis(8);
+    let mut last_frame = Instant::now() - FRAME_INTERVAL;
+    let mut update = RenderUpdate::default();
+    let mut output_disconnects = Vec::new();
+    #[cfg(feature = "render-diff")]
+    let mut frame_differ = crate::render_diff::AnsiFrameDiffer::default();
 
     // Transient one-line message shown by the command palette on success
     // (`display-message`) or on parse/dispatch error. Cleared automatically
@@ -350,8 +359,6 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
             // explicit IPC bound is wired in a follow-up commit.
             if signal_state.sigterm.load(Ordering::Relaxed) {
                 tracing::info!("SIGTERM received — graceful shutdown");
-                let payload = HookPayload::new().set("session.name", session_name);
-                hook_executor.fire(HookEvent::BeforeSessionDestroy, &payload);
                 events::publish(Event::SessionDetached {
                     session: session_name.to_string(),
                     ts: events::now_ts(),
@@ -359,10 +366,32 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                 for c in &mut clients {
                     let _ = protocol::write_msg(&mut c.writer, protocol::S_DETACHED, &[]);
                 }
+                connection::drain_output(&clients, Duration::from_millis(100));
+                let snapshot = capture_snapshot(
+                    &mut tab_mgr,
+                    &tab_name,
+                    &layout,
+                    &mut panes,
+                    active,
+                    zoomed_pane,
+                    broadcast,
+                    &restart_policies,
+                    &default_shell,
+                    &settings,
+                    effective_scrollback,
+                );
+                match snapshot {
+                    Ok(snapshot) => {
+                        if let Err(error) = workspace::auto_save(session_name, &snapshot) {
+                            tracing::warn!(%error, "snapshot save failed");
+                        }
+                    }
+                    Err(error) => tracing::warn!(%error, "snapshot capture failed"),
+                }
                 for pane in panes.values_mut() {
                     pane.kill();
                 }
-                session::cleanup(session_name);
+                tab_mgr.kill_all_inactive();
                 ipc::cleanup();
                 return Ok(());
             }
@@ -419,9 +448,11 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                         prefix_key = settings.config().prefix_key;
 
                         // Hot-swap hook + keymap registries (#83 / #84).
-                        hook_executor.replace(config::load_hooks());
-                        if let Ok(new_km) = config::load_keymap() {
-                            keymap = new_km;
+                        if let Some(bindings) = settings.take_reloaded_bindings() {
+                            let mut hooks = bindings.hooks;
+                            hooks.extend(project_hooks.iter().cloned());
+                            hook_executor.replace(hooks);
+                            keymap = bindings.keymap;
                         }
 
                         if non_reloadable_changed.is_empty() {
@@ -489,10 +520,9 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
             prev_active = active;
         }
 
-        let mut update = RenderUpdate::default();
         // Status bar is sensitive to focus / mode / broadcast / clock —
         // mark it dirty whenever any of those flipped during this iteration.
-        // Flags reset every frame; setting them here is cheap.
+        // Retain dirty flags until a frame is sent, while PTY reads continue.
         if last_status_tick.elapsed() >= STATUS_TICK_INTERVAL {
             update.status_dirty = true;
             last_status_tick = Instant::now();
@@ -582,8 +612,24 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
         spawned_seen.retain(|pid| panes.contains_key(pid));
 
         // ── Read PTY output ──
+        let mut background_output = false;
+        for tab in tab_mgr.inactive_mut() {
+            for pane in tab.panes.values_mut() {
+                background_output |= pane.read_output();
+            }
+        }
+        let mut sync_waiting = false;
         for (&pid, pane) in &mut panes {
-            if pane.read_output() {
+            let mut changed = pane.read_output();
+            if pane
+                .sync_opened_at()
+                .is_some_and(|opened| opened.elapsed() >= Duration::from_millis(33))
+            {
+                pane.force_close_sync();
+                changed = true;
+            }
+            sync_waiting |= pane.in_sync();
+            if changed && !pane.in_sync() {
                 update.dirty_panes.insert(pid);
             }
             // Forward OSC 52 clipboard sequences from child to all clients
@@ -680,74 +726,37 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
             }
         }
 
-        // ── Auto-restart dead panes ──
-        {
-            let dead_restartable: Vec<usize> = panes
-                .iter()
-                .filter(|(pid, pane)| {
-                    !pane.is_alive()
-                        && restart_policies.get(pid).is_some_and(|p| {
-                            *p == project::RestartPolicy::Always
-                                || *p == project::RestartPolicy::OnFailure
-                        })
-                })
-                .map(|(&pid, _)| pid)
-                .collect();
-
-            for pid in dead_restartable {
-                let (last_death, retries) = restart_state
-                    .entry(pid)
-                    .or_insert((Instant::now() - RESTART_DELAY, 0));
-
-                if *retries >= MAX_RESTART_RETRIES {
-                    continue;
-                }
-
-                let delay = if *retries >= RESTART_BACKOFF_THRESHOLD {
-                    RESTART_DELAY * (*retries - RESTART_BACKOFF_THRESHOLD + 1)
-                } else {
-                    RESTART_DELAY
-                };
-
-                if last_death.elapsed() < delay {
-                    continue;
-                }
-
-                let (launch, old_name, pane_shell) = panes
-                    .get(&pid)
-                    .map(|p| {
-                        (
-                            p.launch().clone(),
-                            p.name().map(String::from),
-                            p.initial_shell().map(String::from),
-                        )
-                    })
-                    .unwrap_or((PaneLaunch::Shell, None, None));
-                let effective_shell = pane_shell.as_deref().unwrap_or(&default_shell);
-                if super::replace_pane(
-                    &mut panes,
-                    &layout,
-                    pid,
-                    launch,
-                    effective_shell,
-                    tw,
-                    th,
-                    &settings,
-                    effective_scrollback,
-                )
-                .is_ok()
-                {
-                    if let Some(pane) = panes.get_mut(&pid) {
-                        pane.set_name(old_name);
-                        if let Some(ref shell_override) = pane_shell {
-                            pane.set_initial_shell(Some(shell_override.clone()));
-                        }
-                    }
-                    *retries += 1;
-                    *last_death = Instant::now();
-                    update.dirty_panes.insert(pid);
-                }
+        let restarted = crate::bootstrap::restart_panes(
+            &mut panes,
+            &layout,
+            &restart_policies,
+            &mut restart_state,
+            &default_shell,
+            tw,
+            th,
+            &settings,
+            effective_scrollback,
+        );
+        for id in &restarted {
+            exited_fired.remove(id);
+            if let Some(pane) = panes.get_mut(id) {
+                pane.set_scrollback_budget(scrollback_bytes, scrollback_eviction);
+                pane.set_clipboard_policy(clipboard_policy);
             }
+        }
+        update.dirty_panes.extend(restarted);
+        for tab in tab_mgr.inactive_mut() {
+            crate::bootstrap::restart_panes(
+                &mut tab.panes,
+                &tab.layout,
+                &tab.restart_policies,
+                &mut tab.restart_state,
+                &default_shell,
+                tw,
+                th,
+                &settings,
+                effective_scrollback,
+            );
         }
 
         // ── Check all dead (active tab) ──
@@ -756,21 +765,22 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                 if pane.is_alive() {
                     return false;
                 }
-                let has_restart = restart_policies.get(pid).is_some_and(|p| {
-                    *p == project::RestartPolicy::Always || *p == project::RestartPolicy::OnFailure
-                });
+                let has_restart = restart_policies
+                    .get(pid)
+                    .is_some_and(|p| crate::bootstrap::restart_allowed(p, pane.exit_code()));
                 if !has_restart {
                     return true;
                 }
                 restart_state
                     .get(pid)
-                    .is_some_and(|(_, retries)| *retries >= MAX_RESTART_RETRIES)
+                    .is_some_and(|(_, retries)| *retries >= crate::bootstrap::MAX_RESTART_RETRIES)
             });
         if active_tab_dead {
             if tab_mgr.count > 1 {
                 // Other tabs still alive — auto-close this dead tab and switch
                 super::kill_all_panes(&mut panes);
                 if let Some(new_tab) = tab_mgr.close_active() {
+                    settings.tab_count = tab_mgr.count;
                     tab_name = new_tab.name;
                     layout = new_tab.layout;
                     panes = new_tab.panes;
@@ -791,7 +801,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                         &layout,
                         settings.show_status_bar,
                         tw,
-                        th,
+                        crate::bootstrap::terminal_render_height(th, &settings),
                         settings.border_style,
                     ));
                     update.mark_all(&layout);
@@ -824,127 +834,63 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
             }
         }
 
-        // ── Accept new connections with handshake ──
-        // Read the first message to determine intent:
-        //   C_PING   → respond with S_PONG, close (no side effects)
-        //   C_KILL   → kill server
-        //   C_RESIZE → legacy client attach (steal mode)
-        //   C_ATTACH → new protocol attach with mode
-        if let Ok((conn, _)) = listener.accept() {
-            conn.set_nonblocking(false).ok();
-            // Defense-in-depth (issue #65): refuse cross-UID connections
-            // even if a third party managed to chmod the socket open
-            // between our bind and our chmod. Logged as a structured
-            // audit line so operators can detect probing.
-            let our_uid = unsafe { libc::getuid() };
-            match crate::socket_security::peer_uid(&conn) {
-                Ok(peer) if peer == our_uid => {}
-                Ok(peer) => {
-                    tracing::warn!(
-                        event = "ipc_peer_uid_mismatch",
-                        peer_uid = peer,
-                        expected_uid = our_uid,
-                        "refusing cross-uid connection"
-                    );
-                    drop(conn);
-                    continue;
+        // Handshakes and probes run on bounded workers; never block PTY I/O.
+        if let Ok(incoming) = incoming_connections.try_recv() {
+            match incoming {
+                handshake::Incoming::Kill => {
+                    for pane in panes.values_mut() {
+                        pane.kill();
+                    }
+                    tab_mgr.kill_all_inactive();
+                    for c in &mut clients {
+                        let _ = protocol::write_msg(&mut c.writer, protocol::S_EXIT, &[]);
+                    }
+                    connection::drain_output(&clients, Duration::from_millis(100));
+                    ipc::cleanup();
+                    return Ok(());
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        event = "ipc_peer_uid_error",
-                        error = %e,
-                        "could not read peer credentials, refusing connection"
+                handshake::Incoming::Attach {
+                    conn,
+                    cols,
+                    rows,
+                    mode: attach_mode,
+                } => {
+                    accept_client(
+                        conn,
+                        cols,
+                        rows,
+                        attach_mode,
+                        &mut clients,
+                        &mut panes,
+                        &layout,
+                        &settings,
+                        &mut tw,
+                        &mut th,
+                        &mut drag,
+                        zoomed_pane,
+                        &mut update,
                     );
-                    drop(conn);
-                    continue;
-                }
-            }
-            // Short timeout for handshake — fail-close if setting fails
-            if conn
-                .set_read_timeout(Some(Duration::from_millis(100)))
-                .is_err()
-            {
-                drop(conn);
-            } else {
-                match protocol::read_msg(&mut &conn) {
-                    Ok((protocol::C_PING, _)) => {
-                        // Liveness probe — respond and close, no side effects
-                        let mut w = &conn;
-                        let _ = protocol::write_msg(&mut w, protocol::S_PONG, &[]);
-                    }
-                    Ok((protocol::C_KILL, _)) => {
-                        // Kill server: kill all panes and exit
-                        for pane in panes.values_mut() {
-                            pane.kill();
-                        }
-                        for c in &mut clients {
-                            let _ = protocol::write_msg(&mut c.writer, protocol::S_EXIT, &[]);
-                        }
-                        session::cleanup(session_name);
-                        ipc::cleanup();
-                        return Ok(());
-                    }
-                    Ok((protocol::C_ATTACH, payload)) => {
-                        // New protocol: attach with mode
-                        if let Ok(req) = serde_json::from_slice::<protocol::AttachRequest>(&payload)
-                        {
-                            accept_client(
-                                conn,
-                                req.cols,
-                                req.rows,
-                                req.mode,
-                                &mut clients,
-                                &mut panes,
-                                &layout,
-                                &settings,
-                                &mut tw,
-                                &mut th,
-                                &mut drag,
-                                zoomed_pane,
-                                &mut update,
-                            );
-                        }
-                    }
-                    Ok((protocol::C_RESIZE, payload)) => {
-                        // Legacy client attach — always steal mode
-                        if let Some((w, h)) = protocol::decode_resize(&payload) {
-                            accept_client(
-                                conn,
-                                w,
-                                h,
-                                protocol::AttachMode::Steal,
-                                &mut clients,
-                                &mut panes,
-                                &layout,
-                                &settings,
-                                &mut tw,
-                                &mut th,
-                                &mut drag,
-                                zoomed_pane,
-                                &mut update,
-                            );
-                        }
-                    }
-                    _ => {
-                        // Unknown first message or disconnected → ignore
-                    }
                 }
             }
         }
 
         // ── Process client events from all clients ──
         let mut detach_ids: Vec<u64> = Vec::new();
-        let mut disconnect_ids: Vec<u64> = Vec::new();
+        let mut disconnect_ids = std::mem::take(&mut output_disconnects);
         let mut kill_requested = false;
-        let mut detach_all = false; // Set by Ctrl+B d via process_key
+        let mut detach_requested = false;
         let mut tab_action = TabAction::None;
         let mut size_changed = false;
         let current_tab_names = tab_mgr.tab_names(&tab_name);
 
         for client in &mut clients {
+            if disconnect_ids.contains(&client.id) {
+                continue;
+            }
             let client_mode = client.mode;
             let client_id = client.id;
-            loop {
+            // A busy peer cannot starve PTY draining, resize or other clients.
+            for _ in 0..64 {
                 match client.event_rx.try_recv() {
                     Ok(ClientMsg::Event(event)) => {
                         // Readonly clients cannot send input
@@ -985,7 +931,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                             th,
                             effective_scrollback,
                             &border_cache,
-                            &mut detach_all,
+                            &mut detach_requested,
                             &mut tab_action,
                             &current_tab_names,
                             prefix_key,
@@ -994,11 +940,16 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                             copy_argv,
                             &mut ctx,
                         );
+                        if std::mem::take(&mut detach_requested) {
+                            detach_ids.push(client_id);
+                            break;
+                        }
                     }
                     Ok(ClientMsg::Resize(w, h)) => {
                         client.tw = w;
                         client.th = h;
                         size_changed = true;
+                        update.mark_all(&layout);
                     }
                     Ok(ClientMsg::Detach) => {
                         detach_ids.push(client_id);
@@ -1009,6 +960,9 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                         break;
                     }
                     Ok(ClientMsg::Kill) => {
+                        if client_mode == protocol::AttachMode::Readonly {
+                            continue;
+                        }
                         kill_requested = true;
                         break;
                     }
@@ -1028,10 +982,11 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
             for pane in panes.values_mut() {
                 pane.kill();
             }
+            tab_mgr.kill_all_inactive();
             for c in &mut clients {
                 let _ = protocol::write_msg(&mut c.writer, protocol::S_EXIT, &[]);
             }
-            session::cleanup(session_name);
+            connection::drain_output(&clients, Duration::from_millis(100));
             ipc::cleanup();
             return Ok(());
         }
@@ -1060,22 +1015,12 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
             }
         }
 
-        // detach_all (from Ctrl+B d): in steal mode, detach all clients.
-        // In shared/readonly mode, only detach writable clients (the ones that
-        // could have triggered the detach).
-        if detach_all {
-            for c in &clients {
-                if c.mode != protocol::AttachMode::Readonly {
-                    detach_ids.push(c.id);
-                }
-            }
-        }
-
         // Handle detach/disconnect — auto-save when last client leaves
         let had_clients = !clients.is_empty();
         for id in &detach_ids {
             if let Some(pos) = clients.iter().position(|c| c.id == *id) {
                 let _ = protocol::write_msg(&mut clients[pos].writer, protocol::S_DETACHED, &[]);
+                connection::drain_output(&clients[pos..=pos], Duration::from_millis(100));
                 clients.remove(pos);
             }
         }
@@ -1085,7 +1030,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
             }
         }
         // Recompute effective size after any client changes
-        if !detach_ids.is_empty() || !disconnect_ids.is_empty() {
+        if !clients.is_empty() && (!detach_ids.is_empty() || !disconnect_ids.is_empty()) {
             let (ew, eh) = effective_size(&clients);
             if ew != tw || eh != th {
                 tw = ew;
@@ -1105,28 +1050,27 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
             && (!detach_ids.is_empty() || !disconnect_ids.is_empty())
         {
             // All clients gone — auto-save and reset input state
-            let snapshot = WorkspaceSnapshot::from_live(
-                &tab_mgr,
+            let snapshot = capture_snapshot(
+                &mut tab_mgr,
                 &tab_name,
                 &layout,
-                &panes,
+                &mut panes,
                 active,
                 zoomed_pane,
                 broadcast,
                 &restart_policies,
                 &default_shell,
-                settings.border_style,
-                settings.show_status_bar,
-                settings.show_tab_bar,
+                &settings,
                 effective_scrollback,
             );
-            workspace::auto_save(session_name, &snapshot);
-            // #82: announce snapshot save + session detach.
-            events::publish(Event::SnapshotSaved {
-                session: session_name.to_string(),
-                path: format!("auto:{session_name}"),
-                ts: events::now_ts(),
-            });
+            match snapshot.and_then(|snapshot| workspace::auto_save(session_name, &snapshot)) {
+                Ok(()) => events::publish(Event::SnapshotSaved {
+                    session: session_name.to_string(),
+                    path: format!("auto:{session_name}"),
+                    ts: events::now_ts(),
+                }),
+                Err(error) => tracing::warn!(%error, "snapshot save failed"),
+            }
             events::publish(Event::SessionDetached {
                 session: session_name.to_string(),
                 ts: events::now_ts(),
@@ -1142,7 +1086,8 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
 
         // ── Handle tab actions ──
         match tab_action {
-            TabAction::NewTab => {
+            TabAction::NewTab(requested_name) => {
+                let inherit_cwd = panes.get(&active).and_then(|pane| pane.live_cwd());
                 // Save current tab state
                 let current_tab = Tab::new(
                     std::mem::take(&mut tab_name),
@@ -1158,9 +1103,13 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                 saved.broadcast = broadcast;
 
                 tab_name = tab_mgr.create_tab(saved);
+                settings.tab_count = tab_mgr.count;
+                if let Some(name) = requested_name {
+                    tab_name = name;
+                }
                 // Create new tab with a single shell pane
                 layout = Layout::from_grid(1, 1);
-                let inner = super::make_inner(tw, th, settings.show_status_bar);
+                let inner = crate::bootstrap::terminal_content_area(tw, th, &settings);
                 let rects = layout.pane_rects(&inner);
                 let (&pid, rect) = rects.iter().next().unwrap();
                 // #82: announce the new tab now so subscribers see the
@@ -1173,12 +1122,13 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                 });
                 update.tabs_dirty = true;
                 update.status_dirty = true;
-                match super::spawn_pane(
+                match crate::bootstrap::spawn_pane_in(
                     &default_shell,
                     &PaneLaunch::Shell,
                     rect.w.max(1),
                     rect.h.max(1),
                     effective_scrollback,
+                    inherit_cwd.as_deref(),
                 ) {
                     Ok(mut p) => {
                         // Inherit byte-budget telemetry + clipboard policy
@@ -1214,7 +1164,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                             &layout,
                             settings.show_status_bar,
                             tw,
-                            th,
+                            crate::bootstrap::terminal_render_height(th, &settings),
                             settings.border_style,
                         ));
                         update.mark_all(&layout);
@@ -1224,6 +1174,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                     Err(_) => {
                         // Spawn failed — revert: close this empty tab and restore previous
                         if let Some(restored) = tab_mgr.close_active() {
+                            settings.tab_count = tab_mgr.count;
                             tab_name = restored.name;
                             layout = restored.layout;
                             panes = restored.panes;
@@ -1237,7 +1188,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                                 &layout,
                                 settings.show_status_bar,
                                 tw,
-                                th,
+                                crate::bootstrap::terminal_render_height(th, &settings),
                                 settings.border_style,
                             ));
                             update.mark_all(&layout);
@@ -1287,7 +1238,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                             &layout,
                             settings.show_status_bar,
                             tw,
-                            th,
+                            crate::bootstrap::terminal_render_height(th, &settings),
                             settings.border_style,
                         ));
                         update.mark_all(&layout);
@@ -1299,9 +1250,19 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                 }
             }
             TabAction::CloseTab => {
+                if tab_mgr.count == 1 {
+                    super::kill_all_panes(&mut panes);
+                    for client in &mut clients {
+                        let _ = protocol::write_msg(&mut client.writer, protocol::S_EXIT, &[]);
+                    }
+                    connection::drain_output(&clients, Duration::from_millis(100));
+                    ipc::cleanup();
+                    return Ok(());
+                }
                 if tab_mgr.count > 1 {
                     super::kill_all_panes(&mut panes);
                     if let Some(new_tab) = tab_mgr.close_active() {
+                        settings.tab_count = tab_mgr.count;
                         tab_name = new_tab.name;
                         layout = new_tab.layout;
                         panes = new_tab.panes;
@@ -1322,7 +1283,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                             &layout,
                             settings.show_status_bar,
                             tw,
-                            th,
+                            crate::bootstrap::terminal_render_height(th, &settings),
                             settings.border_style,
                         ));
                         update.mark_all(&layout);
@@ -1353,7 +1314,6 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                 for c in &mut clients {
                     let _ = protocol::write_msg(&mut c.writer, protocol::S_EXIT, &[]);
                 }
-                session::cleanup(session_name);
                 ipc::cleanup();
                 return Ok(());
             }
@@ -1362,7 +1322,7 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
 
         // ── Handle IPC commands ──
         if let Some(ref rx) = ipc_rx {
-            while let Ok((cmd, resp_tx)) = rx.try_recv() {
+            for (cmd, resp_tx) in rx.try_iter().take(64) {
                 // RFC #103: extended commands (`ls_tree`, `dump`,
                 // `send_keys`) flow through the same channel as the
                 // legacy `IpcRequest` vocabulary so handlers can read
@@ -1389,22 +1349,22 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
 
                 // Intercept Save/Load to use full-session snapshots (with all tabs)
                 if let ipc::IpcRequest::Save { ref path } = cmd {
-                    let snapshot = WorkspaceSnapshot::from_live(
-                        &tab_mgr,
+                    let snapshot = capture_snapshot(
+                        &mut tab_mgr,
                         &tab_name,
                         &layout,
-                        &panes,
+                        &mut panes,
                         active,
                         zoomed_pane,
                         broadcast,
                         &restart_policies,
                         &default_shell,
-                        settings.border_style,
-                        settings.show_status_bar,
-                        settings.show_tab_bar,
+                        &settings,
                         effective_scrollback,
                     );
-                    let response = match workspace::save_snapshot(path, &snapshot) {
+                    let response = match snapshot
+                        .and_then(|snapshot| workspace::save_snapshot(path, &snapshot))
+                    {
                         Ok(()) => ipc::IpcResponse::success(format!("saved {}", path)),
                         Err(error) => ipc::IpcResponse::error(error.to_string()),
                     };
@@ -1418,14 +1378,12 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                         let snapshot = workspace::load_snapshot(path)?;
                         let snap_scrollback = snapshot.scrollback;
 
-                        // Kill current session
-                        super::kill_all_panes(&mut panes);
-                        tab_mgr.kill_all_inactive();
-
-                        default_shell = snapshot.shell.clone();
-                        settings = Settings::new(snapshot.border_style);
-                        settings.show_status_bar = snapshot.show_status_bar;
-                        settings.show_tab_bar = snapshot.show_tab_bar;
+                        // Prepare the complete replacement first. A missing
+                        // shell/cwd must leave all current processes running.
+                        let mut next_settings = Settings::new(snapshot.border_style);
+                        next_settings.tab_count = snapshot.tabs.len();
+                        next_settings.show_status_bar = snapshot.show_status_bar;
+                        next_settings.show_tab_bar = snapshot.show_tab_bar;
 
                         // Spawn all tabs in order
                         let mut all_tabs: Vec<Tab> = Vec::new();
@@ -1433,10 +1391,10 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                             let tp = super::spawn_snapshot_panes(
                                 &tab_snap.layout,
                                 tab_snap,
-                                &default_shell,
+                                &snapshot.shell,
                                 tw,
                                 th,
-                                &settings,
+                                &next_settings,
                                 snap_scrollback,
                             )?;
                             let mut tr = HashMap::new();
@@ -1459,7 +1417,14 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
 
                         let (new_mgr, active_tab) =
                             TabManager::from_tabs(all_tabs, snapshot.active_tab);
+                        super::kill_all_panes(&mut panes);
+                        tab_mgr.kill_all_inactive();
+                        default_shell = snapshot.shell;
+                        settings.border_style = next_settings.border_style;
+                        settings.show_status_bar = next_settings.show_status_bar;
+                        settings.show_tab_bar = next_settings.show_tab_bar;
                         tab_mgr = new_mgr;
+                        settings.tab_count = tab_mgr.count;
                         tab_name = active_tab.name;
                         layout = active_tab.layout;
                         panes = active_tab.panes;
@@ -1468,6 +1433,17 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                         restart_state = active_tab.restart_state;
                         zoomed_pane = active_tab.zoomed_pane;
                         broadcast = active_tab.broadcast;
+                        mode = InputMode::Normal;
+                        drag = None;
+                        text_selection = None;
+                        selection_anchor = None;
+                        zoomed_pane = active_tab.zoomed_pane;
+                        last_active = active;
+                        prev_active = active;
+                        spawned_seen.clear();
+                        exited_fired.clear();
+                        prev_cwd.clear();
+                        osc52_confirm = None;
                         tab_names_dirty = true;
                         Ok(())
                     })();
@@ -1508,9 +1484,10 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                 &layout,
                 settings.show_status_bar,
                 tw,
-                th,
+                crate::bootstrap::terminal_render_height(th, &settings),
                 settings.border_style,
             ));
+            update.border_dirty = false;
         }
 
         if zoomed_pane.is_some() {
@@ -1518,8 +1495,12 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
             super::resize_zoomed_pane(&mut panes, active, tw, th, &settings);
         }
 
+        let deferred_dirty =
+            update.defer_dirty_panes(|pid| panes.get(&pid).is_some_and(|pane| pane.in_sync()));
         let render_needed = update.needs_render();
-        if render_needed && !clients.is_empty() {
+        let render_due = last_frame.elapsed() >= FRAME_INTERVAL;
+        let mut rendered_this_frame = false;
+        if render_needed && render_due && !clients.is_empty() {
             if let Some(ref cache) = border_cache {
                 if tab_names_dirty {
                     tab_names_cache = tab_mgr.tab_names(&tab_name);
@@ -1600,48 +1581,185 @@ pub fn run(session_name: &str, args: &[String]) -> anyhow::Result<()> {
                     selection_chars,
                     zoomed_pane,
                     &default_shell,
+                    session_name,
                     &tab_names_cache,
                     flash_text,
                     palette_state.as_ref(),
                     osc52_confirm.as_ref(),
                 );
 
-                super::reset_render_targets(&mut panes, &render_targets);
+                #[cfg(feature = "render-diff")]
+                if render_result.is_ok() {
+                    render_buf = frame_differ.encode(&render_buf, tw, th, update.full_redraw);
+                }
 
-                // Broadcast frame to all clients; remove failed ones
+                // Broadcast in order; defer eviction to normal bookkeeping.
                 if render_result.is_ok() && !render_buf.is_empty() {
-                    clients.retain_mut(|c| {
-                        if protocol::write_msg(&mut c.writer, protocol::S_OUTPUT, &render_buf)
-                            .is_err()
-                        {
-                            // Try to send detach ack before dropping
-                            let _ = protocol::write_msg(&mut c.writer, protocol::S_DETACHED, &[]);
-                            false
-                        } else {
-                            true
+                    for c in &mut clients {
+                        let sent = (|| {
+                            let (view_w, view_h) = protocol::normalize_size(c.tw, c.th);
+                            if c.mode == protocol::AttachMode::Readonly
+                                && (view_w < tw || view_h < th)
+                            {
+                                // A smaller observer gets clipped pane content, not
+                                // out-of-range cursor writes and not a PTY resize.
+                                let view_cache = render::build_border_cache_with_style(
+                                    &layout,
+                                    settings.show_status_bar,
+                                    view_w,
+                                    crate::bootstrap::terminal_render_height(view_h, &settings),
+                                    settings.border_style,
+                                );
+                                let mut view = Vec::new();
+                                if render_glue::render_frame_to_buf(
+                                    &mut view,
+                                    &panes,
+                                    &layout,
+                                    active,
+                                    &settings,
+                                    view_w,
+                                    view_h,
+                                    false,
+                                    &view_cache,
+                                    &update.dirty_panes,
+                                    update.full_redraw,
+                                    &mode,
+                                    broadcast,
+                                    sel_for_render,
+                                    selection_chars,
+                                    zoomed_pane,
+                                    &default_shell,
+                                    session_name,
+                                    &tab_names_cache,
+                                    flash_text,
+                                    palette_state.as_ref(),
+                                    osc52_confirm.as_ref(),
+                                )
+                                .is_err()
+                                {
+                                    return false;
+                                }
+                                return protocol::write_msg(
+                                    &mut c.writer,
+                                    protocol::S_OUTPUT,
+                                    &view,
+                                )
+                                .is_ok();
+                            }
+                            if protocol::write_msg(&mut c.writer, protocol::S_OUTPUT, &render_buf)
+                                .is_err()
+                            {
+                                // Try to send detach ack before dropping
+                                let _ =
+                                    protocol::write_msg(&mut c.writer, protocol::S_DETACHED, &[]);
+                                false
+                            } else {
+                                true
+                            }
+                        })();
+                        if !sent {
+                            // Keep the client until the normal disconnect path
+                            // recalculates geometry and saves the last detach.
+                            output_disconnects.push(c.id);
                         }
-                    });
+                    }
+                }
+                super::reset_render_targets(&mut panes, &render_targets);
+                if render_result.is_ok() {
+                    update = RenderUpdate::default();
+                    last_frame = Instant::now();
+                    rendered_this_frame = true;
                 }
             }
         }
 
+        update.dirty_panes.extend(deferred_dirty);
+        if clients.is_empty() {
+            update = RenderUpdate::default();
+        }
+
         // Block until any event source wakes us, or timeout.
-        // With clients: 2ms when we just rendered (active I/O), 8ms idle.
-        // Headless: 20ms (responsive to PING probes for session discovery).
-        let rendered_this_frame = render_needed;
-        let timeout_ms = if clients.is_empty() {
-            20
-        } else if rendered_this_frame {
-            2
+        // A pending frame has a bounded deadline even after the final PTY
+        // chunk. Event wakes still drain input/output without rendering each
+        // chunk as a separate frame during large bursts.
+        let timeout = if !output_disconnects.is_empty() {
+            Duration::ZERO
+        } else if render_needed && !rendered_this_frame && !clients.is_empty() {
+            FRAME_INTERVAL.saturating_sub(last_frame.elapsed())
+        } else if rendered_this_frame || background_output || sync_waiting {
+            Duration::from_millis(2)
         } else {
-            8
+            Duration::from_millis(250)
         };
-        let _ = wake_rx.recv_timeout(Duration::from_millis(timeout_ms));
+        let _ = wake_rx.recv_timeout(timeout);
         // Drain accumulated wake signals
         while wake_rx.try_recv().is_ok() {}
     }
 
-    session::cleanup(session_name);
+    connection::drain_output(&clients, Duration::from_millis(100));
     ipc::cleanup();
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn capture_snapshot(
+    tabs: &mut crate::tab::TabManager,
+    name: &str,
+    layout: &Layout,
+    panes: &mut HashMap<usize, crate::pane::Pane>,
+    active: usize,
+    zoom: Option<usize>,
+    broadcast: bool,
+    restarts: &HashMap<usize, project::RestartPolicy>,
+    shell: &str,
+    settings: &Settings,
+    scrollback: usize,
+) -> anyhow::Result<WorkspaceSnapshot> {
+    let mut snapshot = WorkspaceSnapshot::from_live(
+        tabs,
+        name,
+        layout,
+        panes,
+        active,
+        zoom,
+        broadcast,
+        restarts,
+        shell,
+        settings.border_style,
+        settings.show_status_bar,
+        settings.show_tab_bar,
+        scrollback,
+    );
+    let persist = settings.config().persist_scrollback;
+    let overrides = panes
+        .iter()
+        .filter_map(|(&id, pane)| pane.persist_scrollback_override().map(|value| (id, value)))
+        .collect();
+    workspace::capture_tab_scrollback(
+        &mut snapshot.tabs[tabs.active_idx],
+        panes,
+        persist,
+        &overrides,
+    )?;
+    let active_idx = tabs.active_idx;
+    for (stored, tab) in tabs.inactive_mut().enumerate() {
+        let logical = if stored < active_idx {
+            stored
+        } else {
+            stored + 1
+        };
+        let overrides = tab
+            .panes
+            .iter()
+            .filter_map(|(&id, pane)| pane.persist_scrollback_override().map(|value| (id, value)))
+            .collect();
+        workspace::capture_tab_scrollback(
+            &mut snapshot.tabs[logical],
+            &mut tab.panes,
+            persist,
+            &overrides,
+        )?;
+    }
+    snapshot.validate()?;
+    Ok(snapshot)
 }

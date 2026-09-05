@@ -12,15 +12,18 @@
 //!   so the kernel `execve`'s the binary directly without an intermediate
 //!   shell parse. Users who want shell expansion must opt in explicitly with
 //!   `["sh", "-c", "..."]`.
-//! - **Variable substitution is single-shot and shell-safe.** `${pane.cwd}`
+//! - **Variable substitution is single-shot.** `${pane.cwd}`
 //!   is replaced with the literal payload string inside the argv element it
 //!   occurs in. The result is *never* re-parsed, re-tokenized, or expanded.
 //!   So a payload value of `; rm -rf ~` becomes a single argv string
 //!   `; rm -rf ~`, not three additional arguments.
+//!   Explicit shell programs still parse their script argument: pass payloads
+//!   as positional arguments, not interpolated shell source.
 //! - **No env propagation beyond what the daemon already exports.** The
 //!   spawned child inherits the daemon's env unchanged; hooks cannot inject
 //!   new variables.
-//! - **5 s wall-clock timeout.** Children that overrun are sent `SIGKILL`.
+//! - **5 s wall-clock timeout.** On Unix, the child process group is killed.
+//! - **Bounded execution.** Four workers and 64 queued invocations maximum.
 //! - **Output captured.** stdout + stderr go to a per-event rotating log
 //!   under `$XDG_STATE_HOME/ezpn/hooks/<event>-<unix>.log`, capped at 1 MB
 //!   per file; older files are evicted FIFO.
@@ -38,13 +41,14 @@
 //! 4. The executor is `Send + Sync` and uses an internal thread pool; the
 //!    server's main loop is not blocked.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -188,6 +192,7 @@ pub enum HookParseError {
     /// form) is not. We don't accept the string form at all in TOML, but if
     /// some upstream caller hands us an empty-string program, reject it.
     EmptyProgram,
+    InvalidExec,
     InvalidWhen(String),
 }
 
@@ -207,6 +212,7 @@ impl fmt::Display for HookParseError {
             HookParseError::EmptyProgram => {
                 f.write_str("hook exec[0] (program name) must not be empty")
             }
+            HookParseError::InvalidExec => f.write_str("hook exec contains NUL or exceeds 1 MiB"),
             HookParseError::InvalidWhen(msg) => write!(f, "invalid when predicate: {msg}"),
         }
     }
@@ -226,6 +232,15 @@ impl Hook {
         }
         if raw.exec[0].trim().is_empty() {
             return Err(HookParseError::EmptyProgram);
+        }
+        if raw.exec.iter().any(|s| s.contains('\0'))
+            || raw
+                .exec
+                .iter()
+                .fold(0usize, |n, s| n.saturating_add(s.len()))
+                > HOOK_ARGV_MAX_BYTES
+        {
+            return Err(HookParseError::InvalidExec);
         }
         let when = match raw.when {
             Some(s) if !s.trim().is_empty() => Some(WhenPredicate::parse(&s)?),
@@ -285,7 +300,14 @@ impl HookPayload {
 /// substituted value contains spaces, quotes, or shell metacharacters, the
 /// caller hands the single string to `Command::args` which never invokes a
 /// shell.
-fn substitute(input: &str, payload: &HookPayload, missing: &mut Vec<String>) -> String {
+fn substitute_checked(
+    input: &str,
+    payload: &HookPayload,
+    missing: &mut Vec<String>,
+) -> Option<String> {
+    if input.len() > HOOK_ARGV_MAX_BYTES {
+        return None;
+    }
     let mut out = String::with_capacity(input.len());
     let bytes = input.as_bytes();
     let mut i = 0;
@@ -295,7 +317,12 @@ fn substitute(input: &str, payload: &HookPayload, missing: &mut Vec<String>) -> 
             if let Some(end) = input[i + 2..].find('}') {
                 let key = &input[i + 2..i + 2 + end];
                 match payload.get(key) {
-                    Some(v) => out.push_str(v),
+                    Some(v) => {
+                        if v.len() > HOOK_ARGV_MAX_BYTES.saturating_sub(out.len()) {
+                            return None;
+                        }
+                        out.push_str(v);
+                    }
                     None => {
                         missing.push(key.to_string());
                         // Empty substitution; keep going.
@@ -306,9 +333,17 @@ fn substitute(input: &str, payload: &HookPayload, missing: &mut Vec<String>) -> 
             }
         }
         out.push(input[i..].chars().next().unwrap());
+        if out.len() > HOOK_ARGV_MAX_BYTES {
+            return None;
+        }
         i += input[i..].chars().next().unwrap().len_utf8();
     }
-    out
+    Some(out)
+}
+
+#[cfg(test)]
+fn substitute(input: &str, payload: &HookPayload, missing: &mut Vec<String>) -> String {
+    substitute_checked(input, payload, missing).expect("test substitution within bounds")
 }
 
 // ─── `when` predicate ──────────────────────────────────────────────────
@@ -346,10 +381,16 @@ impl WhenPredicate {
     fn parse(src: &str) -> Result<Self, HookParseError> {
         let trimmed = src.trim();
         // Find an operator. Order matters: scan for `==` / `!=` first.
-        let (op_pos, op_len, op) = if let Some(p) = trimmed.find("==") {
-            (p, 2, WhenOp::Eq)
-        } else if let Some(p) = trimmed.find("!=") {
-            (p, 2, WhenOp::Ne)
+        let lhs_end = trimmed
+            .find('}')
+            .ok_or_else(|| HookParseError::InvalidWhen("missing variable reference".into()))?
+            + 1;
+        let after_lhs = trimmed[lhs_end..].trim_start();
+        let op_pos = trimmed.len() - after_lhs.len();
+        let (op_len, op) = if after_lhs.starts_with("==") {
+            (2, WhenOp::Eq)
+        } else if after_lhs.starts_with("!=") {
+            (2, WhenOp::Ne)
         } else {
             return Err(HookParseError::InvalidWhen(format!(
                 "expected `==` or `!=` operator in `{trimmed}`"
@@ -394,7 +435,10 @@ impl WhenPredicate {
 fn parse_var_ref(s: &str) -> Option<String> {
     let s = s.trim();
     let s = s.strip_prefix("${")?.strip_suffix('}')?;
-    if s.is_empty() {
+    if s.is_empty()
+        || s.chars()
+            .any(|c| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+    {
         return None;
     }
     Some(s.to_string())
@@ -421,6 +465,9 @@ pub const HOOK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum bytes per per-event log file. Older entries are FIFO-evicted
 /// when the next write would exceed this cap.
 pub const HOOK_LOG_MAX_BYTES: u64 = 1024 * 1024;
+const HOOK_WORKERS: usize = 4;
+const HOOK_QUEUE_DEPTH: usize = 64;
+const HOOK_ARGV_MAX_BYTES: usize = 1024 * 1024;
 
 /// Thread-safe registry of hooks indexed by event. Used by the server to
 /// dispatch each lifecycle event to all matching hooks, asynchronously.
@@ -432,10 +479,119 @@ pub struct HookExecutor {
     /// Optional override for the log directory. Used by tests; production
     /// code leaves this `None` so [`hooks_log_dir`] picks the XDG path.
     log_dir_override: Option<PathBuf>,
+    pool: Arc<HookPool>,
 }
 
 struct ExecutorInner {
     by_event: HashMap<HookEvent, Vec<Hook>>,
+}
+
+struct HookJob {
+    event: &'static str,
+    argv: Vec<String>,
+    log_dir: PathBuf,
+}
+
+struct HookQueue {
+    jobs: VecDeque<HookJob>,
+    active: usize,
+    accepting: bool,
+}
+
+struct PoolState {
+    queue: Mutex<HookQueue>,
+    ready: Condvar,
+    cancel: AtomicBool,
+}
+
+struct HookPool {
+    state: Arc<PoolState>,
+    workers: Vec<thread::JoinHandle<()>>,
+}
+
+impl HookPool {
+    fn new() -> Self {
+        let state = Arc::new(PoolState {
+            queue: Mutex::new(HookQueue {
+                jobs: VecDeque::new(),
+                active: 0,
+                accepting: true,
+            }),
+            ready: Condvar::new(),
+            cancel: AtomicBool::new(false),
+        });
+        let mut workers = Vec::new();
+        for i in 0..HOOK_WORKERS {
+            let state = Arc::clone(&state);
+            if let Ok(worker) =
+                thread::Builder::new()
+                    .name(format!("ezpn-hook-{i}"))
+                    .spawn(move || loop {
+                        let job = {
+                            let mut queue = state.queue.lock().unwrap_or_else(|e| e.into_inner());
+                            while queue.jobs.is_empty() && queue.accepting {
+                                queue = state.ready.wait(queue).unwrap_or_else(|e| e.into_inner());
+                            }
+                            let Some(job) = queue.jobs.pop_front() else {
+                                return;
+                            };
+                            queue.active += 1;
+                            job
+                        };
+                        run_one(job.event, &job.argv, &job.log_dir, &state.cancel);
+                        let mut queue = state.queue.lock().unwrap_or_else(|e| e.into_inner());
+                        queue.active -= 1;
+                        state.ready.notify_all();
+                    })
+            {
+                workers.push(worker);
+            }
+        }
+        Self { state, workers }
+    }
+
+    fn submit(&self, job: HookJob) -> bool {
+        let mut queue = self.state.queue.lock().unwrap_or_else(|e| e.into_inner());
+        if self.workers.is_empty() || !queue.accepting || queue.jobs.len() >= HOOK_QUEUE_DEPTH {
+            return false;
+        }
+        queue.jobs.push_back(job);
+        self.state.ready.notify_one();
+        true
+    }
+
+    fn shutdown(&self, timeout: Duration) -> bool {
+        let started = Instant::now();
+        let mut queue = self.state.queue.lock().unwrap_or_else(|e| e.into_inner());
+        queue.accepting = false;
+        self.state.ready.notify_all();
+        while queue.active > 0 || !queue.jobs.is_empty() {
+            let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+                self.state.cancel.store(true, Ordering::Release);
+                queue.jobs.clear();
+                self.state.ready.notify_all();
+                return false;
+            };
+            (queue, _) = self
+                .state
+                .ready
+                .wait_timeout(queue, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        true
+    }
+}
+
+impl Drop for HookPool {
+    fn drop(&mut self) {
+        self.state.cancel.store(true, Ordering::Release);
+        let mut queue = self.state.queue.lock().unwrap_or_else(|e| e.into_inner());
+        queue.accepting = false;
+        queue.jobs.clear();
+        self.state.ready.notify_all();
+        // Explicit shutdown drains before this point. Drop never waits on
+        // external commands; workers observe cancellation on their next tick.
+    }
 }
 
 impl HookExecutor {
@@ -447,6 +603,7 @@ impl HookExecutor {
         Self {
             inner: Arc::new(Mutex::new(ExecutorInner { by_event })),
             log_dir_override: None,
+            pool: Arc::new(HookPool::new()),
         }
     }
 
@@ -492,11 +649,18 @@ impl HookExecutor {
         self
     }
 
+    /// Stop accepting events and drain queued jobs for at most `timeout`.
+    /// False means remaining jobs were cancelled; active process groups are
+    /// killed on the next worker tick. All executor clones share shutdown.
+    pub fn shutdown(&self, timeout: Duration) -> bool {
+        self.pool.shutdown(timeout)
+    }
+
     /// Fire all hooks registered for `event`, asynchronously.
     ///
     /// Substitution + predicate evaluation happens on the calling thread
     /// (cheap); the actual `Command::spawn` + wait loop runs on a worker
-    /// thread per hook. The triggering action is never blocked.
+    /// pool with a bounded queue. The triggering action is never blocked.
     ///
     /// Returns the number of hooks dispatched (post-`when` filtering).
     pub fn fire(&self, event: HookEvent, payload: &HookPayload) -> usize {
@@ -519,27 +683,41 @@ impl HookExecutor {
             // owned and moved into the worker — no shared state, no
             // re-tokenization.
             let mut missing: Vec<String> = Vec::new();
-            let argv: Vec<String> = hook
-                .exec
-                .iter()
-                .map(|s| substitute(s, payload, &mut missing))
-                .collect();
+            let mut argv = Vec::with_capacity(hook.exec.len().min(1024));
+            let mut bytes = 0usize;
+            let mut invalid = false;
+            for arg in &hook.exec {
+                match substitute_checked(arg, payload, &mut missing) {
+                    Some(arg)
+                        if !arg.contains('\0')
+                            && arg.len() <= HOOK_ARGV_MAX_BYTES.saturating_sub(bytes) =>
+                    {
+                        bytes += arg.len();
+                        argv.push(arg);
+                    }
+                    _ => {
+                        invalid = true;
+                        break;
+                    }
+                }
+            }
+            if invalid || argv.first().is_none_or(|s| s.is_empty()) {
+                continue;
+            }
             let log_dir = self.log_dir_override.clone().unwrap_or_else(hooks_log_dir);
             let event_name = event.name();
-            // `spawn` so the work happens off the server's hot path.
-            // Fire-and-forget: we never join.
-            let _ = thread::Builder::new()
-                .name(format!("ezpn-hook-{event_name}"))
-                .spawn(move || {
-                    if !missing.is_empty() {
-                        // Use eprintln since tracing may not be initialized
-                        // in unit tests; production logging happens via the
-                        // captured stderr inside `run_one`.
-                        let _ = writeln!(std::io::sink(), "missing hook payload keys: {missing:?}");
-                    }
-                    run_one(event_name, &argv, &log_dir);
-                });
-            dispatched += 1;
+            if !missing.is_empty() {
+                tracing::debug!(target: "hooks", event = event_name, missing_count = missing.len(), "missing payload fields");
+            }
+            if self.pool.submit(HookJob {
+                event: event_name,
+                argv,
+                log_dir,
+            }) {
+                dispatched += 1;
+            } else {
+                tracing::warn!(target: "hooks", event = event_name, "hook dropped: queue full or executor stopped");
+            }
         }
         dispatched
     }
@@ -558,8 +736,8 @@ impl fmt::Debug for HookExecutor {
 
 /// Spawn the child, enforce the timeout, capture output to the rotating
 /// log file. Errors are swallowed — hooks are best-effort by design.
-fn run_one(event_name: &str, argv: &[String], log_dir: &PathBuf) {
-    if argv.is_empty() {
+fn run_one(event_name: &str, argv: &[String], log_dir: &PathBuf, cancel: &AtomicBool) {
+    if argv.is_empty() || cancel.load(Ordering::Acquire) {
         return;
     }
     let _ = fs::create_dir_all(log_dir);
@@ -567,8 +745,20 @@ fn run_one(event_name: &str, argv: &[String], log_dir: &PathBuf) {
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]);
     cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+    }
+    #[cfg(not(unix))]
+    {
+        // No portable nonblocking pipe API in std. Discard output rather
+        // than leave detached reader threads holding pipes indefinitely.
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
+    }
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -576,80 +766,68 @@ fn run_one(event_name: &str, argv: &[String], log_dir: &PathBuf) {
             append_log(
                 log_dir,
                 event_name,
-                &format!("[ezpn] failed to spawn hook {argv:?}: {e}\n",),
+                &format!("[ezpn] failed to spawn hook: {e}\n"),
             );
             return;
         }
     };
 
-    // Drain stdout/stderr on background threads so a timed-out child
-    // (whose grandchildren may still hold the pipes open after SIGKILL)
-    // does not block our wait loop indefinitely. We `take()` the handles
-    // up front and join with a short timeout — anything still in the pipe
-    // after that is dropped, which is fine for best-effort logging.
-    let stdout_handle = child.stdout.take().map(|mut out| {
-        thread::spawn(move || {
-            let mut s = String::new();
-            let _ = std::io::Read::read_to_string(&mut out, &mut s);
-            s
-        })
-    });
-    let stderr_handle = child.stderr.take().map(|mut err| {
-        thread::spawn(move || {
-            let mut s = String::new();
-            let _ = std::io::Read::read_to_string(&mut err, &mut s);
-            s
-        })
-    });
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    #[cfg(unix)]
+    if stdout
+        .as_ref()
+        .is_some_and(|pipe| set_nonblocking(pipe).is_err())
+        || stderr
+            .as_ref()
+            .is_some_and(|pipe| set_nonblocking(pipe).is_err())
+    {
+        kill_hook(&mut child);
+        let _ = child.wait();
+        return;
+    }
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
 
     let started = Instant::now();
     let timed_out = loop {
+        drain_output(&mut stdout, &mut stdout_bytes);
+        drain_output(&mut stderr, &mut stderr_bytes);
+        if started.elapsed() >= HOOK_TIMEOUT || cancel.load(Ordering::Acquire) {
+            kill_hook(&mut child);
+            break true;
+        }
         match child.try_wait() {
             Ok(Some(_)) => break false,
             Ok(None) => {
-                if started.elapsed() >= HOOK_TIMEOUT {
-                    let _ = child.kill();
-                    break true;
-                }
-                thread::sleep(Duration::from_millis(50));
+                thread::sleep(Duration::from_millis(20));
             }
-            Err(_) => break false,
+            Err(_) => {
+                kill_hook(&mut child);
+                break false;
+            }
         }
     };
+    // Hooks are bounded invocations, not background service launchers.
+    // Terminate any same-group descendants even if the direct child exited.
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
 
     let status = match child.wait() {
         Ok(s) => format!("status={s}"),
         Err(_) => "status=unknown".to_string(),
     };
 
-    // Helper: best-effort fetch of a drain thread's output. We give it up
-    // to ~250 ms post-exit; if pipes are still held by a runaway grandchild,
-    // we abandon the read rather than block the worker forever.
-    fn collect(handle: Option<thread::JoinHandle<String>>) -> String {
-        let h = match handle {
-            Some(h) => h,
-            None => return String::new(),
-        };
-        let deadline = Instant::now() + Duration::from_millis(250);
-        loop {
-            if h.is_finished() {
-                return h.join().unwrap_or_default();
-            }
-            if Instant::now() >= deadline {
-                // Detach: the JoinHandle drops, the thread keeps running
-                // until its `read` returns naturally (or the process
-                // exits). We trade clean shutdown for not blocking here.
-                return String::new();
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-    }
-
-    let stdout_text = collect(stdout_handle);
-    let stderr_text = collect(stderr_handle);
+    drain_output(&mut stdout, &mut stdout_bytes);
+    drain_output(&mut stderr, &mut stderr_bytes);
+    let stdout_text = String::from_utf8_lossy(&stdout_bytes);
+    let stderr_text = String::from_utf8_lossy(&stderr_bytes);
 
     let mut buf = String::new();
-    buf.push_str(&format!("[ezpn] event={event_name} argv={argv:?}\n"));
+    // Expanded argv may include credentials; never record it automatically.
+    buf.push_str(&format!("[ezpn] event={event_name}\n"));
     if !stdout_text.is_empty() {
         buf.push_str("[stdout]\n");
         buf.push_str(&stdout_text);
@@ -676,60 +854,86 @@ fn run_one(event_name: &str, argv: &[String], log_dir: &PathBuf) {
     append_log(log_dir, event_name, &buf);
 }
 
+fn kill_hook(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
+}
+
+#[cfg(unix)]
+fn set_nonblocking(pipe: &impl std::os::fd::AsRawFd) -> std::io::Result<()> {
+    let fd = pipe.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn drain_output<R: std::io::Read>(pipe: &mut Option<R>, output: &mut Vec<u8>) {
+    let Some(reader) = pipe else {
+        return;
+    };
+    let mut buf = [0u8; 8192];
+    // Bound work per tick as well as retained bytes; a noisy child must not
+    // keep us in a read loop past the timeout. Keep draining after truncation.
+    for _ in 0..8 {
+        match reader.read(&mut buf) {
+            Ok(0) => {
+                *pipe = None;
+                break;
+            }
+            Ok(n) => {
+                let keep = n.min((HOOK_LOG_MAX_BYTES as usize / 8).saturating_sub(output.len()));
+                output.extend_from_slice(&buf[..keep]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(_) => {
+                *pipe = None;
+                break;
+            }
+        }
+    }
+}
+
 /// Append `body` to `<log_dir>/<event>-<unix>.log`. If the *current* file
 /// would exceed [`HOOK_LOG_MAX_BYTES`], roll over by starting a fresh file
 /// with a new timestamp. We then GC older files for the same event so the
 /// directory does not grow without bound.
 fn append_log(log_dir: &PathBuf, event_name: &str, body: &str) {
+    static NEXT_LOG: AtomicU64 = AtomicU64::new(0);
+    static LOG_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_nanos())
         .unwrap_or(0);
 
-    // Find the most recent file for this event — if it has room, append;
-    // otherwise create a new timestamped file.
-    let target = match newest_log_for(log_dir, event_name) {
-        Some((path, size)) if size + body.len() as u64 <= HOOK_LOG_MAX_BYTES => path,
-        _ => log_dir.join(format!("{event_name}-{now}.log")),
-    };
-
-    if let Ok(mut f) = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&target)
+    let serial = NEXT_LOG.fetch_add(1, Ordering::Relaxed);
+    let target = log_dir.join(format!(
+        "{event_name}-{now}-{}-{serial}.log",
+        std::process::id()
+    ));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
     {
-        let _ = f.write_all(body.as_bytes());
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    if let Ok(mut f) = options.open(&target) {
+        let mut end = body.len().min(HOOK_LOG_MAX_BYTES as usize);
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        let _ = f.write_all(&body.as_bytes()[..end]);
     }
 
     // Best-effort GC: keep at most 5 log files per event.
     gc_logs_for(log_dir, event_name, 5);
-}
-
-fn newest_log_for(log_dir: &PathBuf, event_name: &str) -> Option<(PathBuf, u64)> {
-    let entries = fs::read_dir(log_dir).ok()?;
-    let prefix = format!("{event_name}-");
-    let mut best: Option<(PathBuf, SystemTime, u64)> = None;
-    for e in entries.flatten() {
-        let name = match e.file_name().into_string() {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        if !name.starts_with(&prefix) || !name.ends_with(".log") {
-            continue;
-        }
-        let meta = match e.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
-        let size = meta.len();
-        match &best {
-            None => best = Some((e.path(), mtime, size)),
-            Some((_, t, _)) if mtime > *t => best = Some((e.path(), mtime, size)),
-            _ => {}
-        }
-    }
-    best.map(|(p, _, s)| (p, s))
 }
 
 fn gc_logs_for(log_dir: &PathBuf, event_name: &str, keep: usize) {
@@ -743,6 +947,9 @@ fn gc_logs_for(log_dir: &PathBuf, event_name: &str, keep: usize) {
         .filter_map(|e| {
             let name = e.file_name().into_string().ok()?;
             if !name.starts_with(&prefix) || !name.ends_with(".log") {
+                return None;
+            }
+            if !e.file_type().ok()?.is_file() {
                 return None;
             }
             let meta = e.metadata().ok()?;
@@ -786,6 +993,128 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::Duration;
+
+    #[test]
+    fn reliability_predicate_operator_inside_literal() {
+        let pred = WhenPredicate::parse("${pane.command} != \"a==b\"").unwrap();
+        assert!(!pred.evaluate(&payload(&[("pane.command", "a==b")])));
+    }
+
+    #[test]
+    fn reliability_log_records_are_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        append_log(
+            &dir,
+            "after_attach",
+            &"x".repeat(HOOK_LOG_MAX_BYTES as usize + 100),
+        );
+        append_log(
+            &dir,
+            "after_attach",
+            &"y".repeat(HOOK_LOG_MAX_BYTES as usize),
+        );
+        for entry in fs::read_dir(dir).unwrap() {
+            assert!(entry.unwrap().metadata().unwrap().len() <= HOOK_LOG_MAX_BYTES);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reliability_executor_queue_and_shutdown_are_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hook = Hook::from_raw(RawHook {
+            event: "after_attach".into(),
+            exec: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+            when: None,
+        })
+        .unwrap();
+        let executor = HookExecutor::new(vec![hook]).with_log_dir(tmp.path().join("hooks"));
+        let mut accepted = 0;
+        for _ in 0..200 {
+            accepted += executor.fire(HookEvent::AfterAttach, &HookPayload::new());
+        }
+        assert!((HOOK_QUEUE_DEPTH..=HOOK_QUEUE_DEPTH + HOOK_WORKERS).contains(&accepted));
+        let start = Instant::now();
+        assert!(!executor.shutdown(Duration::from_millis(30)));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(executor.shutdown(Duration::from_secs(2)));
+        assert_eq!(
+            executor.fire(HookEvent::AfterAttach, &HookPayload::new()),
+            0
+        );
+        assert!(executor.pool.state.queue.lock().unwrap().jobs.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reliability_hooks_do_not_log_expanded_argv_and_logs_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("hooks");
+        let hook = Hook::from_raw(RawHook {
+            event: "after_attach".into(),
+            exec: vec!["/usr/bin/true".into(), "${credential}".into()],
+            when: None,
+        })
+        .unwrap();
+        let executor = HookExecutor::new(vec![hook]).with_log_dir(dir.clone());
+        assert_eq!(
+            executor.fire(
+                HookEvent::AfterAttach,
+                &HookPayload::new().set("credential", "private-token")
+            ),
+            1
+        );
+        assert!(executor.shutdown(Duration::from_secs(2)));
+        let logs: Vec<_> = fs::read_dir(dir).unwrap().map(Result::unwrap).collect();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(
+            logs[0].metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let body = fs::read_to_string(logs[0].path()).unwrap();
+        assert!(body.contains("status="));
+        assert!(!body.contains("private-token"));
+    }
+
+    #[test]
+    fn reliability_substitution_rejects_oversized_output() {
+        let p = payload(&[("value", &"x".repeat(HOOK_ARGV_MAX_BYTES))]);
+        assert!(substitute_checked("${value}${value}", &p, &mut vec![]).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reliability_shutdown_kills_descendant_processes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let started = tmp.path().join("started");
+        let sentinel = tmp.path().join("survived");
+        let hook = Hook::from_raw(RawHook {
+            event: "after_attach".into(),
+            exec: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "touch \"$1\"; (sleep 0.5; touch \"$2\") & wait".into(),
+                "hook".into(),
+                started.to_string_lossy().into(),
+                sentinel.to_string_lossy().into(),
+            ],
+            when: None,
+        })
+        .unwrap();
+        let executor = HookExecutor::new(vec![hook]).with_log_dir(tmp.path().join("hooks"));
+        executor.fire(HookEvent::AfterAttach, &HookPayload::new());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !started.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(started.exists());
+        assert!(!executor.shutdown(Duration::ZERO));
+        assert!(executor.shutdown(Duration::from_secs(2)));
+        thread::sleep(Duration::from_millis(700));
+        assert!(!sentinel.exists());
+    }
 
     fn payload(pairs: &[(&str, &str)]) -> HookPayload {
         let mut p = HookPayload::new();

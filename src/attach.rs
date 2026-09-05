@@ -53,21 +53,25 @@ pub(crate) fn cmd_kill(name: Option<&str>) -> anyhow::Result<()> {
         )
     })?;
 
-    // Connect to the server and send kill command
-    if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&path) {
-        let _ = protocol::write_msg(&mut stream, protocol::C_KILL, &[]);
-        // Give the server a moment to shut down gracefully
-        std::thread::sleep(std::time::Duration::from_millis(200));
+    let stream =
+        crate::socket_security::connect_with_timeout(&path, std::time::Duration::from_secs(2))?;
+    let mut io = protocol::DeadlineStream::new(&stream, std::time::Duration::from_secs(2));
+    protocol::write_msg(&mut io, protocol::C_KILL, &[])?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    while path.exists() {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "shutdown not confirmed for session {session_name}; its socket was left intact"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
-
-    // Clean up socket file in case server didn't
-    session::cleanup(&session_name);
     println!("Killed session: {}", session_name);
     Ok(())
 }
 
 pub(crate) fn cmd_rename(old: Option<&str>, new: Option<&str>) -> anyhow::Result<()> {
     let new_name = new.ok_or_else(|| anyhow::anyhow!("usage: ezpn rename <old> <new>"))?;
+    session::validate_name(new_name)?;
     let (old_name, old_path) = session::find(old).ok_or_else(|| {
         anyhow::anyhow!(
             "no session found{}",
@@ -78,7 +82,13 @@ pub(crate) fn cmd_rename(old: Option<&str>, new: Option<&str>) -> anyhow::Result
     if new_path.exists() {
         anyhow::bail!("session '{}' already exists", new_name);
     }
-    std::fs::rename(&old_path, &new_path)?;
+    // hard_link provides no-clobber publication; unlike rename it cannot
+    // overwrite another session which appears after the existence check.
+    std::fs::hard_link(&old_path, &new_path)?;
+    if let Err(error) = std::fs::remove_file(&old_path) {
+        let _ = std::fs::remove_file(&new_path);
+        return Err(error.into());
+    }
     println!("Renamed session: {} → {}", old_name, new_name);
     Ok(())
 }
@@ -110,6 +120,60 @@ pub(crate) fn cmd_attach(args: &[String]) -> anyhow::Result<()> {
     }
 
     client::run_with_mode(&path, &session_name, attach_mode)
+}
+
+/// Read-only diagnostics: never spawn repository commands or resolve secrets.
+pub(crate) fn cmd_doctor(args: &[String]) -> anyhow::Result<()> {
+    anyhow::ensure!(args.is_empty(), "usage: ezpn doctor");
+    use std::io::IsTerminal;
+    println!("ezpn {}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "interactive tty: {}",
+        std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+    );
+    println!(
+        "platform: {} / {}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+    let config = crate::settings::config_path();
+    match std::fs::read_to_string(&config) {
+        Ok(contents) => {
+            crate::config::parse_config_checked(&contents, &config).map_err(anyhow::Error::msg)?;
+            println!("global config: valid");
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => println!("global config: defaults"),
+        Err(e) => return Err(e.into()),
+    }
+    match std::fs::read_to_string(".ezpn.toml") {
+        Ok(contents) => {
+            let project: crate::project::ProjectConfig =
+                toml::from_str(&contents).map_err(|_| {
+                    anyhow::anyhow!("invalid .ezpn.toml (source omitted to protect secrets)")
+                })?;
+            if let Some(workspace) = &project.workspace {
+                if let Some(spec) = &workspace.layout {
+                    crate::layout::Layout::from_spec(spec).map_err(anyhow::Error::msg)?;
+                } else {
+                    let rows = workspace.rows.unwrap_or(1);
+                    let cols = workspace.cols.unwrap_or(2);
+                    anyhow::ensure!(
+                        rows > 0 && cols > 0 && rows.checked_mul(cols).is_some_and(|n| n <= 100),
+                        "project grid must contain 1..100 panes"
+                    );
+                }
+            }
+            println!(
+                "project: syntax valid; {} pane definitions; execution requires --trust-project",
+                project.pane.len()
+            );
+            println!("env/secret references: not resolved by doctor");
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => println!("project: none"),
+        Err(e) => return Err(e.into()),
+    }
+    println!("SSH: allocate a PTY with ssh -t; run ezpn on the remote host");
+    Ok(())
 }
 
 /// `ezpn upgrade-snapshot <path> [--out PATH] [--force]`

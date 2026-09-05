@@ -6,6 +6,9 @@
 // restoration commit).
 #![allow(dead_code, unused_imports)]
 
+#[path = "../src/vt100/mod.rs"]
+mod vt100;
+
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
@@ -14,8 +17,14 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 // Sibling-module includes so that `use crate::*` paths inside the
 // bin sources resolve to the same modules under the bench harness.
 // Order matters: leaf-most first so dependents see siblings.
+#[path = "../src/buffers.rs"]
+mod buffers;
+#[path = "../src/clipboard.rs"]
+mod clipboard;
 #[path = "../src/config.rs"]
 mod config;
+#[path = "../src/copy_mode.rs"]
+mod copy_mode;
 #[path = "../src/fuzzy.rs"]
 mod fuzzy;
 #[path = "../src/hooks.rs"]
@@ -42,13 +51,7 @@ const TERM_H: u16 = 48;
 const SCROLLBACK: usize = 10_000;
 
 fn make_inner(tw: u16, th: u16, show_status_bar: bool) -> Rect {
-    let sh = if show_status_bar { 1u16 } else { 0 };
-    Rect {
-        x: 1,
-        y: 1,
-        w: tw.saturating_sub(2),
-        h: th.saturating_sub(sh + 2),
-    }
+    render::content_area(tw, th, show_status_bar, BorderStyle::Rounded)
 }
 
 fn wait_for_initial_output(pane: &mut Pane) {

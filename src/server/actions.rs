@@ -65,7 +65,7 @@ pub(super) fn execute_command(
 
     match parsed {
         Command::SplitHorizontal => {
-            let _ = crate::do_split(
+            crate::do_split(
                 layout,
                 panes,
                 *active,
@@ -75,12 +75,13 @@ pub(super) fn execute_command(
                 th,
                 settings,
                 scrollback,
-            );
+            )
+            .map_err(|e| e.to_string())?;
             update.mark_all(layout);
             update.border_dirty = true;
         }
         Command::SplitVertical => {
-            let _ = crate::do_split(
+            crate::do_split(
                 layout,
                 panes,
                 *active,
@@ -90,7 +91,8 @@ pub(super) fn execute_command(
                 th,
                 settings,
                 scrollback,
-            );
+            )
+            .map_err(|e| e.to_string())?;
             update.mark_all(layout);
             update.border_dirty = true;
         }
@@ -105,22 +107,13 @@ pub(super) fn execute_command(
             *tab_action = TabAction::CloseTab;
         }
         Command::NewWindow { name } => {
-            *tab_action = TabAction::NewTab;
-            // tmux's `-n NAME` is acknowledged but not auto-applied: the
-            // current TabAction enum only carries one action per frame, so
-            // CloseTab/NewTab take precedence. The user can chain a
-            // `:rename-window <NAME>` immediately after for the same effect.
-            if let Some(n) = name {
-                if !n.is_empty() {
-                    flash = Some(format!("new-window: name `{n}` (rename pending)"));
-                }
-            }
+            *tab_action = TabAction::NewTab(name);
         }
         Command::RenameWindow { name } => {
             *tab_action = TabAction::Rename(name);
         }
         Command::SelectPane { dir } => {
-            let inner = crate::make_inner(tw, th, settings.show_status_bar);
+            let inner = crate::bootstrap::terminal_content_area(tw, th, settings);
             if let Some(next) = layout.navigate(*active, dir_to_nav(dir), &inner) {
                 *active = next;
                 update.full_redraw = true;
@@ -150,21 +143,8 @@ pub(super) fn execute_command(
             }
         }
         Command::SelectLayout { name } => {
-            let new_layout = Layout::from_spec(&name).map_err(|e| format!("select-layout: {e}"))?;
-            let new_panes = crate::spawn_layout_panes(
-                &new_layout,
-                HashMap::new(),
-                default_shell,
-                tw,
-                th,
-                settings,
-                scrollback,
-            )
-            .map_err(|e| format!("select-layout: spawn failed: {e}"))?;
-            crate::kill_all_panes(panes);
-            *layout = new_layout;
-            *panes = new_panes;
-            *active = *layout.pane_ids().first().unwrap_or(&0);
+            crate::bootstrap::reconfigure_layout(layout, &name).map_err(|e| e.to_string())?;
+            crate::resize_all(panes, layout, tw, th, settings);
             update.mark_all(layout);
             update.border_dirty = true;
         }
@@ -318,7 +298,13 @@ pub(super) fn execute_action(
             if let Some(buf) = entry {
                 if let Some(pane) = panes.get_mut(active) {
                     if pane.is_alive() {
+                        if pane.bracketed_paste() {
+                            pane.write_bytes(b"\x1b[200~");
+                        }
                         pane.write_bytes(buf.text.as_bytes());
+                        if pane.bracketed_paste() {
+                            pane.write_bytes(b"\x1b[201~");
+                        }
                     }
                 }
                 return Ok(None);
@@ -382,10 +368,10 @@ fn render_command(cmd: &crate::commands::Command) -> String {
         Command::KillPane => "kill-pane".into(),
         Command::KillWindow => "kill-window".into(),
         Command::NewWindow { name } => match name {
-            Some(n) => format!("new-window -n {n}"),
+            Some(n) => format!("new-window -n {}", quote_arg(n)),
             None => "new-window".into(),
         },
-        Command::RenameWindow { name } => format!("rename-window {name}"),
+        Command::RenameWindow { name } => format!("rename-window {}", quote_arg(name)),
         Command::SelectPane { dir } => format!("select-pane {}", dir_flag(*dir)),
         Command::ResizePane { dir, amount } => {
             format!("resize-pane {} {}", dir_flag(*dir), amount)
@@ -397,8 +383,30 @@ fn render_command(cmd: &crate::commands::Command) -> String {
                 "swap-pane -D".into()
             }
         }
-        Command::SelectLayout { name } => format!("select-layout {name}"),
-        Command::SetOption { key, value } => format!("set-option {key} {value}"),
-        Command::DisplayMessage { text } => format!("display-message {text}"),
+        Command::SelectLayout { name } => format!("select-layout {}", quote_arg(name)),
+        Command::SetOption { key, value } => {
+            format!("set-option {} {}", quote_arg(key), quote_arg(value))
+        }
+        Command::DisplayMessage { text } => format!("display-message {}", quote_arg(text)),
+    }
+}
+
+fn quote_arg(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn named_window_roundtrip_preserves_spaces_quotes_and_backslashes() {
+        let name = r#"work \ "quoted""#.to_string();
+        let cmd = crate::commands::Command::NewWindow {
+            name: Some(name.clone()),
+        };
+        assert!(
+            matches!(crate::commands::parse(&render_command(&cmd)).unwrap(),
+            crate::commands::Command::NewWindow { name: Some(n) } if n == name)
+        );
     }
 }

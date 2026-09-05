@@ -1,7 +1,10 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -409,12 +412,12 @@ pub fn socket_path_for_pid(pid: u32) -> PathBuf {
     PathBuf::from(format!("{}/ezpn-{}.sock", dir, pid))
 }
 
-pub fn start_listener() -> anyhow::Result<mpsc::Receiver<(IpcCommand, ResponseSender)>> {
+pub fn start_listener(wake: fn()) -> anyhow::Result<mpsc::Receiver<(IpcCommand, ResponseSender)>> {
     let path = socket_path();
     if let Some(parent) = path.parent() {
         crate::socket_security::harden_socket_dir(parent)?;
     }
-    let _ = std::fs::remove_file(&path);
+    crate::socket_security::remove_stale_socket(&path)?;
 
     // umask 0o077 across bind so the inode is born with a restricted mode,
     // then chmod + re-stat to assert (issue #65). Any deviation is a hard
@@ -429,7 +432,8 @@ pub fn start_listener() -> anyhow::Result<mpsc::Receiver<(IpcCommand, ResponseSe
 
     crate::socket_security::fix_socket_permissions(&path)?;
 
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(16);
+    let active = Arc::new(AtomicUsize::new(0));
 
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -457,8 +461,22 @@ pub fn start_listener() -> anyhow::Result<mpsc::Receiver<(IpcCommand, ResponseSe
                             continue;
                         }
                     }
-                    let tx: mpsc::Sender<(IpcCommand, ResponseSender)> = tx.clone();
-                    std::thread::spawn(move || handle_client(stream, tx));
+                    if active
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                            (n < 16).then_some(n + 1)
+                        })
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    let guard = WorkerGuard(Arc::clone(&active));
+                    let tx = tx.clone();
+                    let _ = std::thread::Builder::new()
+                        .name("ezpn-ctl".into())
+                        .spawn(move || {
+                            let _guard = guard;
+                            handle_client(stream, tx, wake);
+                        });
                 }
                 Err(_) => break,
             }
@@ -472,19 +490,65 @@ pub fn cleanup() {
     let _ = std::fs::remove_file(socket_path());
 }
 
-fn handle_client(stream: UnixStream, tx: mpsc::Sender<(IpcCommand, ResponseSender)>) {
+struct WorkerGuard(Arc<AtomicUsize>);
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn read_request_line(
+    reader: &mut BufReader<UnixStream>,
+    timeout: Duration,
+) -> io::Result<Option<String>> {
+    let deadline = Instant::now() + timeout;
+    let mut line = Vec::new();
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "request deadline exceeded"))?;
+        reader.get_ref().set_read_timeout(Some(remaining))?;
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                String::from_utf8(line)
+                    .map(Some)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            };
+        }
+        let end = available.iter().position(|b| *b == b'\n').map(|i| i + 1);
+        let n = end.unwrap_or(available.len());
+        if n > DUMP_MAX_BYTES.saturating_sub(line.len()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IPC request exceeds 16 MiB",
+            ));
+        }
+        line.extend_from_slice(&available[..n]);
+        reader.consume(n);
+        if end.is_some() {
+            return String::from_utf8(line)
+                .map(Some)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
+        }
+    }
+}
+
+fn handle_client(
+    stream: UnixStream,
+    tx: mpsc::SyncSender<(IpcCommand, ResponseSender)>,
+    wake: fn(),
+) {
     let Ok(read_stream) = stream.try_clone() else {
         return;
     };
-    let reader = BufReader::new(read_stream);
+    let mut reader = BufReader::new(read_stream);
     let mut writer = stream;
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(line) => line,
-            Err(_) => break,
-        };
-
+    while let Ok(Some(line)) = read_request_line(&mut reader, Duration::from_secs(5)) {
         if line.trim().is_empty() {
             continue;
         }
@@ -506,14 +570,30 @@ fn handle_client(stream: UnixStream, tx: mpsc::Sender<(IpcCommand, ResponseSende
         let response = match parsed {
             Ok(cmd) => {
                 let (resp_tx, resp_rx) = mpsc::sync_channel(1);
-                if tx.send((cmd, resp_tx)).is_err() {
-                    let response = IpcResponse::error("listener unavailable");
+                let response_timeout = match &cmd {
+                    IpcCommand::Ext(IpcRequestExt::SendKeys {
+                        timeout_ms,
+                        await_prompt: true,
+                        ..
+                    }) => Duration::from_millis(
+                        timeout_ms
+                            .unwrap_or(SEND_KEYS_DEFAULT_TIMEOUT_MS)
+                            .min(300_000)
+                            + 5000,
+                    ),
+                    _ => Duration::from_secs(5),
+                };
+                if tx.try_send((cmd, resp_tx)).is_err() {
+                    let response = IpcResponse::error("listener unavailable or busy");
                     let _ = write_response(&mut writer, &response);
                     break;
                 }
-                resp_rx
-                    .recv()
-                    .unwrap_or_else(|_| IpcResponse::error("internal error"))
+                wake();
+                resp_rx.recv_timeout(response_timeout).unwrap_or_else(|_| {
+                    IpcResponse::error(
+                        "response unavailable or timed out; command may have executed",
+                    )
+                })
             }
             Err(message) => IpcResponse::error(message),
         };
@@ -583,14 +663,80 @@ fn is_ext_command(line: &str) -> bool {
 //        return it via `IpcResponse::with_send_keys`.
 
 fn write_response(writer: &mut UnixStream, response: &IpcResponse) -> anyhow::Result<()> {
-    writeln!(writer, "{}", serde_json::to_string(response)?)?;
-    writer.flush()?;
+    struct DeadlineWriter<'a> {
+        stream: &'a UnixStream,
+        deadline: Instant,
+    }
+    impl Write for DeadlineWriter<'_> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let remaining = self
+                .deadline
+                .checked_duration_since(Instant::now())
+                .filter(|d| !d.is_zero())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::TimedOut, "response deadline exceeded")
+                })?;
+            self.stream.set_write_timeout(Some(remaining))?;
+            self.stream.write(buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.stream.flush()
+        }
+    }
+    let mut out = BufWriter::new(DeadlineWriter {
+        stream: writer,
+        deadline: Instant::now() + Duration::from_secs(2),
+    });
+    serde_json::to_writer(&mut out, response)?;
+    out.write_all(b"\n")?;
+    out.flush()?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_ctl_request_expires_and_buffered_lines_remain_distinct() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        client
+            .write_all(b"{\"cmd\":\"list\"}\n{\"cmd\":\"list\"}\n{")
+            .unwrap();
+        let mut reader = BufReader::new(server);
+        for _ in 0..2 {
+            assert_eq!(
+                read_request_line(&mut reader, Duration::from_secs(1))
+                    .unwrap()
+                    .unwrap(),
+                "{\"cmd\":\"list\"}\n"
+            );
+        }
+        let start = Instant::now();
+        assert!(read_request_line(&mut reader, Duration::from_millis(30)).is_err());
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn ctl_request_is_woken_and_roundtrips_through_bounded_channel() {
+        static WAKES: AtomicUsize = AtomicUsize::new(0);
+        fn wake() {
+            WAKES.fetch_add(1, Ordering::SeqCst);
+        }
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let (tx, rx) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || handle_client(server, tx, wake));
+        client.write_all(b"{\"cmd\":\"list\"}\n").unwrap();
+        let (request, response) = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(request, IpcCommand::Legacy(IpcRequest::List)));
+        response.send(IpcResponse::success("done")).unwrap();
+        let mut response = String::new();
+        BufReader::new(&client).read_line(&mut response).unwrap();
+        assert!(serde_json::from_str::<IpcResponse>(&response).unwrap().ok);
+        assert_eq!(WAKES.load(Ordering::SeqCst), 1);
+        drop(client);
+        worker.join().unwrap();
+    }
 
     /// Frozen-v1 schema check (#89): every documented field of
     /// `LsTree` round-trips, the `proto_version` is preserved as-is,

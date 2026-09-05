@@ -36,6 +36,21 @@ pub struct Rect {
     pub h: u16,
 }
 
+impl Rect {
+    /// Clip to representable terminal extents; an exclusive edge can be 65535.
+    fn clipped(&self) -> Self {
+        Self {
+            w: self.w.min(u16::MAX - self.x),
+            h: self.h.min(u16::MAX - self.y),
+            ..*self
+        }
+    }
+
+    fn contains(&self, x: u16, y: u16) -> bool {
+        x >= self.x && x - self.x < self.w && y >= self.y && y - self.y < self.h
+    }
+}
+
 #[derive(Clone, Copy)]
 pub enum NavDir {
     Left,
@@ -67,7 +82,7 @@ pub struct Layout {
 impl Layout {
     pub fn from_grid(rows: usize, cols: usize) -> Self {
         let mut next_id = 0;
-        let root = build_grid(rows, cols, &mut next_id);
+        let root = build_grid(rows.max(1), cols.max(1), &mut next_id);
         Layout { root, next_id }
     }
 
@@ -94,6 +109,15 @@ impl Layout {
             "trio" => "1/1:1",
             other => other,
         };
+        // Reject over-limit input before recursively constructing any trees.
+        let total_panes = resolved
+            .bytes()
+            .filter(|b| matches!(b, b'/' | b':'))
+            .count()
+            + 1;
+        if total_panes > 100 {
+            return Err(format!("too many panes: {}", total_panes));
+        }
         let rows: Vec<&str> = resolved.split('/').collect();
         if rows.is_empty() {
             return Err("empty layout spec".into());
@@ -153,20 +177,20 @@ impl Layout {
     /// Content rects for all panes (area inside borders).
     pub fn pane_rects(&self, inner: &Rect) -> HashMap<usize, Rect> {
         let mut rects = HashMap::new();
-        collect_rects(&self.root, inner, &mut rects);
+        collect_rects(&self.root, &inner.clipped(), &mut rects);
         rects
     }
 
     /// Separator lines (for border rendering).
     pub fn separators(&self, inner: &Rect, outer: &Rect) -> Vec<SepLine> {
         let mut seps = Vec::new();
-        collect_seps(&self.root, inner, outer, &mut seps);
+        collect_seps(&self.root, &inner.clipped(), &outer.clipped(), &mut seps);
         seps
     }
 
     /// Find pane at a screen position (checks content rects).
     pub fn find_at(&self, x: u16, y: u16, inner: &Rect) -> Option<usize> {
-        find_at_node(&self.root, x, y, inner)
+        find_at_node(&self.root, x, y, &inner.clipped())
     }
 
     /// Split a pane. Returns new pane ID. Auto-equalizes ratios.
@@ -186,7 +210,7 @@ impl Layout {
 
     /// Remove a pane (collapses parent split). Returns false if it's the last pane.
     pub fn remove(&mut self, target_id: usize) -> bool {
-        if self.pane_count() <= 1 {
+        if self.pane_count() <= 1 || !contains(&self.root, target_id) {
             return false;
         }
         let old = std::mem::take(&mut self.root);
@@ -310,7 +334,7 @@ impl Layout {
     /// Find which separator is at screen position (for drag-to-resize).
     pub fn find_separator_at(&self, x: u16, y: u16, inner: &Rect) -> Option<SepHit> {
         let mut path = Vec::new();
-        find_sep_at(&self.root, x, y, inner, &mut path)
+        find_sep_at(&self.root, x, y, &inner.clipped(), &mut path)
     }
 
     /// Update the ratio of a Split node identified by tree path.
@@ -325,7 +349,7 @@ impl Layout {
         rects
             .iter()
             .filter(|(&id, r)| id != from_id && is_adjacent(from, r, nav))
-            .min_by_key(|(_, r)| nav_distance(from, r, nav))
+            .min_by_key(|(&id, r)| (nav_distance(from, r, nav), id))
             .map(|(&id, _)| id)
     }
 
@@ -361,6 +385,9 @@ impl Layout {
     /// Resize a pane by moving the nearest matching separator.
     /// Returns true if a resize was applied.
     pub fn resize_pane(&mut self, pane_id: usize, dir: NavDir, delta: f32) -> bool {
+        if !delta.is_finite() {
+            return false;
+        }
         let mut breadcrumbs = Vec::new();
         collect_path_to_pane(&self.root, pane_id, &mut Vec::new(), &mut breadcrumbs);
 
@@ -371,7 +398,7 @@ impl Layout {
         let need_in_second = matches!(dir, NavDir::Left | NavDir::Up);
 
         // Search from deepest to shallowest for the right split to adjust
-        for (path, split_dir, in_second) in breadcrumbs.iter().rev() {
+        for (path, split_dir, in_second) in &breadcrumbs {
             if *split_dir == target_dir && *in_second == need_in_second {
                 let sign = if need_in_second { -1.0 } else { 1.0 };
                 adjust_ratio_at(&mut self.root, path, delta * sign);
@@ -502,13 +529,19 @@ fn collect_rects(node: &LayoutNode, area: &Rect, out: &mut HashMap<usize, Rect>)
 }
 
 pub fn split_area(area: &Rect, dir: Direction, ratio: f32) -> (Rect, Rect) {
+    let area = &area.clipped();
+    let ratio = if ratio.is_finite() { ratio } else { 0.5 };
     match dir {
         Direction::Horizontal => {
             let usable = area.w.saturating_sub(1); // 1 cell for separator
             if usable < 2 {
                 return (area.clone(), Rect { w: 0, ..*area });
             }
-            let fw = ((usable as f32 * ratio).round() as u16).clamp(1, usable - 1);
+            // Allocate pane-plus-separator slots, then remove the trailing gap.
+            // This keeps equal columns equal even in a right-deep split tree.
+            let fw = (((f32::from(area.w) + 1.0) * ratio).round() as u16)
+                .saturating_sub(1)
+                .clamp(1, usable - 1);
             let sw = usable - fw;
             (
                 Rect { w: fw, ..*area },
@@ -524,7 +557,9 @@ pub fn split_area(area: &Rect, dir: Direction, ratio: f32) -> (Rect, Rect) {
             if usable < 2 {
                 return (area.clone(), Rect { h: 0, ..*area });
             }
-            let fh = ((usable as f32 * ratio).round() as u16).clamp(1, usable - 1);
+            let fh = (((f32::from(area.h) + 1.0) * ratio).round() as u16)
+                .saturating_sub(1)
+                .clamp(1, usable - 1);
             let sh = usable - fh;
             (
                 Rect { h: fh, ..*area },
@@ -541,6 +576,9 @@ pub fn split_area(area: &Rect, dir: Direction, ratio: f32) -> (Rect, Rect) {
 // ─── Separators ────────────────────────────────────────────
 
 fn collect_seps(node: &LayoutNode, area: &Rect, outer: &Rect, seps: &mut Vec<SepLine>) {
+    if area.w == 0 || area.h == 0 || outer.w == 0 || outer.h == 0 {
+        return;
+    }
     if let LayoutNode::Split {
         direction,
         ratio,
@@ -551,7 +589,7 @@ fn collect_seps(node: &LayoutNode, area: &Rect, outer: &Rect, seps: &mut Vec<Sep
         let (a1, a2) = split_area(area, *direction, *ratio);
 
         match direction {
-            Direction::Horizontal => {
+            Direction::Horizontal if a2.w > 0 && outer.contains(a1.x + a1.w, area.y) => {
                 let sx = a1.x + a1.w;
                 let y0 = area.y.saturating_sub(1).max(outer.y);
                 let y1 = (area.y + area.h).min(outer.y + outer.h - 1);
@@ -562,7 +600,7 @@ fn collect_seps(node: &LayoutNode, area: &Rect, outer: &Rect, seps: &mut Vec<Sep
                     length: y1.saturating_sub(y0) + 1,
                 });
             }
-            Direction::Vertical => {
+            Direction::Vertical if a2.h > 0 && outer.contains(area.x, a1.y + a1.h) => {
                 let sy = a1.y + a1.h;
                 let x0 = area.x.saturating_sub(1).max(outer.x);
                 let x1 = (area.x + area.w).min(outer.x + outer.w - 1);
@@ -573,6 +611,7 @@ fn collect_seps(node: &LayoutNode, area: &Rect, outer: &Rect, seps: &mut Vec<Sep
                     length: x1.saturating_sub(x0) + 1,
                 });
             }
+            _ => {}
         }
 
         collect_seps(first, &a1, outer, seps);
@@ -585,7 +624,7 @@ fn collect_seps(node: &LayoutNode, area: &Rect, outer: &Rect, seps: &mut Vec<Sep
 fn find_at_node(node: &LayoutNode, x: u16, y: u16, area: &Rect) -> Option<usize> {
     match node {
         LayoutNode::Leaf { id } => {
-            if x >= area.x && x < area.x + area.w && y >= area.y && y < area.y + area.h {
+            if area.contains(x, y) {
                 Some(*id)
             } else {
                 None
@@ -612,6 +651,9 @@ fn find_sep_at(
     area: &Rect,
     path: &mut Vec<bool>,
 ) -> Option<SepHit> {
+    if !area.contains(x, y) {
+        return None;
+    }
     if let LayoutNode::Split {
         direction,
         ratio,
@@ -623,20 +665,21 @@ fn find_sep_at(
 
         // Check if (x, y) is on this split's separator (±1 cell tolerance for easier grab)
         let on_sep = match direction {
-            Direction::Horizontal => {
+            Direction::Horizontal if a2.w > 0 => {
                 let sep_x = a1.x + a1.w;
                 x >= sep_x.saturating_sub(1)
                     && x <= sep_x.saturating_add(1)
                     && y >= area.y
                     && y < area.y + area.h
             }
-            Direction::Vertical => {
+            Direction::Vertical if a2.h > 0 => {
                 let sep_y = a1.y + a1.h;
                 y >= sep_y.saturating_sub(1)
                     && y <= sep_y.saturating_add(1)
                     && x >= area.x
                     && x < area.x + area.w
             }
+            _ => false,
         };
 
         if on_sep {
@@ -664,6 +707,9 @@ fn find_sep_at(
 }
 
 fn set_ratio_at(node: &mut LayoutNode, path: &[bool], ratio: f32) {
+    if !ratio.is_finite() {
+        return;
+    }
     if path.is_empty() {
         if let LayoutNode::Split { ratio: r, .. } = node {
             *r = ratio.clamp(0.1, 0.9);
@@ -828,6 +874,9 @@ fn collect_path_to_pane(
 // ─── Navigation ────────────────────────────────────────────
 
 fn is_adjacent(from: &Rect, to: &Rect, dir: NavDir) -> bool {
+    if from.w == 0 || from.h == 0 || to.w == 0 || to.h == 0 {
+        return false;
+    }
     match dir {
         NavDir::Left => to.x + to.w <= from.x && v_overlap(from, to),
         NavDir::Right => to.x >= from.x + from.w && v_overlap(from, to),
@@ -856,6 +905,77 @@ fn nav_distance(from: &Rect, to: &Rect, dir: NavDir) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reliability_tiny_split_has_no_separator_or_drag_target() {
+        let layout = Layout::from_grid(1, 2);
+        for w in 0..3 {
+            let area = Rect {
+                x: 0,
+                y: 0,
+                w,
+                h: 2,
+            };
+            assert!(layout.separators(&area, &area).is_empty());
+            assert!(layout.find_separator_at(0, 0, &area).is_none());
+        }
+    }
+
+    #[test]
+    fn reliability_extreme_rect_does_not_overflow() {
+        let layout = Layout::from_grid(2, 2);
+        let area = Rect {
+            x: u16::MAX - 3,
+            y: u16::MAX - 3,
+            w: 100,
+            h: 100,
+        };
+        for rect in layout.pane_rects(&area).values() {
+            assert!(u32::from(rect.x) + u32::from(rect.w) <= u32::from(u16::MAX));
+            assert!(u32::from(rect.y) + u32::from(rect.h) <= u32::from(u16::MAX));
+        }
+        layout.separators(&area, &area);
+        layout.find_at(u16::MAX - 1, u16::MAX - 1, &area);
+        layout.navigate(0, NavDir::Right, &area);
+    }
+
+    #[test]
+    fn reliability_resize_moves_deepest_matching_separator() {
+        let mut layout = Layout::from_grid(1, 1);
+        layout.split(0, Direction::Horizontal);
+        layout.split(0, Direction::Horizontal);
+        let LayoutNode::Split { ratio: before, .. } = layout.root else {
+            panic!()
+        };
+        assert!(layout.resize_pane(0, NavDir::Right, 0.05));
+        let LayoutNode::Split { ratio: after, .. } = layout.root else {
+            panic!()
+        };
+        assert_eq!(before, after, "outer separator must not move");
+    }
+
+    #[test]
+    fn reliability_remove_missing_pane_reports_failure() {
+        assert!(!Layout::from_grid(1, 2).remove(999));
+    }
+
+    #[test]
+    fn reliability_equal_columns_include_internal_separator_space() {
+        for count in 2..=20 {
+            let layout = Layout::from_grid(1, count);
+            for w in (2 * count - 1) as u16..200 {
+                let rects = layout.pane_rects(&Rect {
+                    x: 0,
+                    y: 0,
+                    w,
+                    h: 1,
+                });
+                let min = rects.values().map(|r| r.w).min().unwrap();
+                let max = rects.values().map(|r| r.w).max().unwrap();
+                assert!(max - min <= 1, "{count} columns in width {w}: {min}..{max}");
+            }
+        }
+    }
 
     fn inner_80x24() -> Rect {
         Rect {

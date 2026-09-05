@@ -1,5 +1,4 @@
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 
 // `ipc.rs` references `crate::socket_security::*` for its bind/accept
@@ -95,15 +94,26 @@ fn run() -> anyhow::Result<()> {
         _ => DumpFormat::Text,
     };
     let socket_path = resolve_socket(socket_path, pid)?;
-    let mut stream = UnixStream::connect(&socket_path)?;
+    let mut stream =
+        socket_security::connect_with_timeout(&socket_path, std::time::Duration::from_secs(2))?;
+    anyhow::ensure!(
+        socket_security::peer_uid(&stream)? == unsafe { libc::getuid() },
+        "refusing control socket owned by another user"
+    );
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
     writeln!(stream, "{}", parsed.to_json()?)?;
     stream.flush()?;
 
-    let mut reader = BufReader::new(stream);
+    let mut reader = BufReader::new(stream).take(16 * 1024 * 1024 + 1);
     let mut line = String::new();
     if reader.read_line(&mut line)? == 0 {
         anyhow::bail!("no response from server");
     }
+    anyhow::ensure!(
+        line.len() <= 16 * 1024 * 1024 && line.ends_with('\n'),
+        "control response exceeds size limit or is incomplete"
+    );
 
     let response: ipc::IpcResponse = serde_json::from_str(line.trim())?;
 
@@ -499,7 +509,11 @@ fn find_latest_socket() -> Option<PathBuf> {
         })
         .filter(|path| {
             // Validate socket is connectable (rejects stale sockets from dead processes)
-            UnixStream::connect(path).is_ok()
+            socket_security::connect_with_timeout(path, std::time::Duration::from_millis(100))
+                .is_ok_and(|stream| {
+                    socket_security::peer_uid(&stream)
+                        .is_ok_and(|uid| uid == unsafe { libc::getuid() })
+                })
         })
         .collect();
 
@@ -533,13 +547,11 @@ COMMANDS:
        [--include-scrollback | --no-scrollback] [--strip-ansi]
        [--format text|json]
                              Capture pane output (16 MiB hard cap)
-  layout <spec>              Reset to layout spec
+  layout <spec>              Reflow existing panes (same pane count)
   exec <pane> <command>      Run command in a pane
   send-keys --pane <id> [--await-prompt] [--timeout SECONDS]
             [--no-newline] -- TEXT...
-                             Write TEXT to a pane; with --await-prompt
-                             block until OSC 133 D semantic-prompt
-                             arrives (default 30s timeout)
+                             Reserved schema; server execution is not implemented
   save <path>                Save workspace snapshot
   load <path>                Load workspace snapshot
 
@@ -547,7 +559,6 @@ EXAMPLES:
   ezpn-ctl list
   ezpn-ctl ls --json
   ezpn-ctl dump --pane 0 --last 50
-  ezpn-ctl send-keys --pane 0 --await-prompt -- 'cargo test'
   ezpn-ctl exec 0 'cargo test'
   ezpn-ctl save .ezpn-session.json
   ezpn-ctl --pid 12345 load .ezpn-session.json"

@@ -34,8 +34,8 @@ const MAX_LOG_FILES: usize = 5;
 /// `tracing-appender` only supports time-based rotation, so this constant
 /// is currently informational; rotation happens daily. Replacing with a
 /// size-based custom appender is tracked separately.
-#[allow(dead_code)]
 const MAX_LOG_FILE_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_RECORD_BYTES: usize = 16 * 1024;
 
 /// Shared in-memory ring buffer of recent log lines, drained by the panic
 /// hook into the crash dump.
@@ -89,19 +89,32 @@ pub fn init(session_name: &str) -> WorkerGuard {
         .filename_prefix(sanitize_filename(session_name))
         .filename_suffix("log")
         .max_log_files(MAX_LOG_FILES)
-        .build(&log_dir)
-        .unwrap_or_else(|error| {
+        .build(&log_dir);
+    let file_appender: Box<dyn Write + Send> = match file_appender {
+        Ok(writer) => Box::new(writer),
+        Err(error) => {
             eprintln!("ezpn: failed to build rolling file appender: {error}");
-            // Fall back to a non-rotating appender in /tmp so we never
-            // panic during startup.
-            RollingFileAppender::builder()
-                .rotation(Rotation::NEVER)
-                .filename_prefix("ezpn-fallback")
-                .filename_suffix("log")
-                .build(std::env::temp_dir())
-                .expect("fallback rolling appender must build")
-        });
-    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+            Box::new(io::sink())
+        }
+    };
+    let used = fs::read_dir(&log_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&sanitize_filename(session_name))
+        })
+        .filter_map(|entry| entry.metadata().ok())
+        .map(|meta| meta.len())
+        .sum::<u64>();
+    let writer = BudgetedWriter {
+        inner: file_appender,
+        remaining: (MAX_LOG_FILE_BYTES * MAX_LOG_FILES as u64).saturating_sub(used),
+    };
+    let (non_blocking, guard) = tracing_appender::non_blocking(writer);
 
     // Tee writer that captures every log line into the ring buffer in
     // addition to forwarding to the rolling file appender.
@@ -119,13 +132,13 @@ pub fn init(session_name: &str) -> WorkerGuard {
         let layer = tracing_subscriber::fmt::layer()
             .with_writer(writer)
             .with_ansi(true);
-        registry.with(layer).init();
+        let _ = registry.with(layer).try_init();
     } else {
         let layer = tracing_subscriber::fmt::layer()
             .with_writer(writer)
             .with_ansi(false)
             .json();
-        registry.with(layer).init();
+        let _ = registry.with(layer).try_init();
     }
 
     install_panic_hook(crash_dir.clone());
@@ -134,6 +147,23 @@ pub fn init(session_name: &str) -> WorkerGuard {
     report_previous_crashes(&crash_dir);
 
     guard
+}
+
+struct BudgetedWriter<W> {
+    inner: W,
+    remaining: u64,
+}
+
+impl<W: Write> Write for BudgetedWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let n = bytes.len().min(self.remaining as usize);
+        self.inner.write_all(&bytes[..n])?;
+        self.remaining -= n as u64;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Tee `MakeWriter` that pushes each emitted record into the in-memory
@@ -166,8 +196,10 @@ struct TeeWriter<W: Write> {
 
 impl<W: Write> Write for TeeWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.buffer.extend_from_slice(buf);
-        self.inner.write(buf)
+        let n = self.inner.write(buf)?;
+        let retained = n.min(MAX_RECORD_BYTES.saturating_sub(self.buffer.len()));
+        self.buffer.extend_from_slice(&buf[..retained]);
+        Ok(n)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -217,7 +249,7 @@ fn install_panic_hook(crash_dir: PathBuf) {
 
         let backtrace = std::backtrace::Backtrace::force_capture();
         let recent = ring()
-            .lock()
+            .try_lock()
             .map(|guard| guard.iter().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
 
@@ -235,7 +267,17 @@ fn install_panic_hook(crash_dir: PathBuf) {
             body.push_str(line);
         }
 
-        if let Err(error) = fs::write(&path, body) {
+        let mut options = fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        if let Err(error) = options
+            .open(&path)
+            .and_then(|mut file| file.write_all(body.as_bytes()))
+        {
             eprintln!(
                 "ezpn: failed to write crash dump {}: {}",
                 path.display(),
@@ -321,6 +363,24 @@ fn stderr_is_tty() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reliability_log_writer_enforces_budget_without_blocking_callers() {
+        let mut writer = BudgetedWriter {
+            inner: Vec::new(),
+            remaining: 4,
+        };
+        writer.write_all(b"abcdef").unwrap();
+        writer.write_all(b"more").unwrap();
+        assert_eq!(writer.inner, b"abcd");
+        let mut tee = TeeWriter {
+            inner: io::sink(),
+            buffer: Vec::new(),
+        };
+        tee.write_all(&vec![b'x'; MAX_RECORD_BYTES * 2]).unwrap();
+        assert_eq!(tee.buffer.len(), MAX_RECORD_BYTES);
+        tee.buffer.clear(); // Keep this test independent of the shared ring test.
+    }
 
     #[test]
     fn sanitize_strips_path_separators() {
