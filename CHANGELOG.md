@@ -9,6 +9,59 @@ Entries are written in **functional-only style**: every bullet describes an obse
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-09-05 - Terminal and Remote Session Reliability
+
+### Changed
+- Standard shell control keys, including Ctrl+D, Ctrl+E and Ctrl+W, pass
+  through unless explicitly rebound. Splits remain available through prefix
+  keys and mouse buttons. Pane/window close actions ask for confirmation.
+- Automatic repository startup requires `--trust-project`. `ezpn doctor`
+  validates syntax without executing commands or resolving external secrets.
+- `select-layout` and control `layout` reflow existing processes and reject
+  pane-count changes. Failed splits and snapshot loads preserve current work.
+- The declared build minimum is Rust 1.88.0, matching locked dependencies;
+  CI now invokes the declared compiler explicitly.
+
+### Fixed
+- Inactive tabs continue draining PTYs and honoring restart policy. Successful
+  `on_failure` commands no longer restart; failed spawns consume retry budgets.
+- Shared detach affects only its client. Abrupt disconnect retains daemon
+  processes and headless dimensions. Readonly viewers do not resize writers,
+  and smaller readonly terminals receive clipped, in-bounds frames.
+- Handshakes, input/output queues, hooks, control requests and slow writers
+  have resource/deadline bounds. Session probes no longer delete live sockets.
+- Small output bursts no longer disconnect clients on an arbitrary frame-count
+  limit. Ordered output remains byte-bounded, and screen updates coalesce over
+  an 8 ms cadence without dropping terminal deltas.
+- Socket cleanup follows the bound inode, including renamed locators, and
+  does not remove replacement sessions sharing an old name.
+- Cursor visibility, copy-mode search/selection, application mouse reports,
+  modal paste, named tabs, borderless footers and tiny viewport handling.
+- Streaming escape parsing preserves chunk-boundary state. Legacy keyboard
+  encoding is kept unless the child requests supported enhancements.
+- Snapshot validation bounds compressed and decoded data before execution;
+  files use private atomic writes. Opt-in history captures full text history
+  without disturbing the scroll view. Externally expanded panes restore as
+  clean shells rather than persisting resolved secrets.
+- Global reload applies config, keymaps and hooks from the same validated
+  bytes. Trusted project hooks are preserved across global reloads.
+- The private bundled vt100 0.16.2 parser fixes tiny-grid wrapping, truncated
+  wide cells and soft-wrap metadata. Its source and MIT license ship inside
+  the crate so publication cannot silently lose local fixes.
+- `anyhow` is updated beyond the fix for RUSTSEC-2026-0190.
+
+### Performance and Verification
+- Cell text rendering no longer allocates a string for each cell read.
+  Border caches use a bounded dense representation for normal terminal sizes.
+- Frame decoding avoids redundant stack copies while bounding advertised-length
+  allocation. The optional ANSI diff path falls back on unsupported frames.
+- Real PTY, SSH, coverage, fuzz, soak and benchmark checks preserve failure
+  statuses. Proxy benchmarks are distinguished from runtime memory evidence.
+- README and translations remove unverified tmux/Zellij speed comparisons and
+  document supported commands, build requirements and compatibility limits.
+- Release artifacts are built and tested per target, checksum-verified, and
+  published by a single CI path. See `docs/audits/v0.14.0.md` for evidence.
+
 ## [0.13.1] — 2026-04-29 — Clippy gate + RFC docs + cwd inheritance
 
 Patch release that (a) restores the strict clippy gate v0.12.0 had

@@ -1,60 +1,70 @@
-# Security model
+# Security and Trust
 
-This document covers the threat model for multiplexer-controlled escape
-sequences and the default policies ezpn ships.
+ezpn multiplexes processes you explicitly start. It is not a sandbox for those
+processes and cannot make arbitrary shell commands safe.
 
-## Threat model
+## Project execution
 
-ezpn sits between user-controlled input (your keystrokes) and
-program-controlled output (PTY bytes from child processes). Two distinct
-trust boundaries matter:
+Automatic .ezpn.toml / Procfile execution requires `--trust-project`.
+Review the repository before granting it. An explicit grid (`ezpn 1 2`)
+starts plain shells. `ezpn doctor` performs read-only syntax diagnostics;
+it does not execute project commands, resolve secrets or test a remote host.
 
-1. **Programs you run** — your shell, editors, build tools. These are
-   expected to emit OSC 52 (clipboard), OSC 7 (cwd), and similar
-   sequences as part of normal operation.
-2. **Output you display from elsewhere** — `cat hostile.log`, `curl …`,
-   `tail` on a network log. The bytes here have not been audited and
-   may try to inject sequences that affect host-emulator state, the
-   user's clipboard, or the user's filesystem.
+An explicit `--restore FILE` or control `load FILE` starts commands stored in
+that snapshot. Treat snapshots as executable configuration, not harmless logs.
 
-The dangerous case is #2: a hostile byte stream printed to the terminal.
-The user is expecting to read text. They are not expecting their
-clipboard contents to silently change, or to be exfiltrated.
+## Secrets and snapshots
 
-## Default policies
+Secret references use `${secret:KEY}` from the private runtime secrets file.
+Global OS keychain backends are not implemented. Secret files are opened without
+following symlinks and checked for owner/private permissions.
 
-| Policy                       | Default value | Rationale |
-|------------------------------|---------------|-----------|
-| `clipboard.osc52_set`        | `confirm`     | Match tmux >= 3.4 default. First write per pane prompts the user; subsequent writes within the same pane lifetime use the cached decision. |
-| `clipboard.osc52_get`        | `deny`        | Read is the dominant attack vector — apps that legitimately read clipboard contents are extremely rare. |
-| `clipboard.osc52_max_bytes`  | `1048576` (1 MiB) | Defence against memory-exhaustion via crafted output. The 16 MiB hard cap prevents config typos from re-introducing the vulnerability. |
+External environment/dotenv/secret reads mark a project pane as sensitive.
+Its executable metadata, cwd, name, env and history are omitted from snapshots;
+it restores as a clean shell. Literal configuration can itself contain secrets:
+do not embed credentials in literal commands or env fields.
 
-## What changed from v0.5
+Snapshots are private, written through exclusive temporary files and rename,
+and bounded before and after decompression. Unknown history codecs skip history
+rather than execute it. History replay writes only into the display parser,
+never into shell stdin. Live detached sessions retain processes independently
+of disk snapshots.
 
-In v0.5 ezpn forwarded OSC 52 set sequences directly to the host
-terminal. A program that read a file controlled by an attacker (e.g.
-`cat malicious.txt`) could replace your clipboard contents silently.
-This is fixed in v0.12 by intercepting OSC 52 in
-[`Pane::read_output`](../src/pane.rs) and routing through the policy
-chain in [`crate::terminal_state`](../src/terminal_state.rs).
+## Program-controlled terminal output
 
-## What is NOT in scope
+OSC 52 set requests follow `[clipboard]` policy (confirm by default); reads are
+denied by default. A per-pane decision does not authenticate the program that
+later writes to the same pane. Choosing allow trusts that pane's output.
+User-initiated copies are separate from program-initiated clipboard requests.
 
-- **Wayland/X11 clipboard fallback** — when the host emulator is itself
-  inside `tmux` or another nested multiplexer, OSC 52 may not reach the
-  Wayland/X11 clipboard at all. v0.16 will optionally bridge to
-  `wl-copy` / `xclip`. (See issue #80 family.)
-- **Per-pane theme overrides for OSC 4/10/11/12** — colour queries are
-  answered with the session-wide theme. Per-tab themes are deferred to
-  v0.15.
-- **OSC 8 ID renumbering for multi-client** — see
-  [multi-client-osc.md](./multi-client-osc.md#multi-client-osc-8-id-collisions).
+OSC 7 is accepted only as a local cwd hint. A path reported by a remote process
+must not become a local split's working directory. Unsupported graphics and
+hyperlink metadata are not transparently passed through.
 
-## Auditing your config
+## Local transport
 
-```sh
-ezpn-ctl config show | grep -A4 '\[clipboard\]'
-```
+Session and control sockets are local Unix sockets. Connections verify peer UID.
+Socket creation checks paths, symlinks, ownership and permissions. Probing a slow
+server does not authorize unlinking its socket. Handshakes, frames, queues and
+writers are bounded; a slow client is disconnected rather than stalling peers.
 
-If `osc52_set = "allow"`, the v0.5 vulnerability is back; treat anything
-that prints to your terminal as trusted-equivalent.
+Readonly is an input/geometry policy for that attached client, not isolation
+between processes belonging to the same OS user. Unix permissions and OpenSSH
+authentication are the outer security boundary.
+
+## Hooks
+
+Hooks execute configured argv with finite worker/queue capacity, timeouts and
+bounded private logs. Invoking `sh -c` explicitly introduces shell evaluation:
+do not interpolate untrusted values into shell source. Prefer argv substitution
+as separate arguments. Cancellation is bounded best effort; a hostile process
+that deliberately escapes its process group is outside the supervisor guarantee.
+
+## Supply chain
+
+Strict audit and deny checks run before release. Existing unmaintained-library
+exceptions are documented in the audit configuration; new safety advisories
+must be fixed, not silently ignored. The bundled parser's MIT license and narrow
+boundary patches are recorded in [its provenance](../src/vt100/UPSTREAM.md).
+
+See the [release audit](audits/v0.14.0.md) for tested evidence and remaining limits.
