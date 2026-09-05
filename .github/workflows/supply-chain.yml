@@ -20,11 +20,13 @@ jobs:
       issues: write
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      # Install the released binary before audit-check can try an unlocked
+      # source build whose transitive dependencies may require a newer Rust.
+      - uses: taiki-e/install-action@cargo-audit
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: taiki-e/install-action@cargo-audit
       - name: Fail on new unsound, unmaintained or yanked warnings
         run: cargo audit --deny warnings
 
