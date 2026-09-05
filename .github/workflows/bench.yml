@@ -36,16 +36,21 @@ jobs:
           else
             base=$(git describe --tags --abbrev=0 HEAD^)
           fi
-          python3 scripts/bench-regression.py --base "$base"
+          python3 scripts/bench-regression.py --base "$base" \
+            --out "target/bench-evidence/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: criterion-evidence
           path: |
-            target/bench-evidence/*.log
-            target/bench-evidence/*.json
-            target/bench-evidence/base.txt
-            target/bench-evidence/protocol-codec-*
+            target/bench-evidence/${{ github.run_id }}-${{ github.run_attempt }}/*.log
+            target/bench-evidence/${{ github.run_id }}-${{ github.run_attempt }}/*.json
+            target/bench-evidence/${{ github.run_id }}-${{ github.run_attempt }}/base.txt
+            target/bench-evidence/${{ github.run_id }}-${{ github.run_attempt }}/protocol-codec-*
+            target/bench-evidence/${{ github.run_id }}-${{ github.run_attempt }}/raw/**
+            target/bench-evidence/${{ github.run_id }}-${{ github.run_attempt }}/analysis/**
+            target/bench-evidence/${{ github.run_id }}-${{ github.run_attempt }}/executables/**
+            target/bench-evidence/${{ github.run_id }}-${{ github.run_attempt }}/criterion-current/**
           if-no-files-found: error
           retention-days: 14
 

@@ -68,6 +68,14 @@ bash tests/soak/run.sh --profile=smoke
 ```
 
 The comparison freezes complete revisions and records all requested estimates.
+Measure every revision with the same `--save-baseline main` mode in an empty
+Criterion data directory. Archive raw samples before comparing them offline
+with Criterion's `--load-baseline`; never mix clean-save measurements with
+live `--baseline` comparisons. An identical-executable CI control reproduced
+a 700% to 1344% apparent 4 KiB regression from that mode mismatch alone.
+Keep the existing per-suite sample counts, confidence intervals, three runs
+and 5% threshold. Raw samples and measured executable hashes must be retained;
+offline analysis is not a new timing run or permission to waive a regression.
 Measure on a quiet machine. Snapshot/RSS proxy benchmarks are not end-to-end
 snapshot timings or daemon RSS; label them as proxies. Record the real soak
 duration, workloads, setup/steady-state samples, cycles, RSS and zombie counts.

@@ -60,6 +60,8 @@ Entries are written in **functional-only style**: every bullet describes an obse
   allocation limits unchanged.
 - Real PTY, SSH, coverage, fuzz, soak and benchmark checks preserve failure
   statuses. Proxy benchmarks are distinguished from runtime memory evidence.
+- Benchmark revisions use identical clean measurement modes; statistical
+  comparisons run afterward against preserved samples and executable hashes.
 - README and translations remove unverified tmux/Zellij speed comparisons and
   document supported commands, build requirements and compatibility limits.
 - Release artifacts are built and tested per target, checksum-verified, and
