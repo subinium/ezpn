@@ -22,7 +22,15 @@ def main():
     os.chdir(root)
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=True)
+    selected_target = Path(os.environ.get("CARGO_TARGET_DIR", root / "target/preflight-build")).resolve()
+    os.environ["CARGO_TARGET_DIR"] = str(selected_target)
+    package_target = root / "target/package-verification-build"
+    if package_target.resolve() == selected_target:
+        package_target = package_target / "package"
+    print(f"CARGO_TARGET_DIR={selected_target}", flush=True)
+    print(f"Package verification CARGO_TARGET_DIR={package_target}", flush=True)
     results = []
+    target_directory = None
 
     def run(name, command, env=None, timeout=1200, optional=False):
         start = time.monotonic()
@@ -40,8 +48,9 @@ def main():
                 log.write(str(error))
                 code = 127
         status = "PASS" if code == 0 else "SKIP" if optional and code == 77 else "FAIL"
-        results.append({"name": name, "status": status, "exit_code": code, "seconds": round(time.monotonic() - start, 3), "command": list(map(str, command))})
-        (out / "status.json").write_text(json.dumps({"mode": args.mode, "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(), "checks": results}, indent=2) + "\n")
+        actual_env = os.environ if env is None else env
+        results.append({"name": name, "status": status, "exit_code": code, "seconds": round(time.monotonic() - start, 3), "command": list(map(str, command)), "cargo_target_dir": actual_env.get("CARGO_TARGET_DIR")})
+        (out / "status.json").write_text(json.dumps({"mode": args.mode, "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(), "cargo_target_dir": str(selected_target), "package_target_dir": str(package_target), "checks": results}, indent=2) + "\n")
         print(f"{status} {name} (exit {code})", flush=True)
         return code
 
@@ -55,6 +64,7 @@ def main():
     metadata_code = run("metadata", ["cargo", "metadata", "--locked", "--format-version=1", "--no-deps"])
     if metadata_code == 0:
         metadata = json.loads((out / "metadata.log").read_text())
+        target_directory = Path(metadata["target_directory"])
         package = next(p for p in metadata["packages"] if p["name"] == "ezpn")
         msrv = package["rust_version"]
         if not msrv:
@@ -83,15 +93,20 @@ def main():
     run("bench-build", ["cargo", "bench", "--locked", "--all-features", "--no-run"])
     # Cargo bench can replace target/release/ezpn with the all-feature binary.
     # Materialize the default-feature artifact last, immediately before SSH.
-    run("release-build", ["cargo", "build", "--locked", "--release", "--bins"])
+    release_build_code = run("release-build", ["cargo", "build", "--locked", "--release", "--bins"])
     if args.ssh != "skip":
-        run("ssh", [sys.executable, "scripts/ssh-smoke.py", "--out", str(out / "ssh")], timeout=120, optional=args.ssh == "optional")
+        if target_directory is None or metadata_code != 0 or release_build_code != 0:
+            reason = f"SSH prerequisite failed (metadata={metadata_code}, default release build={release_build_code}); refusing to test a potentially stale binary"
+            run("ssh", [sys.executable, "-c", f"raise SystemExit({reason!r})"])
+        else:
+            run("ssh", [sys.executable, "scripts/ssh-smoke.py", "--bin", str(target_directory / "release/ezpn"), "--out", str(out / "ssh")], timeout=120, optional=args.ssh == "optional")
     else:
         run("ssh", [sys.executable, "-c", "print('SKIP: explicitly requested; no real SSH evidence'); raise SystemExit(77)"], optional=True)
     if args.mode == "release":
         run("audit", ["cargo", "audit", "--deny", "warnings"])
         run("deny", ["cargo", "deny", "--locked", "--all-features", "check"])
-        run("package", ["cargo", "package", "--locked"])
+        package_env = dict(os.environ, CARGO_TARGET_DIR=str(package_target))
+        run("package", ["cargo", "package", "--locked"], env=package_env)
     run("diff-check", ["git", "diff", "--check"])
     print(f"Evidence: {out / 'status.json'}")
     return int(any(result["status"] == "FAIL" for result in results))

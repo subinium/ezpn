@@ -49,6 +49,13 @@ the maintainer's unrelated sessions. Reap every process started by a test.
 Forward LLVM_PROFILE_FILE explicitly to child test processes when collecting
 coverage; do not forward arbitrary user environment.
 
+Use a dedicated `CARGO_TARGET_DIR` for package verification and tests against
+extracted crate sources. Do not share the workspace target directory with a
+packaged copy of the same crate/version: Cargo can reuse a same-named test
+artifact from that copy. After source changes, verify new regression tests
+appear in both default and all-feature discovery/execution; a nonzero passing
+count alone does not prove the intended source was tested.
+
 GUI-emulator certification is separate from TERM-string/PTY tests. Maintain the
 tested/untested distinction in docs/terminal-protocol.md and the release audit.
 
