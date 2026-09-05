@@ -1,10 +1,17 @@
 # Build artifacts
 /target
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/corpus/
 *.profraw
 flamegraph.svg
 /criterion
 /tarpaulin-report.html
 *.lcov
+/coverage.json
+/lcov.info
+/artifacts/
+__pycache__/
 
 # OS
 .DS_Store

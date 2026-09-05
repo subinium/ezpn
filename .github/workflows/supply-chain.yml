@@ -7,6 +7,7 @@ on:
     branches: [main]
   schedule:
     - cron: '17 6 * * 1'
+  workflow_call:
 
 jobs:
   audit:
@@ -22,6 +23,10 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: taiki-e/install-action@cargo-audit
+      - name: Fail on new unsound, unmaintained or yanked warnings
+        run: cargo audit --deny warnings
 
   deny:
     runs-on: ubuntu-latest

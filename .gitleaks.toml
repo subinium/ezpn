@@ -14,10 +14,3 @@ id = "ezpn-private-key"
 description = "Private key blocks"
 regex = '''-----BEGIN (?:RSA|EC|OPENSSH|ED25519|PGP|DSA) PRIVATE KEY-----'''
 secretGroup = 0
-
-[allowlist]
-description = "False positives"
-paths = [
-    '''docs/.*''',
-    '''README.*\.md''',
-]
