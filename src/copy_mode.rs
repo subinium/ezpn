@@ -19,7 +19,9 @@
 //! to flow through the per-pane output buffer (`pane.osc52_pending`)
 //! to reach the attached client — that plumbing lives in `server/`.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crate::vt100;
+
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::buffers::{BufferStore, SetError};
 use crate::clipboard::{self, ClipboardError};
@@ -67,6 +69,9 @@ impl CopyModeState {
     /// Get the current selection range for rendering, if any.
     /// Returns (start_row, start_col, end_row, end_col).
     pub fn selection(&self) -> Option<(u16, u16, u16, u16)> {
+        if self.pane_rows == 0 || self.pane_cols == 0 {
+            return None;
+        }
         match &self.phase {
             Phase::VisualChar {
                 anchor_row,
@@ -132,6 +137,25 @@ pub fn handle_key(
     scroll_up: &mut dyn FnMut(usize),
     scroll_down: &mut dyn FnMut(usize),
 ) -> CopyAction {
+    if key.kind == KeyEventKind::Release {
+        return CopyAction::None;
+    }
+    let (rows, cols) = screen.size();
+    state.pane_rows = rows;
+    state.pane_cols = cols;
+    state.cursor_row = state.cursor_row.min(rows.saturating_sub(1));
+    state.cursor_col = state.cursor_col.min(cols.saturating_sub(1));
+    match &mut state.phase {
+        Phase::VisualChar {
+            anchor_row,
+            anchor_col,
+        } => {
+            *anchor_row = (*anchor_row).min(rows.saturating_sub(1));
+            *anchor_col = (*anchor_col).min(cols.saturating_sub(1));
+        }
+        Phase::VisualLine { anchor_row } => *anchor_row = (*anchor_row).min(rows.saturating_sub(1)),
+        _ => {}
+    }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
     // Search input sub-mode
@@ -324,13 +348,15 @@ pub fn handle_key(
         }
         KeyCode::Char('n') => {
             if state.last_search.is_some() {
-                jump_to_match(state, state.last_search_forward);
+                execute_search(state, screen);
             }
             CopyAction::Redraw
         }
         KeyCode::Char('N') => {
             if state.last_search.is_some() {
-                jump_to_match(state, !state.last_search_forward);
+                state.last_search_forward = !state.last_search_forward;
+                execute_search(state, screen);
+                state.last_search_forward = !state.last_search_forward;
             }
             CopyAction::Redraw
         }
@@ -388,6 +414,9 @@ fn first_non_blank(state: &CopyModeState, screen: &vt100::Screen) -> u16 {
 }
 
 fn move_word_forward(state: &mut CopyModeState, screen: &vt100::Screen) {
+    if state.pane_rows == 0 || state.pane_cols == 0 {
+        return;
+    }
     let mut r = state.cursor_row;
     let mut c = state.cursor_col;
     let start_word = is_word_char(cell_char(screen, r, c));
@@ -403,6 +432,12 @@ fn move_word_forward(state: &mut CopyModeState, screen: &vt100::Screen) {
             }
         }
         let ch = cell_char(screen, r, c);
+        if screen
+            .cell(r, c)
+            .is_some_and(|cell| cell.is_wide_continuation())
+        {
+            continue;
+        }
         if is_word_char(ch) != start_word || ch == ' ' {
             break;
         }
@@ -427,6 +462,9 @@ fn move_word_forward(state: &mut CopyModeState, screen: &vt100::Screen) {
 }
 
 fn move_word_backward(state: &mut CopyModeState, screen: &vt100::Screen) {
+    if state.pane_rows == 0 || state.pane_cols == 0 {
+        return;
+    }
     let mut r = state.cursor_row;
     let mut c = state.cursor_col;
 
@@ -438,6 +476,13 @@ fn move_word_backward(state: &mut CopyModeState, screen: &vt100::Screen) {
         r -= 1;
         c = state.pane_cols - 1;
     } else {
+        c -= 1;
+    }
+    if c > 0
+        && screen
+            .cell(r, c)
+            .is_some_and(|cell| cell.is_wide_continuation())
+    {
         c -= 1;
     }
 
@@ -466,11 +511,18 @@ fn move_word_backward(state: &mut CopyModeState, screen: &vt100::Screen) {
         if c == 0 {
             break;
         }
-        let prev = cell_char(screen, r, c - 1);
+        let mut previous_col = c - 1;
+        if screen
+            .cell(r, previous_col)
+            .is_some_and(|cell| cell.is_wide_continuation())
+        {
+            previous_col = previous_col.saturating_sub(1);
+        }
+        let prev = cell_char(screen, r, previous_col);
         if is_word_char(prev) != target_word || prev == ' ' {
             break;
         }
-        c -= 1;
+        c = previous_col;
     }
 
     state.cursor_row = r;
@@ -479,11 +531,25 @@ fn move_word_backward(state: &mut CopyModeState, screen: &vt100::Screen) {
 
 fn extract_selection(state: &CopyModeState, screen: &vt100::Screen) -> Option<String> {
     let (sr, sc, er, ec) = state.selection()?;
+    let (rows, cols) = screen.size();
+    if sr >= rows || sc >= cols || cols == 0 {
+        return None;
+    }
+    let er = er.min(rows.saturating_sub(1));
+    let ec = ec.min(cols - 1);
     let mut text = String::new();
     for r in sr..=er {
-        let c_start = if r == sr { sc } else { 0 };
-        let c_end = if r == er { ec } else { state.pane_cols - 1 };
+        let mut c_start = if r == sr { sc } else { 0 };
+        if c_start > 0
+            && screen
+                .cell(r, c_start)
+                .is_some_and(|cell| cell.is_wide_continuation())
+        {
+            c_start -= 1;
+        }
+        let c_end = if r == er { ec } else { cols - 1 };
         let mut row_text = String::new();
+        let mut content_end = 0;
         for c in c_start..=c_end {
             if let Some(cell) = screen.cell(r, c) {
                 if cell.is_wide_continuation() {
@@ -493,12 +559,24 @@ fn extract_selection(state: &CopyModeState, screen: &vt100::Screen) -> Option<St
                 if s.is_empty() {
                     row_text.push(' ');
                 } else {
-                    row_text.push_str(&s);
+                    row_text.push_str(s);
+                    content_end = row_text.len();
                 }
             }
         }
-        text.push_str(row_text.trim_end());
-        if r < er {
+        let soft_wrap =
+            r < er && screen.row_wrapped(r) && !matches!(state.phase, Phase::VisualLine { .. });
+        if soft_wrap {
+            // A wide glyph can wrap before the last column, leaving an empty
+            // padding cell. Preserve typed spaces but omit this implicit gap.
+            row_text.truncate(content_end);
+        }
+        text.push_str(if soft_wrap {
+            &row_text
+        } else {
+            row_text.trim_end()
+        });
+        if r < er && !soft_wrap {
             text.push('\n');
         }
     }
@@ -525,35 +603,34 @@ fn execute_search(state: &mut CopyModeState, screen: &vt100::Screen) {
 
     for r in 0..state.pane_rows {
         let mut row_text = String::new();
-        let mut col_map: Vec<u16> = Vec::new();
+        let mut col_map: Vec<(u16, u16)> = Vec::new();
         for c in 0..state.pane_cols {
             if let Some(cell) = screen.cell(r, c) {
                 if cell.is_wide_continuation() {
                     continue;
                 }
-                let start_byte = row_text.len();
                 let s = cell.contents();
-                if s.is_empty() {
-                    row_text.push(' ');
-                } else {
-                    row_text.push_str(&s);
-                }
-                for _ in start_byte..row_text.len() {
-                    col_map.push(c);
+                let s = if s.is_empty() { " " } else { s };
+                row_text.push_str(s);
+                let end_col = c
+                    .saturating_add(if cell.is_wide() { 2 } else { 1 })
+                    .min(state.pane_cols);
+                for _ in 0..s.to_lowercase().len() {
+                    col_map.push((c, end_col));
                 }
             }
         }
 
+        // Whole-row lowercase preserves contextual mappings such as final sigma.
         let lower_text = row_text.to_lowercase();
         let mut start = 0;
         while let Some(pos) = lower_text[start..].find(&lower_query) {
             let byte_pos = start + pos;
-            if byte_pos < col_map.len() {
-                let col = col_map[byte_pos];
-                let display_len = lower_query.len().min(col_map.len() - byte_pos) as u16;
-                matches.push((r, col, display_len));
-            }
-            start = byte_pos + 1;
+            let col = col_map[byte_pos].0;
+            let end_col = col_map[byte_pos + lower_query.len() - 1].1;
+            matches.push((r, col, end_col - col));
+            // Advance one scalar, not one byte, retaining overlapping matches.
+            start = byte_pos + lower_text[byte_pos..].chars().next().unwrap().len_utf8();
         }
     }
 
@@ -562,6 +639,7 @@ fn execute_search(state: &mut CopyModeState, screen: &vt100::Screen) {
     // Jump to nearest match after cursor
     if !state.search_matches.is_empty() {
         let cursor = (state.cursor_row, state.cursor_col);
+        let incremental = matches!(state.phase, Phase::Search { .. });
         let forward = match &state.phase {
             Phase::Search { forward, .. } => *forward,
             _ => state.last_search_forward,
@@ -570,13 +648,13 @@ fn execute_search(state: &mut CopyModeState, screen: &vt100::Screen) {
             state
                 .search_matches
                 .iter()
-                .position(|(r, c, _)| (*r, *c) > cursor)
+                .position(|(r, c, _)| (*r, *c) > cursor || (incremental && (*r, *c) == cursor))
                 .or(Some(0))
         } else {
             state
                 .search_matches
                 .iter()
-                .rposition(|(r, c, _)| (*r, *c) < cursor)
+                .rposition(|(r, c, _)| (*r, *c) < cursor || (incremental && (*r, *c) == cursor))
                 .or(Some(state.search_matches.len() - 1))
         };
 
@@ -588,25 +666,6 @@ fn execute_search(state: &mut CopyModeState, screen: &vt100::Screen) {
     } else {
         state.current_match_idx = None;
     }
-}
-
-fn jump_to_match(state: &mut CopyModeState, forward: bool) {
-    if state.search_matches.is_empty() {
-        return;
-    }
-    let total = state.search_matches.len();
-    let idx = state.current_match_idx.unwrap_or(0);
-    let next = if forward {
-        (idx + 1) % total
-    } else if idx == 0 {
-        total - 1
-    } else {
-        idx - 1
-    };
-    state.current_match_idx = Some(next);
-    let (r, c, _) = state.search_matches[next];
-    state.cursor_row = r;
-    state.cursor_col = c;
 }
 
 // ─── Yank pipeline (#91, #92) ──────────────────────────────
@@ -679,9 +738,151 @@ mod yank_tests {
     use super::*;
 
     #[test]
+    fn reliability_unicode_search_maps_display_columns() {
+        let mut parser = vt100::Parser::new(2, 20, 0);
+        parser.process("İ한e\u{301}🙂".as_bytes());
+        for (query, col, len) in [("한", 1, 2), ("e\u{301}", 3, 1), ("🙂", 4, 2)] {
+            let mut state = CopyModeState::new(2, 20);
+            state.phase = Phase::Search {
+                forward: true,
+                query: query.into(),
+            };
+            execute_search(&mut state, parser.screen());
+            assert_eq!(state.search_matches, vec![(0, col, len)]);
+        }
+    }
+
+    #[test]
+    fn reliability_yank_joins_soft_wrapped_url() {
+        let mut parser = vt100::Parser::new(3, 12, 0);
+        let url = "https://example.test/path";
+        parser.process(url.as_bytes());
+        let mut state = CopyModeState::new(3, 12);
+        state.phase = Phase::VisualChar {
+            anchor_row: 0,
+            anchor_col: 0,
+        };
+        state.cursor_row = 2;
+        state.cursor_col = 0;
+        assert_eq!(
+            extract_selection(&state, parser.screen()).as_deref(),
+            Some(url)
+        );
+    }
+
+    #[test]
+    fn reliability_yank_wide_continuation_includes_character() {
+        let mut parser = vt100::Parser::new(1, 4, 0);
+        parser.process("한".as_bytes());
+        let mut state = CopyModeState::new(1, 4);
+        state.phase = Phase::VisualChar {
+            anchor_row: 0,
+            anchor_col: 1,
+        };
+        state.cursor_col = 1;
+        assert_eq!(
+            extract_selection(&state, parser.screen()).as_deref(),
+            Some("한")
+        );
+    }
+
+    #[test]
+    fn reliability_soft_wrap_omits_wide_padding_but_preserves_typed_space() {
+        for text in ["abc한Z", "ab 한Z"] {
+            let mut parser = vt100::Parser::new(3, 4, 0);
+            parser.process(text.as_bytes());
+            let mut state = CopyModeState::new(3, 4);
+            state.phase = Phase::VisualChar {
+                anchor_row: 0,
+                anchor_col: 0,
+            };
+            state.cursor_row = 1;
+            state.cursor_col = 2;
+            assert_eq!(
+                extract_selection(&state, parser.screen()).as_deref(),
+                Some(text)
+            );
+        }
+    }
+
+    #[test]
+    fn reliability_search_incremental_enter_and_next_have_distinct_semantics() {
+        let mut parser = vt100::Parser::new(2, 20, 0);
+        parser.process("ΟΣ cat cat".as_bytes());
+        let mut state = CopyModeState::new(2, 20);
+        state.phase = Phase::Search {
+            forward: true,
+            query: "ΟΣ".into(),
+        };
+        execute_search(&mut state, parser.screen());
+        assert_eq!(state.search_matches, vec![(0, 0, 2)]);
+        state.phase = Phase::Search {
+            forward: true,
+            query: "cat".into(),
+        };
+        execute_search(&mut state, parser.screen());
+        assert_eq!(state.cursor_col, 3);
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+            parser.screen(),
+            &mut |_| {},
+            &mut |_| {},
+        );
+        assert_eq!(state.cursor_col, 3);
+        handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &mut state,
+            parser.screen(),
+            &mut |_| {},
+            &mut |_| {},
+        );
+        assert_eq!(state.cursor_col, 7);
+        handle_key(
+            KeyEvent::new(KeyCode::Char('N'), KeyModifiers::NONE),
+            &mut state,
+            parser.screen(),
+            &mut |_| {},
+            &mut |_| {},
+        );
+        assert_eq!(state.cursor_col, 3);
+    }
+
+    #[test]
+    fn reliability_word_backward_does_not_land_on_wide_continuation() {
+        let mut parser = vt100::Parser::new(1, 20, 0);
+        parser.process("한🙂 abc".as_bytes());
+        let mut state = CopyModeState::new(1, 20);
+        state.cursor_col = 5;
+        move_word_backward(&mut state, parser.screen());
+        assert_eq!(state.cursor_col, 2);
+    }
+
+    #[test]
+    fn reliability_resize_clamps_copy_cursor_and_selection() {
+        let parser = vt100::Parser::new(2, 4, 0);
+        let mut state = CopyModeState::new(u16::MAX, u16::MAX);
+        state.cursor_row = u16::MAX;
+        state.cursor_col = u16::MAX;
+        state.phase = Phase::VisualChar {
+            anchor_row: u16::MAX,
+            anchor_col: u16::MAX,
+        };
+        handle_key(
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            &mut state,
+            parser.screen(),
+            &mut |_| {},
+            &mut |_| {},
+        );
+        assert_eq!(state.selection(), Some((1, 3, 1, 3)));
+    }
+
+    #[test]
     fn yank_pushes_text_into_default_buffer() {
         let mut store = BufferStore::new();
-        let report = yank_to_buffer("hello world", &mut store, None);
+        let argv = vec!["this-binary-does-not-exist-zzz".to_string()];
+        let report = yank_to_buffer("hello world", &mut store, Some(&argv));
         assert!(report.buffer.is_ok());
         assert_eq!(store.default_buffer().unwrap().text, "hello world");
     }

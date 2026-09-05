@@ -2,14 +2,19 @@
   - changed-files:
       - any-glob-to-any-file:
           - "src/render.rs"
+          - "src/render_diff.rs"
+          - "src/terminal_state.rs"
+          - "src/vt100/**"
           - "src/settings.rs"
           - "assets/themes/**"
 
 "area:daemon":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/server.rs"
-          - "src/daemon/**"
+          - "src/server/**"
+          - "src/client.rs"
+          - "src/socket_security.rs"
+          - "src/signals.rs"
           - "src/session.rs"
           - "src/ipc.rs"
           - "src/protocol.rs"
@@ -31,15 +36,18 @@
       - any-glob-to-any-file:
           - "src/config.rs"
           - "src/project.rs"
+          - "src/env_interp.rs"
+          - "src/workspace.rs"
+          - "src/hooks.rs"
           - "src/theme.rs"
 
 "area:cli":
   - changed-files:
       - any-glob-to-any-file:
           - "src/main.rs"
-          - "src/cli/**"
-          - "src/app/**"
-          - "src/direct.rs"
+          - "src/cli.rs"
+          - "src/bootstrap.rs"
+          - "src/attach.rs"
           - "src/bin/**"
 
 "area:test":
@@ -47,11 +55,18 @@
       - any-glob-to-any-file:
           - "tests/**"
           - "benches/**"
+          - "scripts/**"
+          - "fuzz/**"
 
 "area:repo":
   - changed-files:
       - any-glob-to-any-file:
           - ".github/**"
+          - ".gitleaks.toml"
+          - "deny.toml"
+          - "Cargo.toml"
+          - "Cargo.lock"
+          - "rust-toolchain.toml"
           - "*.md"
           - "CONTRIBUTING.md"
           - "MAINTENANCE.md"

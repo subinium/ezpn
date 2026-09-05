@@ -11,3 +11,6 @@
 mod layout_invariants;
 mod protocol_roundtrip;
 mod workspace_migration;
+
+#[path = "../common/mod.rs"]
+mod common;

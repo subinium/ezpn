@@ -10,6 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Check CHANGELOG entry
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -17,6 +19,8 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
           PR_LABELS: ${{ toJson(github.event.pull_request.labels.*.name) }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
 
@@ -38,16 +42,17 @@ jobs:
             exit 0
           fi
 
-          # Inspect changed files
-          files=$(gh pr diff "$PR_NUMBER" --name-only)
+          # Diff checked-out commits, not GitHub's line-limited patch API.
+          # The merge-base range matches the PR and includes added files.
+          files=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
 
           touches_code=false
-          if echo "$files" | grep -qE '^(src/|Cargo\.toml$)'; then
+          if grep -qE '^(src/|Cargo\.toml$)' <<< "$files"; then
             touches_code=true
           fi
 
           touches_changelog=false
-          if echo "$files" | grep -qx 'CHANGELOG.md'; then
+          if grep -qx 'CHANGELOG.md' <<< "$files"; then
             touches_changelog=true
           fi
 

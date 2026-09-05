@@ -75,6 +75,7 @@ mod terminal_state;
 // `EzpnConfig::theme` only.
 #[allow(dead_code)]
 mod theme;
+mod vt100;
 mod workspace;
 
 // Crate-root re-exports so the `super::Foo` references in `server.rs`
@@ -82,11 +83,11 @@ mod workspace;
 // `pub(crate)` — no new public surface.
 pub(crate) use bootstrap::{
     base64_encode, build_initial_state, close_pane, collect_render_targets, do_split,
-    extract_selected_text, handle_ipc_command, kill_all_panes, make_inner, replace_pane,
-    reset_render_targets, resize_all, resize_zoomed_pane, selection_char_count_from_synced,
-    spawn_layout_panes, spawn_pane, spawn_snapshot_panes, sync_render_targets, RenderUpdate,
+    extract_selected_text, handle_ipc_command, kill_all_panes, replace_pane, reset_render_targets,
+    resize_all, resize_zoomed_pane, selection_char_count_from_synced, spawn_snapshot_panes,
+    sync_render_targets, RenderUpdate,
 };
-pub(crate) use cli::{parse_args_from, SocketKind};
+pub(crate) use cli::parse_args_from;
 
 fn main() -> anyhow::Result<()> {
     // Handle subcommands before anything else
@@ -94,6 +95,7 @@ fn main() -> anyhow::Result<()> {
     match args.get(1).map(|s| s.as_str()) {
         Some("init") => return bootstrap::cmd_init(),
         Some("from") => return bootstrap::cmd_from(args.get(2).map(|s| s.as_str())),
+        Some("doctor") => return attach::cmd_doctor(&args[2..]),
         Some("ls") => return attach::cmd_ls(),
         Some("kill") => return attach::cmd_kill(args.get(2).map(|s| s.as_str())),
         Some("a") | Some("attach") => return attach::cmd_attach(&args[2..]),
@@ -131,6 +133,7 @@ fn main() -> anyhow::Result<()> {
     // Validate args BEFORE spawning daemon — catch errors like invalid flags,
     // conflicting options, etc. early so the user sees them immediately.
     let config = cli::parse_args()?;
+    client::require_terminal()?;
 
     // Check for --no-daemon flag for legacy single-process mode
     let original_args: Vec<String> = args[1..].to_vec();
@@ -140,18 +143,10 @@ fn main() -> anyhow::Result<()> {
 
     // Create a new session and attach
     // Check for -S/--session flag to set custom session name
-    let session_name = {
-        let mut custom = None;
-        let mut i = 1;
-        while i < args.len() {
-            if (args[i] == "-S" || args[i] == "--session") && i + 1 < args.len() {
-                custom = Some(args[i + 1].clone());
-                break;
-            }
-            i += 1;
-        }
-        custom.unwrap_or_else(session::auto_name)
-    };
+    let session_name = config
+        .session_name
+        .clone()
+        .unwrap_or_else(session::auto_name);
 
     // Auto-attach: if a session with this name already exists, attach to it
     // instead of creating a new one. (Like `cd` into a tmux project.)
@@ -166,12 +161,14 @@ fn main() -> anyhow::Result<()> {
                     eprintln!("ezpn: {ic}");
                     std::process::exit(2);
                 }
-                // Session was stale — clean up and fall through to create new
-                session::cleanup(&existing_name);
+                // An interrupted SSH connection or local terminal failure says
+                // nothing about daemon liveness. Never unlink a live session.
+                return Err(e);
             }
         }
     }
 
+    bootstrap::require_project_trust(&config)?;
     let sock_path = session::spawn_server(&session_name, &original_args)?;
     client::run(&sock_path, &session_name)
 }

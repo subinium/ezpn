@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{MouseButton, MouseEventKind};
+use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
 
 use crate::layout::{Direction, Layout, Rect};
 use crate::pane::Pane;
@@ -45,10 +45,59 @@ pub(super) fn process_mouse(
     tab_action: &mut TabAction,
     tab_names: &[(usize, String, bool)],
 ) {
+    if !matches!(_mode, InputMode::Normal) && !settings.visible {
+        return;
+    }
+    let zoom_rects = zoomed_pane.map(|id| {
+        HashMap::from([(
+            id,
+            crate::bootstrap::terminal_content_area(tw, th, settings),
+        )])
+    });
+    let rects = zoom_rects
+        .as_ref()
+        .unwrap_or_else(|| border_cache.pane_rects());
+    let hit_pane = rects
+        .iter()
+        .find(|(_, r)| contains(r, mouse.column, mouse.row))
+        .map(|(&id, _)| id);
+    let zoom_layout = zoomed_pane.map(|id| Layout::singleton(id, layout.next_id));
+    let title_action = render::title_button_hit(
+        mouse.column,
+        mouse.row,
+        zoom_layout.as_ref().unwrap_or(layout),
+        inner,
+    );
+    let on_tab_bar = settings.show_tab_bar
+        && tab_names.len() > 1
+        && mouse.row == render::tab_bar_y(th, settings.show_status_bar);
+    if !settings.visible
+        && !on_tab_bar
+        && drag.is_none()
+        && selection_anchor.is_none()
+        && !mouse.modifiers.contains(KeyModifiers::SHIFT)
+    {
+        if let Some(id) = hit_pane {
+            if let Some(pane) = panes.get_mut(&id) {
+                if pane.wants_mouse() && !mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                    if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                        *active = id;
+                        update.full_redraw = true;
+                    }
+                    let rect = &rects[&id];
+                    let mut relative = mouse;
+                    relative.column -= rect.x;
+                    relative.row -= rect.y;
+                    pane.forward_mouse_event(relative);
+                    return;
+                }
+            }
+        }
+    }
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             // Tab bar: single click = switch tab, double click = rename tab
-            if tab_names.len() > 1 {
+            if !settings.visible && settings.show_tab_bar && tab_names.len() > 1 {
                 let tab_y = render::tab_bar_y(th, settings.show_status_bar);
                 if mouse.row == tab_y {
                     if let Some(idx) = render::tab_bar_hit(mouse.column, tab_names, tw) {
@@ -104,13 +153,11 @@ pub(super) fn process_mouse(
                 {
                     update.full_redraw = true;
                 }
-            } else if let Some(action) =
-                render::title_button_hit(mouse.column, mouse.row, layout, inner)
-            {
+            } else if let Some(action) = title_action {
                 match action {
                     render::TitleAction::Close(pid) => {
-                        crate::close_pane(layout, panes, active, pid);
-                        crate::resize_all(panes, layout, tw, th, settings);
+                        *active = pid;
+                        *_mode = InputMode::CloseConfirm;
                     }
                     render::TitleAction::SplitH(pid) => {
                         let _ = crate::do_split(
@@ -141,10 +188,14 @@ pub(super) fn process_mouse(
                 }
                 update.mark_all(layout);
                 update.border_dirty = true;
-            } else if let Some(hit) = layout.find_separator_at(mouse.column, mouse.row, inner) {
+            } else if let Some(hit) = if zoomed_pane.is_none() {
+                layout.find_separator_at(mouse.column, mouse.row, inner)
+            } else {
+                None
+            } {
                 *drag = Some(DragState::from_hit(hit));
                 update.full_redraw = true;
-            } else if let Some(pid) = layout.find_at(mouse.column, mouse.row, inner) {
+            } else if let Some(pid) = hit_pane {
                 let now = Instant::now();
                 let is_double = last_click
                     .map(|(t, lx, ly)| {
@@ -172,14 +223,14 @@ pub(super) fn process_mouse(
                 }
                 if !is_double {
                     if let Some(pane) = panes.get_mut(&pid) {
-                        if pane.wants_mouse() {
-                            if let Some(rect) = border_cache.pane_rects().get(&pid) {
+                        if pane.wants_mouse() && !mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                            if let Some(rect) = rects.get(&pid) {
                                 let rel_col = mouse.column.saturating_sub(rect.x);
                                 let rel_row = mouse.row.saturating_sub(rect.y);
                                 pane.send_mouse_event(0, rel_col, rel_row, false);
                             }
                         } else if pid == *active {
-                            if let Some(rect) = border_cache.pane_rects().get(&pid) {
+                            if let Some(rect) = rects.get(&pid) {
                                 let rel_col = mouse.column.saturating_sub(rect.x);
                                 let rel_row = mouse.row.saturating_sub(rect.y);
                                 *selection_anchor = Some((pid, rel_col, rel_row));
@@ -201,7 +252,7 @@ pub(super) fn process_mouse(
                 update.mark_all(layout);
                 update.border_dirty = true;
             } else if let Some((pid, anchor_col, anchor_row)) = *selection_anchor {
-                if let Some(rect) = border_cache.pane_rects().get(&pid) {
+                if let Some(rect) = rects.get(&pid) {
                     let rel_col = mouse
                         .column
                         .saturating_sub(rect.x)
@@ -253,8 +304,8 @@ pub(super) fn process_mouse(
             } else {
                 *selection_anchor = None;
                 if let Some(pane) = panes.get_mut(active) {
-                    if pane.wants_mouse() {
-                        if let Some(rect) = border_cache.pane_rects().get(active) {
+                    if pane.wants_mouse() && !mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                        if let Some(rect) = rects.get(active) {
                             let rel_col = mouse.column.saturating_sub(rect.x);
                             let rel_row = mouse.row.saturating_sub(rect.y);
                             pane.send_mouse_event(0, rel_col, rel_row, true);
@@ -264,13 +315,11 @@ pub(super) fn process_mouse(
             }
         }
         MouseEventKind::ScrollUp => {
-            let target = layout
-                .find_at(mouse.column, mouse.row, inner)
-                .unwrap_or(*active);
+            let target = hit_pane.unwrap_or(*active);
             if let Some(pane) = panes.get_mut(&target) {
                 if pane.is_alive() {
-                    if pane.wants_mouse() {
-                        if let Some(rect) = border_cache.pane_rects().get(&target) {
+                    if pane.wants_mouse() && !mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                        if let Some(rect) = rects.get(&target) {
                             let rel_col = mouse.column.saturating_sub(rect.x);
                             let rel_row = mouse.row.saturating_sub(rect.y);
                             for _ in 0..3 {
@@ -285,13 +334,11 @@ pub(super) fn process_mouse(
             }
         }
         MouseEventKind::ScrollDown => {
-            let target = layout
-                .find_at(mouse.column, mouse.row, inner)
-                .unwrap_or(*active);
+            let target = hit_pane.unwrap_or(*active);
             if let Some(pane) = panes.get_mut(&target) {
                 if pane.is_alive() {
-                    if pane.wants_mouse() {
-                        if let Some(rect) = border_cache.pane_rects().get(&target) {
+                    if pane.wants_mouse() && !mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                        if let Some(rect) = rects.get(&target) {
                             let rel_col = mouse.column.saturating_sub(rect.x);
                             let rel_row = mouse.row.saturating_sub(rect.y);
                             for _ in 0..3 {
@@ -307,4 +354,8 @@ pub(super) fn process_mouse(
         }
         _ => {}
     }
+}
+
+fn contains(rect: &Rect, x: u16, y: u16) -> bool {
+    x >= rect.x && x - rect.x < rect.w && y >= rect.y && y - rect.y < rect.h
 }

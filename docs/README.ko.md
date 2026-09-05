@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>터미널 패널, 즉시.</strong><br>
-  설정 없이 세션 영속성과 tmux 호환 키를 제공하는 터미널 멀티플렉서.
+  마우스 조작, 지속되는 세션, 익숙한 접두 키를 지원하는 macOS·Linux용 터미널 멀티플렉서.
 </p>
 
 <p align="center">
@@ -22,319 +22,192 @@
 
 ---
 
-## 왜 ezpn?
+## 작업 시작
 
-```bash
-$ ezpn                # 터미널을 즉시 분할
-$ ezpn 2 3            # 2x3 셸 그리드
-$ ezpn -l dev         # 프리셋 레이아웃
+```sh
+cargo install ezpn --locked
+ezpn                 # two shells
+ezpn 2 3             # a 2-by-3 grid
+ezpn -S work         # create or reattach to a named session
 ```
 
-설정 파일도, 셋업도, 러닝 커브도 없습니다. 세션은 백그라운드에서 유지 — `Ctrl+B d`로 분리, `ezpn a`로 복귀.
+빌드에는 Rust 1.88 이상이 필요합니다. [GitHub Releases](https://github.com/subinium/ezpn/releases)에서
+macOS·Linux 바이너리를 받을 수 있으며, 체크섬이 제공되면 함께 확인하세요.
+ezpn은 실행형 터미널 멀티플렉서이며, Rust 애플리케이션에 임베드하는 GUI 라이브러리가 아닙니다.
 
-**프로젝트에서**, `.ezpn.toml`을 레포에 넣고 `ezpn`을 실행하면 모두가 같은 워크스페이스를 사용합니다:
+## 세션과 SSH
 
-```toml
-[workspace]
-layout = "7:3/1:1"
-
-[[pane]]
-name = "editor"
-command = "nvim ."
-
-[[pane]]
-name = "server"
-command = "npm run dev"
-restart = "on_failure"
-
-[[pane]]
-name = "tests"
-command = "npm test -- --watch"
-
-[[pane]]
-name = "logs"
-command = "tail -f logs/app.log"
+```sh
+ezpn a work
+ezpn a work --shared
+ezpn a work --readonly
+ezpn ls
+ezpn kill work
 ```
 
-```bash
-$ ezpn   # .ezpn.toml을 읽고 전부 시작
+`Ctrl+B` 다음 `d`를 누르면 현재 클라이언트만 분리됩니다. 비활성 탭의 작업을 포함해
+셸 프로세스는 계속 실행됩니다. 다시 연결하면 기존 프로세스에 접속합니다.
+읽기 전용 클라이언트는 입력을 보내거나 쓰기 가능한 클라이언트의 작업 영역 크기를 바꿀 수 없습니다.
+
+원격 호스트에 ezpn을 설치하고 PATH에서 실행할 수 있도록 설정하세요.
+
+```sh
+ssh -t host 'ezpn -S work'
+ssh -t host 'ezpn a work'
+ssh -J bastion -t host 'ezpn a work'
 ```
 
-tmuxinator도 없고. YAML도 없고. 레포에 TOML 파일 하나면 끝.
+SSH 연결에는 PTY 할당이 필요합니다. SSH 클라이언트의 연결이 끊겨도 원격 데몬은 종료되지 않습니다.
+암호화, 인증, 호스트 키 검증, 포워딩은 OpenSSH가 담당합니다.
+ezpn의 로컬 Unix 소켓을 인증되지 않은 네트워크에 노출하지 마세요.
 
-## 설치
+## 마우스와 키보드
 
-```bash
-cargo install ezpn
-```
-
-<details>
-<summary>소스에서 빌드</summary>
-
-```bash
-git clone https://github.com/subinium/ezpn
-cd ezpn && cargo install --path .
-```
-
-</details>
-
-## 빠른 시작
-
-```bash
-ezpn                  # 2패널 (또는 .ezpn.toml 로드)
-ezpn 2 3              # 2x3 그리드
-ezpn -l dev           # 레이아웃 프리셋 (dev, monitor, quad, stack, trio...)
-ezpn -e 'cmd1' -e 'cmd2'   # 패널별 명령어
-```
-
-### 세션
-
-```bash
-Ctrl+B d               # 분리 (세션은 계속 실행)
-ezpn a                 # 가장 최근 세션에 재연결
-ezpn a myproject       # 이름으로 재연결
-ezpn ls                # 활성 세션 목록
-ezpn kill myproject    # 세션 종료
-```
-
-### 탭
-
-```bash
-Ctrl+B c               # 새 탭
-Ctrl+B n / p           # 다음 / 이전 탭
-Ctrl+B 0-9             # 번호로 탭 이동
-```
-
-모든 tmux 키가 동작합니다 — `Ctrl+B %`로 분할, `Ctrl+B x`로 닫기, `Ctrl+B [`로 복사 모드.
-
-## 주요 기능
-
-| | |
-|---|---|
-| **제로 설정** | 바로 사용 가능. rc 파일 불필요. |
-| **레이아웃 프리셋** | `dev`, `ide`, `monitor`, `quad`, `stack`, `main`, `trio` |
-| **세션 유지** | tmux처럼 분리/연결. 백그라운드 데몬이 프로세스 유지. |
-| **탭** | tmux 스타일 윈도우. 탭 바와 마우스 클릭 전환 지원. |
-| **마우스 우선** | 클릭으로 포커스, 드래그로 크기 조절, 스크롤로 히스토리, 드래그로 선택 & 복사. |
-| **복사 모드** | Vi 키, 비주얼 선택, 증분 검색, OSC 52 클립보드. |
-| **커맨드 팔레트** | `Ctrl+B :` tmux 호환 명령어. |
-| **브로드캐스트 모드** | 모든 패널에 동시 입력. |
-| **프로젝트 설정** | `.ezpn.toml` — 레이아웃, 명령어, 환경변수, 자동 재시작. |
-| **보더리스 모드** | `ezpn -b none`으로 화면 공간 극대화. |
-| **Kitty 키보드** | `Shift+Enter`, `Ctrl+Arrow` 등 수정 키 정상 동작. |
-| **CJK/유니코드** | 한국어, 중국어, 일본어, 이모지 정확한 폭 계산. |
-
-## 레이아웃 프리셋
-
-```bash
-ezpn -l dev       # 7:3 — 메인 + 사이드
-ezpn -l ide       # 7:3/1:1 — 에디터 + 사이드바 + 하단 2개
-ezpn -l monitor   # 1:1:1 — 3열 균등
-ezpn -l quad      # 2x2 그리드
-ezpn -l stack     # 1/1/1 — 3행 쌓기
-ezpn -l main      # 6:4/1 — 상단 넓은 쌍 + 하단 전체
-ezpn -l trio      # 1/1:1 — 상단 전체 + 하단 2개
-```
-
-커스텀 비율: `ezpn -l '7:3/5:5'`
-
-## 프로젝트 설정
-
-프로젝트 루트에 `.ezpn.toml`을 넣고 `ezpn`을 실행하세요. 끝.
-
-**패널별 옵션:** `command`, `cwd`, `name`, `env`, `restart` (`never`/`on_failure`/`always`), `shell`
-
-```bash
-ezpn init              # .ezpn.toml 템플릿 생성
-ezpn from Procfile     # Procfile에서 가져오기
-```
-
-<details>
-<summary>글로벌 설정</summary>
-
-`~/.config/ezpn/config.toml`:
-
-```toml
-border = rounded        # single | rounded | heavy | double | none
-shell = /bin/zsh
-scrollback = 10000
-status_bar = true
-tab_bar = true
-prefix = b              # 프리픽스 키 (Ctrl+<key>)
-```
-
-</details>
-
-## 키 바인딩
-
-**직접 단축키:**
-
-| 키 | 동작 |
-|---|---|
-| `Ctrl+D` | 좌우 분할 |
-| `Ctrl+E` | 상하 분할 |
-| `Ctrl+N` | 다음 패널 |
-| `F2` | 크기 균등화 |
-
-**프리픽스 모드** (`Ctrl+B` 후):
-
-| 키 | 동작 |
-|---|---|
-| `%` / `"` | 좌우 / 상하 분할 |
-| `o` / Arrow | 패널 이동 |
-| `x` | 패널 닫기 |
-| `z` | 줌 토글 |
-| `R` | 크기 조절 모드 |
-| `[` | 복사 모드 |
-| `B` | 브로드캐스트 |
-| `:` | 커맨드 팔레트 |
-| `d` | 디태치 |
-| `?` | 도움말 |
-
-<details>
-<summary>전체 키 바인딩 참조</summary>
-
-**탭:**
-
-| 키 | 동작 |
-|---|---|
-| `Ctrl+B c` | 새 탭 |
-| `Ctrl+B n` / `p` | 다음 / 이전 탭 |
-| `Ctrl+B 0-9` | 번호로 탭 이동 |
-| `Ctrl+B ,` | 탭 이름 변경 |
-| `Ctrl+B &` | 탭 닫기 |
-
-**패널:**
-
-| 키 | 동작 |
-|---|---|
-| `Ctrl+B {` / `}` | 이전 / 다음 패널과 교환 |
-| `Ctrl+B E` / `Space` | 크기 균등화 |
-| `Ctrl+B s` | 상태 바 토글 |
-| `Ctrl+B q` | 패널 번호 + 빠른 이동 |
-
-**복사 모드** (`Ctrl+B [`):
-
-| 키 | 동작 |
-|---|---|
-| `h` `j` `k` `l` | 커서 이동 |
-| `w` / `b` | 다음 / 이전 단어 |
-| `0` / `$` / `^` | 줄 시작 / 끝 / 첫 문자 |
-| `g` / `G` | 스크롤백 맨 위 / 맨 아래 |
-| `Ctrl+U` / `Ctrl+D` | 반 페이지 위 / 아래 |
-| `v` | 문자 선택 |
-| `V` | 줄 선택 |
-| `y` / `Enter` | 복사 후 종료 |
-| `/` / `?` | 앞으로 / 뒤로 검색 |
-| `n` / `N` | 다음 / 이전 일치 |
-| `q` / `Esc` | 종료 |
-
-**마우스:**
-
-| 동작 | 효과 |
-|---|---|
-| 패널 클릭 | 포커스 |
-| 더블클릭 | 줌 토글 |
+| 조작 | 동작 |
+| --- | --- |
+| 패널 내용 클릭 | 해당 패널로 포커스 이동 |
+| 구분선 드래그 | 분할 크기 조정 |
+| 제목 표시줄의 분할 버튼 | 선택한 패널 분할 |
+| 제목 표시줄의 닫기 버튼 | 확인 후 닫기 |
 | 탭 클릭 | 탭 전환 |
-| `[x]` 클릭 | 패널 닫기 |
-| 보더 드래그 | 크기 조절 |
-| 텍스트 드래그 | 선택 + 복사 |
-| 스크롤 휠 | 스크롤백 히스토리 |
+| 스크롤 | 기록을 스크롤하거나 마우스를 지원하는 앱에 전달 |
+| 텍스트 드래그 | 선택 및 복사 |
+| Shift + 드래그 | 앱에 마우스 입력을 보내는 대신 ezpn 텍스트 선택 |
+| 마우스를 처리하지 않는 앱의 내용 더블 클릭 | 확대 전환 |
+| F1 / F2 | 설정 / 크기 균등화 |
+| Alt + 방향키 | 패널 이동. macOS에서는 Option을 Meta로 설정 |
 
-**macOS 참고:** Alt+Arrow 방향 이동은 Option을 Meta로 설정해야 합니다 (iTerm2: Preferences > Profiles > Keys > `Esc+`).
+앱으로 전달하는 클릭, 이동, 휠, 버튼 해제 이벤트는 앱이 요청한 마우스 인코딩을 사용합니다.
+`Ctrl+D`, `Ctrl+E`, `Ctrl+W` 등의 키는 명시적으로 재지정하지 않는 한 셸로 전달됩니다.
+이 키들은 더 이상 패널을 분할하거나 종료를 요청하지 않습니다.
 
-</details>
+`Ctrl+B`를 누른 뒤 다음 접두 키 명령을 사용할 수 있습니다.
 
-<details>
-<summary>커맨드 팔레트 명령어</summary>
+| 키 | 동작 |
+| --- | --- |
+| `%` / `"` | 열 / 행 분할 |
+| `o` / 방향키 | 패널 이동 |
+| `x` | 패널 닫기 확인 |
+| `z` | 확대 전환 |
+| `R` | 크기 조정 모드 |
+| `Space` / `E` | 크기 균등화 |
+| `c` / `n` / `p` | 새 탭 / 다음 탭 / 이전 탭 |
+| `0`–`9` | 0부터 시작하는 인덱스로 탭 선택 |
+| `,` / `&` | 탭 이름 변경 / 닫기 확인 |
+| `[` | 복사 모드 |
+| `:` | 명령 팔레트 |
+| `r` | 전역 설정 다시 불러오기 |
+| `B` | 동시 입력 전환 |
+| `d` | 현재 클라이언트 분리 |
+| `?` | 도움말 |
+| `Ctrl+B` | 앱에 접두 키 전달 |
 
-`Ctrl+B :` 명령어 프롬프트. tmux 별칭 모두 지원.
+복사 모드에서는 vi 이동, `v`/`V` 선택, `y` 또는 Enter로 복사,
+`/`/`?` 검색, `n`/`N`으로 다음/이전 일치 항목 이동, `q`/Escape로 나가기를 지원합니다.
+일부 익숙한 tmux 키 바인딩을 지원하지만, tmux 명령 전체와 호환되는 것은 아닙니다.
 
+## 작업을 유지하며 레이아웃 변경
+
+```sh
+ezpn -l dev       # 7:3
+ezpn -l ide       # 7:3/1:1
+ezpn -l quad      # 2-by-2
+ezpn -l '7:3/5:5'
+ezpn -b none
 ```
-split / split-window         좌우 분할
-split -v                     상하 분할
-new-tab / new-window         새 탭
-next-tab / prev-tab          탭 전환
-close-pane / kill-pane       패널 닫기
-close-tab / kill-window      탭 닫기
-rename-tab <name>            탭 이름 변경
-layout <spec>                레이아웃 변경
-equalize / even              크기 균등화
-zoom                         줌 토글
-broadcast                    브로드캐스트 토글
+
+명령 팔레트의 `select-layout`은 실행 중인 프로세스를 그대로 두고 재배치합니다.
+패널 수가 다른 레이아웃은 거부하므로, 패널은 명시적으로 분할하거나 닫아야 합니다.
+분할이나 스냅샷 불러오기가 실패해도 현재 작업 영역은 유지됩니다.
+
+## 신뢰하는 프로젝트 작업 영역
+
+자동 실행을 허용하기 전에 저장소의 명령을 검토하세요.
+
+```toml
+# .ezpn.toml
+[workspace]
+layout = "7:3"
+
+[[pane]]
+name = "shell"
+cwd = "."
+
+[[pane]]
+name = "worker"
+command = "printf 'ready\\n'; exec sh"
+restart = "on_failure"
 ```
 
-</details>
-
-## ezpn vs. tmux를 선택하는 이유
-
-세 가지 측정 가능한 주장. 직접 워크로드에서 검증한 뒤에 신뢰하세요.
-
-| 축 | tmux 3.4 | **ezpn 0.12** | 측정 방법 |
-| --- | --- | --- | --- |
-| 유휴 시 RSS (16 패널, 50 MB 스크롤백 합계, Linux 6.6) | ~180 MB | **~28 MB** | 16개의 분할 후 1분 유휴 상태에서 `ps -o rss= -p $(pgrep -d, tmux\|ezpn)`. |
-| `send-keys` 신뢰성 | fire-and-forget; 종료 신호 없음 | **`--await-prompt`로 OSC 133 D까지 차단** | `ezpn-ctl send-keys --await-prompt --timeout 60s -- 'cargo test\n'` — [scripting.md](scripting.md) 참고. |
-| DECSET 2026 (synchronised output) | 호스트 에뮬레이터로 통과 | **인터셉트 + 버퍼링**; 클라이언트에 단일 원자 프레임 | 두 클라이언트가 동시에 연결된 상태에서 `printf '\e[?2026h…\e[?2026l'` — 둘 다 동일한 원자 redraw를 봅니다. |
-
-숫자 외에:
-
-- **제로 설정 기본값.** 새 설치에서 모든 tmux 키가 작동합니다. `.tmux.conf` 없음, 플러그인 매니저 없음.
-- **TOML, YAML 위성이 아님.** `.ezpn.toml`은 레포에 살고, `gem install tmuxinator` 없이 모두가 같은 워크스페이스를 공유합니다.
-- **OSC 52 페이스트 인젝션 가드.** `cat hostile.log`이 클립보드를 조용히 덮어쓸 수 없습니다 ([clipboard.md](clipboard.md), [security.md](security.md)).
-- **고정된 와이어 프로토콜.** [`docs/protocol/v1.md`](protocol/v1.md)는 IPC 표면에 SemVer를 약속 — minor 버전 업그레이드에서 스크립트가 깨지지 않습니다.
-
-전환 전 고려할 트레이드오프:
-
-- 플러그인 시스템 없음. tmux의 플러그인 생태계는 10년 이상이지만 ezpn은 비어 있습니다.
-- `pipe-pane`, `command-alias`, `if-shell` 없음. 대신 `[[hooks]]`와 이벤트 버스를 사용하세요.
-- Linux + macOS 전용. Windows 미지원.
-
-전체 마이그레이션 가이드: [docs/migration-from-tmux.md](migration-from-tmux.md).
-
-## ezpn vs. tmux vs. Zellij
-
-| | tmux | Zellij | **ezpn** |
-|---|---|---|---|
-| 설정 | `.tmux.conf` 필요 | KDL 설정 | **제로 설정** |
-| 첫 사용 | 빈 화면 | 튜토리얼 모드 | **`ezpn`** |
-| 세션 | `tmux a` | `zellij a` | **`ezpn a`** |
-| 프로젝트 설정 | tmuxinator (gem) | — | **`.ezpn.toml` 내장** |
-| 브로드캐스트 | `:setw synchronize-panes` | — | **`Ctrl+B B`** |
-| 자동 재시작 | — | — | **`restart = "always"`** |
-| Kitty 키보드 | 미지원 | 지원 | **지원** |
-| 플러그인 | — | WASM | — |
-| 생태계 | 거대 (30년) | 성장중 | 신규 |
-
-**ezpn** — 설정 없이 바로 쓰는 터미널 분할.
-**tmux** — 깊은 스크립팅과 플러그인 생태계가 필요할 때.
-**Zellij** — 모던 UI와 WASM 플러그인을 원할 때.
-
-## CLI 레퍼런스
-
+```sh
+ezpn init
+ezpn doctor
+ezpn --trust-project
 ```
-ezpn [ROWS COLS]         그리드 레이아웃으로 시작
-ezpn -l <PRESET>         레이아웃 프리셋으로 시작
-ezpn -e <CMD> [-e ...]   패널별 명령어
-ezpn -S <NAME>           이름 지정 세션
-ezpn -b <STYLE>          보더 스타일 (single/rounded/heavy/double/none)
-ezpn a [NAME]            세션 연결
-ezpn ls                  세션 목록
-ezpn kill [NAME]         세션 종료
-ezpn rename OLD NEW      세션 이름 변경
-ezpn init                .ezpn.toml 템플릿 생성
-ezpn from <FILE>         Procfile에서 가져오기
+
+`--trust-project`는 `.ezpn.toml` / Procfile의 자동 실행을 허용합니다.
+저장소 명령을 불러오지 않고 일반 셸을 시작하려면 `ezpn 1 2`처럼 그리드를 명시하세요.
+`doctor`는 읽기 전용으로 구문을 검사하며, 명령을 실행하거나 비밀값을 해석하지 않습니다.
+
+프로젝트 환경변수 확장에서는 환경변수·파일·비밀값 참조를 사용할 수 있습니다.
+외부 값은 진단 메시지에 출력하지 않습니다. 설정에서 외부 값을 읽은 패널은
+실행 가능한 스냅샷 메타데이터와 기록에서 제외되며, 복원 시 깨끗한 셸로 열립니다.
+해석된 인증 정보가 그대로 저장되는 것을 막고 개인정보 보호를 우선하는 의도적인 정책입니다.
+[설정](../docs/configuration.md)과 [보안](../docs/security.md)을 참고하세요.
+
+## 설정과 복구
+
+```toml
+# ~/.config/ezpn/config.toml
+[global]
+border = "rounded"
+scrollback = 10000
+persist_scrollback = false
+
+[keys]
+prefix = "b"
+
+[theme]
+name = "ezpn-dark"
 ```
+
+테마: `ezpn-dark`, `ezpn-light`, `nord`, `gruvbox-dark`, `solarized-dark`.
+사용자 키맵은 `[keymap.normal]`, `[keymap.prefix]`, `[keymap.copy_mode]`에 정의합니다.
+`Ctrl+B r`은 검증된 한 번의 파일 읽기 결과를 바탕으로 지원되는 설정을 다시 불러옵니다.
+설정 패널에서 저장이 실패하면 성공으로 표시하지 않고 오류를 알립니다.
+
+디스크 스냅샷과 분리된 채 실행 중인 세션은 다릅니다. `ezpn --restore FILE`은
+**새 프로세스를 시작합니다**. 저장을 허용한 기록은 텍스트로 복원되며, 실행 중인 편집기,
+프로세스 메모리, 터미널 그래픽, 정확한 대체 화면 상태를 복원하지는 않습니다.
+스냅샷 파일에는 크기·압축 해제 제한과 비공개 접근 권한이 적용됩니다.
+
+## 호환성과 검증 근거
+
+- 지원 플랫폼 범위는 UTF-8 ANSI 터미널과 Unix PTY를 사용하는 macOS·Linux입니다.
+  네이티브 Windows는 지원하지 않습니다.
+- 자식 앱의 키보드 프로토콜 협상과 호스트 기능은 별개입니다. 레거시 앱에는 기존 시퀀스를
+  전달하며, 지원되는 Kitty 확장 기능은 명시적으로 활성화해야 합니다.
+- 앱의 클립보드 쓰기는 설정된 OSC 52 정책을 따릅니다.
+  SSH에서 사용자가 복사한 내용은 원격 데스크톱 클립보드보다 연결된 터미널을 우선합니다.
+- 렌더링에는 범위 제한이 있으며 작은 화면은 잘라 표시합니다. 파서 제한, 지원 시퀀스,
+  미검증 GUI 에뮬레이터 조합은 [터미널 호환성](../docs/terminal-protocol.md)을 참고하세요.
+- `--features render-diff`는 크기가 제한된 선택적 ANSI 차이 출력 경로를 활성화합니다.
+  지원하지 않는 프레임은 원래 출력으로 돌아갑니다. 모든 상황에서 빨라진다는 보장은 아닙니다.
+- 실제 PTY 테스트는 연결·분리, 크기 조정, 공유·읽기 전용 클라이언트, 전송 중단을 다룹니다.
+  별도의 격리된 루프백 SSH 테스트로 실제 SSH와 시뮬레이션을 구분합니다.
+- 장시간 안정성 테스트와 tmux/Zellij 성능 비교는 별도의 검증 대상입니다.
+  ezpn이 두 프로젝트보다 항상 빠르거나 메모리를 적게 쓴다고 주장하지 않습니다.
+
+[릴리스 감사 기록](../docs/audits/v0.14.0.md)에 결과와 남은 제약을 정리합니다.
+[사전 점검 스크립트](../scripts/preflight.py)는 PASS/FAIL/SKIP과 실제 종료 코드를 기록하며,
+실패한 테스트를 무시된 자리표시자 뒤에 숨기지 않습니다.
 
 ## 문서
 
-- [시작하기](getting-started.md) — 5분 투어
-- [tmux에서 마이그레이션](migration-from-tmux.md) — 키별, 명령별
-- [설정](configuration.md) — `config.toml` + `.ezpn.toml` 전체 레퍼런스
-- [스크립팅](scripting.md) — `ezpn-ctl`, 이벤트, `ls --json`
-- [클립보드](clipboard.md) — OSC 52, 폴백 체인, SSH 함정
-- [터미널 프로토콜](terminal-protocol.md) — ezpn이 통과/인터셉트/수정하는 것
-- [보안](security.md) — 위협 모델과 기본값
-- [IPC 와이어 프로토콜 v1](protocol/v1.md) — v1.0 고정
+[시작하기](../docs/getting-started.md) · [설정](../docs/configuration.md) ·
+[SSH와 터미널 프로토콜](../docs/terminal-protocol.md) · [클립보드](../docs/clipboard.md) ·
+[보안](../docs/security.md) · [스크립팅 제한](../docs/scripting.md) ·
+[기여하기](../CONTRIBUTING.md) · [변경 기록](../CHANGELOG.md)
 
 ## 라이선스
 

@@ -4,7 +4,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::layout::Layout;
+use crate::layout::{Layout, LayoutNode};
 use crate::pane::{Pane, PaneLaunch};
 use crate::project::RestartPolicy;
 use crate::render::BorderStyle;
@@ -28,9 +28,14 @@ pub const SNAPSHOT_VERSION: u32 = 3;
 pub const MIN_SUPPORTED_VERSION: u32 = 1;
 
 /// Soft warning thresholds for an oversized scrollback payload (#69 AC).
-/// `validate()` warns to stderr but does not fail — the user opted into
-/// persistence and may legitimately have huge logs.
+/// `validate()` warns above this threshold. Separate hard byte and row limits
+/// bound file loading and actual decoded output even for opted-in persistence.
 const SCROLLBACK_SOFT_WARN_BYTES: u32 = 100 * 1024 * 1024;
+const SNAPSHOT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const SCROLLBACK_DECODE_MAX_BYTES: u64 = 128 * 1024 * 1024;
+const SCROLLBACK_MAX_ROWS: usize = 200_000;
+const SNAPSHOT_MAX_TABS: usize = 100;
+const SNAPSHOT_MAX_PANES: usize = 1000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkspaceSnapshot {
@@ -109,9 +114,8 @@ pub struct PaneSnapshot {
 ///   payload = gzip(bincode::serialize(&Vec<RowSnapshot>))
 ///
 /// `bytes_uncompressed` is the size of the bincode buffer **before**
-/// gzip and is recorded so the reader can pre-allocate the inflate
-/// buffer and so `validate()` can warn on pathological sizes without
-/// having to actually decompress.
+/// gzip. The reader bounds inflation by this claim and verifies its exact
+/// size; a claim alone is never treated as proof of the decoded size.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScrollbackBlob {
     pub encoding: ScrollbackEncoding,
@@ -130,6 +134,8 @@ pub enum ScrollbackEncoding {
     /// `gzip(bincode(Vec<RowSnapshot>))` — current default.
     #[default]
     BincodeGz,
+    #[serde(other)]
+    Unknown,
 }
 
 /// One scrollback line as captured for `ScrollbackBlob` (#69).
@@ -168,9 +174,17 @@ impl ScrollbackBlob {
     // suite today.
     #[allow(dead_code)]
     pub fn encode_bincode_gz(rows: &[RowSnapshot]) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            rows.len() <= SCROLLBACK_MAX_ROWS,
+            "too many scrollback rows"
+        );
+        anyhow::ensure!(
+            bincode::serialized_size(rows)? <= SCROLLBACK_DECODE_MAX_BYTES,
+            "scrollback exceeds decoded byte limit"
+        );
         let raw = bincode::serialize(rows)
             .map_err(|e| anyhow::anyhow!("bincode encode scrollback: {e}"))?;
-        let bytes_uncompressed = u32::try_from(raw.len()).unwrap_or(u32::MAX);
+        let bytes_uncompressed = u32::try_from(raw.len())?;
         let mut encoder = flate2::write::GzEncoder::new(
             Vec::with_capacity(raw.len() / 4),
             flate2::Compression::default(),
@@ -181,9 +195,13 @@ impl ScrollbackBlob {
         let payload = encoder
             .finish()
             .map_err(|e| anyhow::anyhow!("gzip finish scrollback: {e}"))?;
+        anyhow::ensure!(
+            payload.len() as u64 <= SNAPSHOT_MAX_BYTES,
+            "compressed scrollback exceeds byte limit"
+        );
         Ok(Self {
             encoding: ScrollbackEncoding::BincodeGz,
-            rows: u32::try_from(rows.len()).unwrap_or(u32::MAX),
+            rows: u32::try_from(rows.len())?,
             bytes_uncompressed,
             payload,
         })
@@ -198,19 +216,57 @@ impl ScrollbackBlob {
     // round-trip tests today.
     #[allow(dead_code)]
     pub fn decode(&self) -> anyhow::Result<Option<Vec<RowSnapshot>>> {
+        use bincode::Options;
         match self.encoding {
+            ScrollbackEncoding::Unknown => Ok(None),
             ScrollbackEncoding::BincodeGz => {
-                let mut decoder = flate2::read::GzDecoder::new(&self.payload[..]);
-                let mut buf =
-                    Vec::with_capacity(self.bytes_uncompressed.min(64 * 1024 * 1024) as usize);
+                self.validate_bounds()?;
+                // Bound the actual output, not just the untrusted size hint.
+                let mut decoder = flate2::read::GzDecoder::new(&self.payload[..])
+                    .take(u64::from(self.bytes_uncompressed) + 1);
+                let mut buf = Vec::new();
                 decoder
                     .read_to_end(&mut buf)
                     .map_err(|e| anyhow::anyhow!("gzip decode scrollback: {e}"))?;
-                let rows: Vec<RowSnapshot> = bincode::deserialize(&buf)
+                anyhow::ensure!(
+                    buf.len() == self.bytes_uncompressed as usize,
+                    "scrollback decoded size does not match metadata"
+                );
+                // A bincode vector starts with a fixed-width u64 length.
+                // Check it before serde can use it as an allocation hint.
+                let count = buf
+                    .get(..8)
+                    .and_then(|b| b.try_into().ok())
+                    .map(u64::from_le_bytes);
+                anyhow::ensure!(
+                    count == Some(u64::from(self.rows)),
+                    "scrollback row count does not match metadata"
+                );
+                let rows: Vec<RowSnapshot> = bincode::DefaultOptions::new()
+                    .with_fixint_encoding()
+                    .with_limit(SCROLLBACK_DECODE_MAX_BYTES)
+                    .reject_trailing_bytes()
+                    .deserialize(&buf)
                     .map_err(|e| anyhow::anyhow!("bincode decode scrollback: {e}"))?;
                 Ok(Some(rows))
             }
         }
+    }
+
+    fn validate_bounds(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            u64::from(self.bytes_uncompressed) <= SCROLLBACK_DECODE_MAX_BYTES,
+            "scrollback exceeds decoded byte limit"
+        );
+        anyhow::ensure!(
+            self.payload.len() as u64 <= SNAPSHOT_MAX_BYTES,
+            "compressed scrollback exceeds byte limit"
+        );
+        anyhow::ensure!(
+            self.rows as usize <= SCROLLBACK_MAX_ROWS,
+            "too many scrollback rows"
+        );
+        Ok(())
     }
 }
 
@@ -287,13 +343,59 @@ impl WorkspaceSnapshot {
         if self.tabs.is_empty() {
             anyhow::bail!("snapshot has no tabs");
         }
+        anyhow::ensure!(
+            self.tabs.len() <= SNAPSHOT_MAX_TABS,
+            "too many snapshot tabs"
+        );
+        anyhow::ensure!(
+            self.scrollback <= 100_000,
+            "snapshot scrollback exceeds 100000 lines"
+        );
+        let mut total_panes = 0usize;
+        let mut total_decoded = 0u64;
 
         for (ti, tab) in self.tabs.iter().enumerate() {
+            total_panes = total_panes.saturating_add(tab.panes.len());
+            anyhow::ensure!(total_panes <= SNAPSHOT_MAX_PANES, "too many snapshot panes");
             let mut snapshot_ids: Vec<usize> = tab.panes.iter().map(|pane| pane.id).collect();
             snapshot_ids.sort_unstable();
             snapshot_ids.dedup();
+            anyhow::ensure!(
+                snapshot_ids.len() == tab.panes.len(),
+                "duplicate snapshot pane IDs in tab {ti}"
+            );
 
-            let mut layout_ids = tab.layout.pane_ids();
+            let mut layout_ids = Vec::new();
+            let mut pending = vec![(&tab.layout.root, 0usize)];
+            while let Some((node, depth)) = pending.pop() {
+                anyhow::ensure!(depth <= 100, "snapshot layout too deep in tab {ti}");
+                match node {
+                    LayoutNode::Leaf { id } => {
+                        layout_ids.push(*id);
+                        anyhow::ensure!(
+                            layout_ids.len() <= 100,
+                            "too many panes in snapshot tab {ti}"
+                        );
+                        anyhow::ensure!(
+                            *id < tab.layout.next_id && tab.layout.next_id < usize::MAX,
+                            "invalid next pane ID in snapshot tab {ti}"
+                        );
+                    }
+                    LayoutNode::Split {
+                        ratio,
+                        first,
+                        second,
+                        ..
+                    } => {
+                        anyhow::ensure!(
+                            ratio.is_finite() && *ratio > 0.0 && *ratio < 1.0,
+                            "invalid layout ratio in snapshot tab {ti}"
+                        );
+                        pending.push((second, depth + 1));
+                        pending.push((first, depth + 1));
+                    }
+                }
+            }
             layout_ids.sort_unstable();
 
             if snapshot_ids != layout_ids {
@@ -306,11 +408,24 @@ impl WorkspaceSnapshot {
                     ti
                 );
             }
+            if let Some(zoomed) = tab.zoomed_pane {
+                anyhow::ensure!(
+                    layout_ids.contains(&zoomed),
+                    "snapshot zoomed pane does not exist in tab {ti}"
+                );
+            }
 
             // Soft warning for pathological scrollback payloads (#69 AC).
             // Don't fail — the user opted into persistence.
             for pane in &tab.panes {
                 if let Some(blob) = &pane.scrollback {
+                    blob.validate_bounds()?;
+                    total_decoded =
+                        total_decoded.saturating_add(u64::from(blob.bytes_uncompressed));
+                    anyhow::ensure!(
+                        total_decoded <= SCROLLBACK_DECODE_MAX_BYTES,
+                        "snapshot exceeds total decoded scrollback byte limit"
+                    );
                     if blob.bytes_uncompressed > SCROLLBACK_SOFT_WARN_BYTES {
                         eprintln!(
                             "ezpn: snapshot tab {ti} pane {pid} scrollback is \
@@ -356,6 +471,9 @@ fn snapshot_panes(
         .into_iter()
         .map(|id| {
             let pane = panes.get(&id);
+            if pane.is_some_and(Pane::snapshot_sensitive) {
+                return plain_shell_snapshot(id);
+            }
             PaneSnapshot {
                 id,
                 launch: pane
@@ -373,6 +491,56 @@ fn snapshot_panes(
             }
         })
         .collect()
+}
+
+fn plain_shell_snapshot(id: usize) -> PaneSnapshot {
+    PaneSnapshot {
+        id,
+        launch: PaneLaunch::Shell,
+        name: None,
+        cwd: None,
+        env: HashMap::new(),
+        restart: RestartPolicy::Never,
+        shell: None,
+        scrollback: None,
+        cursor_pos: None,
+    }
+}
+
+/// Attach full history plus the live viewport to one tab's snapshot. The
+/// caller supplies this tab's persistence overrides; pane IDs are tab-local.
+/// Sensitive panes are never captured, even when persistence was requested.
+pub fn capture_tab_scrollback(
+    tab: &mut TabSnapshot,
+    panes: &mut HashMap<usize, Pane>,
+    persist_default: bool,
+    overrides: &HashMap<usize, bool>,
+) -> anyhow::Result<()> {
+    for saved in &mut tab.panes {
+        saved.scrollback = None;
+        saved.cursor_pos = None;
+        let Some(pane) = panes.get_mut(&saved.id) else {
+            continue;
+        };
+        if pane.snapshot_sensitive() {
+            *saved = plain_shell_snapshot(saved.id);
+            continue;
+        }
+        if !overrides.get(&saved.id).copied().unwrap_or(persist_default) {
+            continue;
+        }
+        let rows: Vec<RowSnapshot> = pane
+            .dump_text(true)
+            .into_iter()
+            .map(|text| RowSnapshot {
+                text,
+                attrs: Vec::new(),
+            })
+            .collect();
+        saved.scrollback = Some(ScrollbackBlob::encode_bincode_gz(&rows)?);
+        saved.cursor_pos = Some(pane.screen().cursor_position());
+    }
+    Ok(())
 }
 
 /// Migrate a v1 snapshot to v2 format.
@@ -437,17 +605,30 @@ pub fn load_snapshot(path: impl AsRef<Path>) -> anyhow::Result<WorkspaceSnapshot
 /// report whether it actually changed anything (the idempotency AC).
 pub fn load_snapshot_with_meta(path: impl AsRef<Path>) -> anyhow::Result<(WorkspaceSnapshot, u32)> {
     validate_path(path.as_ref())?;
-    let content = std::fs::read_to_string(path)?;
+    let content = read_snapshot_file(path.as_ref())?;
     let (snapshot, on_disk) = parse_snapshot_str(&content)?;
     snapshot.validate()?;
+    // Validate every history blob before any caller can start snapshot commands.
+    for pane in snapshot.tabs.iter().flat_map(|tab| &tab.panes) {
+        if let Some(blob) = &pane.scrollback {
+            blob.decode()?;
+        }
+    }
     Ok((snapshot, on_disk))
 }
 
 /// Pure JSON-to-snapshot decoder, factored out so the CLI and IPC paths
 /// share one migration ladder. Returns `(migrated_snapshot, on_disk_version)`.
-fn parse_snapshot_str(content: &str) -> anyhow::Result<(WorkspaceSnapshot, u32)> {
+pub(crate) fn parse_snapshot_str(content: &str) -> anyhow::Result<(WorkspaceSnapshot, u32)> {
+    anyhow::ensure!(
+        content.len() as u64 <= SNAPSHOT_MAX_BYTES,
+        "snapshot exceeds 64 MiB byte limit"
+    );
     let raw: serde_json::Value = serde_json::from_str(content)?;
-    let version = raw["version"].as_u64().unwrap_or(0) as u32;
+    let version = raw["version"]
+        .as_u64()
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(0);
     if !is_supported_version(version) {
         anyhow::bail!(
             "unsupported snapshot version: {found} (current = {current}, \
@@ -489,14 +670,42 @@ pub fn save_snapshot(path: impl AsRef<Path>, snapshot: &WorkspaceSnapshot) -> an
 /// Save without `validate_path`. Used by auto-save where the path is managed
 /// by ezpn itself (e.g. `~/.local/share/ezpn/sessions/`).
 fn save_snapshot_raw(path: impl AsRef<Path>, snapshot: &WorkspaceSnapshot) -> anyhow::Result<()> {
+    snapshot.validate()?;
     let json = serde_json::to_string_pretty(snapshot)?;
+    anyhow::ensure!(
+        json.len() as u64 <= SNAPSHOT_MAX_BYTES,
+        "snapshot exceeds 64 MiB byte limit"
+    );
 
     // Atomic write: write to temp file, then rename
     let path = path.as_ref();
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    std::fs::write(&tmp, &json)?;
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        // Clean up temp file on rename failure
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let (tmp, mut file) = loop {
+        let tmp = path.with_extension(format!(
+            "tmp.{}.{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        match options.open(&tmp) {
+            Ok(file) => break (tmp, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    };
+    let result = (|| -> std::io::Result<()> {
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if let Err(e) = result {
         let _ = std::fs::remove_file(&tmp);
         return Err(e.into());
     }
@@ -505,45 +714,56 @@ fn save_snapshot_raw(path: impl AsRef<Path>, snapshot: &WorkspaceSnapshot) -> an
 
 /// Auto-save directory for session snapshots.
 pub fn auto_save_dir() -> Option<std::path::PathBuf> {
-    let dir = if let Ok(data_dir) = std::env::var("XDG_DATA_HOME") {
-        std::path::PathBuf::from(data_dir)
-            .join("ezpn")
-            .join("sessions")
-    } else if let Ok(home) = std::env::var("HOME") {
-        std::path::PathBuf::from(home)
-            .join(".local")
+    let dir = auto_save_base_path()?;
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+fn auto_save_base_path() -> Option<std::path::PathBuf> {
+    let dir = if let Some(data_dir) = std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+    {
+        data_dir.join("ezpn").join("sessions")
+    } else if let Some(home) = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+    {
+        home.join(".local")
             .join("share")
             .join("ezpn")
             .join("sessions")
     } else {
         return None;
     };
-    std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
 }
 
 /// Auto-save a snapshot for the given session name.
 /// Uses `save_snapshot_raw` to bypass `validate_path` since the auto-save
 /// directory is managed by ezpn itself (e.g. `~/.local/share/ezpn/sessions/`).
-pub fn auto_save(session_name: &str, snapshot: &WorkspaceSnapshot) {
-    if let Some(dir) = auto_save_dir() {
-        let path = dir.join(format!("{}.json", session_name));
-        if let Err(e) = save_snapshot_raw(&path, snapshot) {
-            eprintln!("ezpn: auto-save failed: {e}");
-        }
-    }
+pub fn auto_save(session_name: &str, snapshot: &WorkspaceSnapshot) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        valid_session_component(session_name),
+        "invalid auto-save session name"
+    );
+    let dir = auto_save_dir().ok_or_else(|| anyhow::anyhow!("auto-save directory unavailable"))?;
+    save_snapshot_raw(dir.join(format!("{}.json", session_name)), snapshot)
 }
 
 /// Load an auto-saved snapshot for the given session name.
 #[allow(dead_code)] // Public API for future session resume feature
 pub fn auto_load(session_name: &str) -> Option<WorkspaceSnapshot> {
+    if !valid_session_component(session_name) {
+        return None;
+    }
     let dir = auto_save_dir()?;
     let path = dir.join(format!("{}.json", session_name));
     if !path.exists() {
         return None;
     }
     // For auto-load, we skip validate_path since it's our own managed directory
-    let content = std::fs::read_to_string(&path).ok()?;
+    let content = read_snapshot_file(&path).ok()?;
     let (snapshot, _on_disk) = parse_snapshot_str(&content).ok()?;
     snapshot.validate().ok()?;
     Some(snapshot)
@@ -552,8 +772,15 @@ pub fn auto_load(session_name: &str) -> Option<WorkspaceSnapshot> {
 /// Reject paths that could be dangerous when invoked via IPC.
 fn validate_path(path: &Path) -> anyhow::Result<()> {
     let s = path.to_string_lossy();
-    if s.contains("..") {
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
         anyhow::bail!("path traversal (..) not allowed: {}", s);
+    }
+
+    if auto_save_base_path().is_some_and(|dir| is_managed_snapshot_path(path, &dir)) {
+        return Ok(());
     }
 
     for component in path.components() {
@@ -568,10 +795,333 @@ fn validate_path(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn is_managed_snapshot_path(path: &Path, managed_dir: &Path) -> bool {
+    if path.extension().and_then(|s| s.to_str()) != Some("json") {
+        return false;
+    }
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let (Ok(parent), Ok(managed)) = (parent.canonicalize(), managed_dir.canonicalize()) else {
+        return false;
+    };
+    if parent != managed {
+        return false;
+    }
+    let Ok(meta) = std::fs::metadata(&managed) else {
+        return false;
+    };
+    if !meta.is_dir() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // Only ezpn's actual user-owned, non-shared session directory gets
+        // the exception. A textual "ezpn" substring is not a trust boundary.
+        meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o022 == 0
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+fn valid_session_component(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name
+            .chars()
+            .any(|c| c == '/' || c == '\\' || c.is_control())
+}
+
+fn read_snapshot_file(path: &Path) -> anyhow::Result<String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    anyhow::ensure!(
+        file.metadata()?.is_file(),
+        "snapshot must be a regular file"
+    );
+    let mut content = String::new();
+    file.take(SNAPSHOT_MAX_BYTES + 1)
+        .read_to_string(&mut content)?;
+    anyhow::ensure!(
+        content.len() as u64 <= SNAPSHOT_MAX_BYTES,
+        "snapshot exceeds 64 MiB byte limit"
+    );
+    Ok(content)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::layout::Layout;
+
+    #[test]
+    fn reliability_duplicate_snapshot_ids_rejected() {
+        let mut snapshot = make_v2_snapshot();
+        let duplicate = snapshot.tabs[0].panes[0].clone();
+        snapshot.tabs[0].panes.push(duplicate);
+        assert!(snapshot.validate().is_err());
+    }
+
+    #[test]
+    fn reliability_invalid_zoom_and_next_id_rejected() {
+        let mut snapshot = make_v2_snapshot();
+        snapshot.tabs[0].zoomed_pane = Some(99);
+        assert!(snapshot.validate().is_err());
+        snapshot.tabs[0].zoomed_pane = None;
+        snapshot.tabs[0].layout.next_id = 0;
+        assert!(snapshot.validate().is_err());
+    }
+
+    #[test]
+    fn reliability_scrollback_metadata_matches_decoded_payload() {
+        let mut blob = ScrollbackBlob::encode_bincode_gz(&[RowSnapshot::default()]).unwrap();
+        blob.bytes_uncompressed = 8;
+        assert!(blob.decode().is_err());
+        let mut blob = ScrollbackBlob::encode_bincode_gz(&[RowSnapshot::default()]).unwrap();
+        blob.rows = 0;
+        assert!(blob.decode().is_err());
+    }
+
+    #[test]
+    fn reliability_future_scrollback_encoding_skips_only_history() {
+        let mut json = serde_json::to_value(make_v2_snapshot()).unwrap();
+        json["tabs"][0]["panes"][0]["scrollback"] = serde_json::json!({
+            "encoding": "future-codec", "rows": 1, "bytes_uncompressed": 1, "payload": [0]
+        });
+        let (snapshot, _) = parse_snapshot_str(&json.to_string()).unwrap();
+        assert!(snapshot.tabs[0].panes[0]
+            .scrollback
+            .as_ref()
+            .unwrap()
+            .decode()
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn reliability_version_does_not_wrap_to_supported_version() {
+        let json = serde_json::json!({
+            "version": 4294967297_u64,
+            "layout": serde_json::to_value(Layout::from_grid(1, 1)).unwrap(),
+            "panes": [{"id": 0, "launch": "shell"}]
+        });
+        assert!(parse_snapshot_str(&json.to_string()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reliability_snapshot_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.json");
+        std::fs::write(&path, "previous").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        save_snapshot_raw(&path, &make_v2_snapshot()).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn reliability_path_allows_literal_double_dot_filename() {
+        assert!(validate_path(Path::new("my..session.json")).is_ok());
+        assert!(validate_path(Path::new("../session.json")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reliability_sensitive_panes_omit_all_snapshot_metadata() {
+        let env = [("TOKEN".into(), "private-env".into())].into();
+        let mut pane = Pane::with_full_config(
+            "/bin/sh",
+            PaneLaunch::Command("printf private-command".into()),
+            20,
+            4,
+            100,
+            Some(Path::new("/tmp")),
+            &env,
+        )
+        .unwrap();
+        pane.set_snapshot_sensitive(true);
+        pane.set_name(Some("private-title".into()));
+        pane.set_initial_shell(Some("private-shell".into()));
+        let panes = [(0, pane)].into();
+        let snapshots = snapshot_panes(
+            &Layout::from_grid(1, 1),
+            &panes,
+            &[(0, RestartPolicy::Always)].into(),
+        );
+        let ps = &snapshots[0];
+        assert_eq!(ps.launch, PaneLaunch::Shell);
+        assert_eq!(ps.restart, RestartPolicy::Never);
+        assert!(ps.env.is_empty());
+        assert!(ps.name.is_none() && ps.cwd.is_none() && ps.shell.is_none());
+        assert!(ps.scrollback.is_none() && ps.cursor_pos.is_none());
+        assert!(!serde_json::to_string(ps).unwrap().contains("private-"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reliability_capture_reads_history_not_only_current_view() {
+        let mut pane = Pane::with_full_config(
+            "/bin/sh",
+            PaneLaunch::Command(
+                "i=0; while [ $i -lt 20 ]; do printf 'row%02d\\n' $i; i=$((i+1)); done".into(),
+            ),
+            20,
+            4,
+            100,
+            None,
+            &HashMap::new(),
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            pane.read_output();
+            if pane.screen().contents().contains("row19") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "PTY output did not arrive"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!pane.screen().contents().contains("row00"));
+        pane.scroll_up(3);
+        pane.sync_scrollback();
+        let view = pane.screen().scrollback();
+        let mut panes = [(0, pane)].into();
+        let layout = Layout::from_grid(1, 1);
+        let mut tab = TabSnapshot {
+            name: "1".into(),
+            layout: layout.clone(),
+            active_pane: 0,
+            zoomed_pane: None,
+            broadcast: false,
+            panes: snapshot_panes(&layout, &panes, &HashMap::new()),
+        };
+        capture_tab_scrollback(&mut tab, &mut panes, true, &HashMap::new()).unwrap();
+        let rows = tab.panes[0]
+            .scrollback
+            .as_ref()
+            .unwrap()
+            .decode()
+            .unwrap()
+            .unwrap();
+        for i in 0..20 {
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row.text.trim() == format!("row{i:02}"))
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(panes[&0].screen().scrollback(), view);
+        panes.get_mut(&0).unwrap().set_snapshot_sensitive(true);
+        capture_tab_scrollback(&mut tab, &mut panes, true, &[(0, true)].into()).unwrap();
+        assert!(tab.panes[0].scrollback.is_none() && tab.panes[0].cursor_pos.is_none());
+        assert_eq!(tab.panes[0].launch, PaneLaunch::Shell);
+        assert!(tab.panes[0].env.is_empty());
+        panes.get_mut(&0).unwrap().kill();
+    }
+
+    #[test]
+    fn reliability_gzip_growth_and_bincode_lengths_are_bounded() {
+        let mut blob = ScrollbackBlob::encode_bincode_gz(&[RowSnapshot {
+            text: "a".repeat(2 * 1024 * 1024),
+            attrs: vec![],
+        }])
+        .unwrap();
+        blob.bytes_uncompressed = 32;
+        assert!(blob.decode().is_err());
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&1u64.to_le_bytes());
+        raw.extend_from_slice(&u64::MAX.to_le_bytes());
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&raw).unwrap();
+        let blob = ScrollbackBlob {
+            encoding: ScrollbackEncoding::BincodeGz,
+            rows: 1,
+            bytes_uncompressed: raw.len() as u32,
+            payload: encoder.finish().unwrap(),
+        };
+        assert!(blob.decode().is_err());
+    }
+
+    #[test]
+    fn reliability_snapshot_rejects_bad_ratios_and_resource_claims() {
+        let mut snapshot = make_v2_snapshot();
+        if let LayoutNode::Split { ratio, .. } = &mut snapshot.tabs[0].layout.root {
+            *ratio = f32::NAN;
+        }
+        assert!(snapshot.validate().is_err());
+        let mut snapshot = make_v2_snapshot();
+        snapshot.scrollback = usize::MAX;
+        assert!(snapshot.validate().is_err());
+        let mut blob = ScrollbackBlob::encode_bincode_gz(&[]).unwrap();
+        blob.bytes_uncompressed = u32::MAX;
+        assert!(blob.decode().is_err());
+    }
+
+    #[test]
+    fn reliability_auto_save_name_is_one_component() {
+        for name in ["", ".", "..", "../escape", "/absolute", "a/b", "a\\b"] {
+            assert!(!valid_session_component(name));
+        }
+        assert!(valid_session_component("work-project"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reliability_managed_auto_save_path_can_be_restored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".local/share/ezpn/sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(is_managed_snapshot_path(&dir.join("work.json"), &dir));
+        let other = tmp.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        assert!(!is_managed_snapshot_path(&other.join("work.json"), &dir));
+        assert!(!is_managed_snapshot_path(&dir.join(".bashrc"), &dir));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{symlink, PermissionsExt};
+            let alias = tmp.path().join("sessions-alias");
+            symlink(&dir, &alias).unwrap();
+            assert!(is_managed_snapshot_path(&alias.join("work.json"), &dir));
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+            assert!(!is_managed_snapshot_path(&dir.join("work.json"), &dir));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reliability_snapshot_temp_symlink_cannot_overwrite_target() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.json");
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "do not change").unwrap();
+        symlink(
+            &victim,
+            path.with_extension(format!("tmp.{}", std::process::id())),
+        )
+        .unwrap();
+        save_snapshot_raw(&path, &make_v2_snapshot()).unwrap();
+        assert_eq!(std::fs::read_to_string(victim).unwrap(), "do not change");
+    }
 
     fn make_v2_snapshot() -> WorkspaceSnapshot {
         WorkspaceSnapshot {

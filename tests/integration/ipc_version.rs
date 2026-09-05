@@ -1,21 +1,25 @@
-//! ipc_version — placeholder.
-//!
-//! Coverage spec: clients and servers should exchange a version handshake on
-//! attach, and a mismatch should produce a structured rejection rather than
-//! a silent protocol error. The version handshake itself is tracked by
-//! issue #57.
-//!
-//! Once #57 lands, replace this placeholder with a real test that:
-//!   1. Spawns a daemon advertising protocol version `N`.
-//!   2. Connects via raw `UnixStream`, sends a forged handshake with
-//!      version `N + 1`.
-//!   3. Asserts the daemon responds with a versioned rejection frame and
-//!      closes the socket cleanly (no panic, no resource leak).
-//!
-//! GATED: depends on #57 AND on `EZPN_TEST_SOCKET_DIR` (#62 follow-up commit).
+//! Reject an incompatible client using the running daemon, not a codec mock.
+use crate::common::*;
+use std::io::Read;
 
 #[test]
-#[ignore = "depends on #57 (IPC version handshake) — not yet merged; placeholder per #62"]
 fn version_mismatch_is_rejected() {
-    // Intentionally empty. See module docs for the planned shape.
+    let env = TestEnv::new();
+    let mut daemon = spawn_daemon(&env, "version");
+    let mut stream = connect(&daemon);
+    let version = hello(&mut stream, Some(u16::MAX as u64));
+    let (tag, payload) = read_msg(&mut stream).expect("version rejection frame");
+    assert_eq!(tag, 0x12, "expected S_INCOMPAT");
+    let notice: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+    assert_eq!(
+        notice["server_proto"],
+        format!("{}.{}", version["proto_major"], version["proto_minor"])
+    );
+    assert!(notice["message"]
+        .as_str()
+        .unwrap()
+        .contains("cannot attach"));
+    assert_eq!(stream.read(&mut [0]).expect("EOF after rejection"), 0);
+    daemon.assert_alive();
+    assert!(ls(&env).contains("version"));
 }

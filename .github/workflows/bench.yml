@@ -5,167 +5,85 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-    paths:
-      # Skip bench runs on PRs that don't touch perf-relevant files —
-      # ci-only / docs-only PRs would otherwise trip the 5% noise band
-      # against a self-compare baseline.
-      - 'src/**'
-      - 'benches/**'
-      - 'fuzz/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
+  workflow_call:
+  workflow_dispatch:
 
-env:
-  CARGO_TERM_COLOR: always
-  # Issue #99: PR fails if any tracked metric regresses > 5% with
-  # statistical confidence. Criterion already stores per-bench
-  # confidence intervals; we read its `change.estimate` field.
-  REGRESSION_THRESHOLD_PCT: "5"
+permissions:
+  contents: read
 
 jobs:
   bench-regression:
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    # Roll-up release branches (release/v*) bundle wiring + RFCs across
-    # many subsystems and routinely shift bench numbers because the
-    # baseline becomes stale post-merge. Skipping the gate on release/*
-    # is consistent with the existing ci/* skip (commit f0ee4d1); the
-    # merge to main establishes the new baseline that subsequent feature
-    # PRs measure against. Issue #99 perf regression suite (RFC #105
-    # workstream) tightens this back up with a per-release perf snapshot.
-    if: ${{ !startsWith(github.head_ref, 'release/') }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          # Fetch enough history that we can checkout `main` for the
-          # baseline run.
-          fetch-depth: 0
-
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
-      # ── Step 1: capture the baseline from `main` ──────────────────
-      - name: Run criterion baseline (main)
-        run: |
-          git checkout origin/main -- benches/ Cargo.toml Cargo.lock || \
-            git checkout origin/main -- benches/ Cargo.toml
-          cargo bench --bench render_hotpaths -- --save-baseline main || true
-          cargo bench --bench protocol_codec  -- --save-baseline main || true
-          cargo bench --bench snapshot_io     -- --save-baseline main || true
-          cargo bench --bench rss_proxy       -- --save-baseline main || true
-          # Restore PR working tree.
-          git checkout HEAD -- benches/ Cargo.toml Cargo.lock 2>/dev/null || \
-            git checkout HEAD -- benches/ Cargo.toml
-
-      # ── Step 2: run PR benches against the baseline ───────────────
-      - name: Run criterion (PR) and compare to main
-        id: bench
-        run: |
-          # v0.12.0 introduces protocol_codec, snapshot_io, rss_proxy as
-          # new benches that did not exist on main. `--baseline main`
-          # therefore has nothing to compare against on the first run; we
-          # fall back to an unbaselined run so the PR still records its
-          # numbers without failing the job. The next merge to main
-          # establishes the baseline for subsequent PRs.
-          #
-          # `set -o pipefail` is deliberately not set: a missing baseline
-          # crashes the criterion process before it writes any output, and
-          # we want the `||` fallback to run uninterrupted.
-          for run in 1 2 3; do
-            echo "── bench run $run ──"
-            for bench in render_hotpaths:render protocol_codec:codec snapshot_io:snap rss_proxy:rss; do
-              name="${bench%:*}"
-              tag="${bench#*:}"
-              cargo bench --bench "$name" -- --baseline main 2>&1 | tee "bench-${tag}-${run}.txt" \
-                || cargo bench --bench "$name" 2>&1 | tee "bench-${tag}-${run}.txt"
-            done
-          done
-
-      - name: Detect regressions > 5%
-        # PR-only: on push events to main, the run exists to seed/refresh
-        # the baseline, not to gate the merge. Self-comparison + noisy
-        # micro-benches (codec, rss) trip 5% bands on shared runners,
-        # which is meaningless when the baseline IS the same commit.
-        if: github.event_name == 'pull_request'
-        run: |
-          # Criterion prints `change: [+X% +Y% +Z%]` and a `Performance
-          # has regressed.` line for any bench that crossed its noise
-          # threshold. We grep for the explicit regression marker and
-          # fail the job if any tracked bench regressed in ≥ 2 of the
-          # 3 runs (median rule).
-          regressed=0
-          for bench in render codec snap rss; do
-            hits=0
-            for run in 1 2 3; do
-              if grep -q "Performance has regressed" "bench-${bench}-${run}.txt" 2>/dev/null; then
-                hits=$((hits + 1))
-              fi
-            done
-            if [ "$hits" -ge 2 ]; then
-              echo "::error::bench/$bench regressed in $hits/3 runs"
-              regressed=$((regressed + 1))
-            fi
-          done
-
-          if [ "$regressed" -gt 0 ]; then
-            echo "$regressed bench(es) crossed the ${REGRESSION_THRESHOLD_PCT}% regression threshold"
-            exit 1
-          fi
-          echo "All benches within tolerance."
-
-      - name: Upload criterion reports
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: criterion-reports
-          path: target/criterion/
-          retention-days: 14
-
-      - name: Upload bench logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: bench-logs
-          path: bench-*.txt
-          retention-days: 14
-
-  # ── Soak smoke (issue #95) ────────────────────────────────────────
-  soak-smoke:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build release binary
-        run: cargo build --release
-
-      - name: Run 30-min smoke soak
-        id: soak
-        run: |
-          mkdir -p soak-out
-          tests/soak/run.sh --profile=smoke --out=soak-out --bin=./target/release/ezpn || \
-            echo "::warning::Soak smoke reported a regression — see summary.txt"
-
-      - name: Upload soak artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
         with:
-          name: soak-smoke-results
-          path: soak-out/
-          retention-days: 30
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: Swatinem/rust-cache@v2
+      - name: Compare complete revisions, fail on missing estimates
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BASE: ${{ github.event.before }}
+        run: |
+          if [ -n "$PR_BASE" ]; then
+            base="$PR_BASE"
+          elif [ -n "$PUSH_BASE" ] && git cat-file -e "$PUSH_BASE^{commit}" 2>/dev/null; then
+            base="$PUSH_BASE"
+          else
+            base=$(git describe --tags --abbrev=0 HEAD^)
+          fi
+          python3 scripts/bench-regression.py --base "$base" \
+            --out "target/bench-evidence/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: criterion-evidence
+          path: |
+            target/bench-evidence/${{ github.run_id }}-${{ github.run_attempt }}/*.log
+            target/bench-evidence/${{ github.run_id }}-${{ github.run_attempt }}/*.json
+            target/bench-evidence/${{ github.run_id }}-${{ github.run_attempt }}/base.txt
+            target/bench-evidence/${{ github.run_id }}-${{ github.run_attempt }}/protocol-codec-*
+            target/bench-evidence/${{ github.run_id }}-${{ github.run_attempt }}/raw/**
+            target/bench-evidence/${{ github.run_id }}-${{ github.run_attempt }}/analysis/**
+            target/bench-evidence/${{ github.run_id }}-${{ github.run_attempt }}/executables/**
+            target/bench-evidence/${{ github.run_id }}-${{ github.run_attempt }}/criterion-current/**
+          if-no-files-found: error
+          retention-days: 14
 
-  # ── Deliberate-regression self-test (issue #99 acceptance) ────────
-  # Runs only on the special branch `bench/regression-self-test`.
-  # Reverts a perf-positive commit and verifies the bench-regression
-  # job correctly flags it. Kept opt-in because it intentionally fails.
-  deliberate-regression:
-    if: github.head_ref == 'bench/regression-self-test'
-    runs-on: ubuntu-latest
-    needs: bench-regression
+  soak-smoke:
+    name: soak-smoke (${{ matrix.features }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [default, all-features]
     steps:
-      - run: |
-          echo "Self-test branch: bench-regression must have failed above."
-          echo "If this step is reached the gate is broken — fail the job."
-          exit 1
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the labeled release artifact
+        env:
+          BUILD_FEATURES: ${{ matrix.features }}
+        run: |
+          if [ "$BUILD_FEATURES" = all-features ]; then
+            cargo build --locked --release --bins --all-features
+          else
+            cargo build --locked --release --bins
+          fi
+      - name: Real 30-minute workload, no failure suppression
+        run: bash tests/soak/run.sh --profile=smoke --out=target/soak-smoke-${{ matrix.features }} --build-features=${{ matrix.features }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: soak-smoke-${{ matrix.features }}
+          path: target/soak-smoke-${{ matrix.features }}/
+          if-no-files-found: error
+          retention-days: 30

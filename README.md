@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Terminal panes, instantly.</strong><br>
-  Zero-config terminal multiplexer with session persistence and tmux-compatible keys.
+  Mouse-friendly terminal multiplexer for macOS and Linux, with persistent sessions and familiar prefix keys.
 </p>
 
 <p align="center">
@@ -22,320 +22,193 @@
 
 ---
 
-## Why ezpn?
+## Start Working
 
-```bash
-$ ezpn                # split your terminal, instantly
-$ ezpn 2 3            # 2x3 grid of shells
-$ ezpn -l dev         # preset layout
+```sh
+cargo install ezpn --locked
+ezpn                 # two shells
+ezpn 2 3             # a 2-by-3 grid
+ezpn -S work         # create or reattach to a named session
 ```
 
-No config files, no setup, no learning curve. Sessions persist in the background — `Ctrl+B d` to detach, `ezpn a` to come back.
+Rust 1.88 or newer is required to build. [GitHub Releases](https://github.com/subinium/ezpn/releases)
+provide macOS and Linux binaries; use the accompanying checksums when available.
+ezpn is an executable terminal multiplexer, not an embeddable Rust GUI library.
 
-**In a project**, drop `.ezpn.toml` in your repo and run `ezpn` — everyone gets the same workspace:
+## Sessions and SSH
+
+```sh
+ezpn a work
+ezpn a work --shared
+ezpn a work --readonly
+ezpn ls
+ezpn kill work
+```
+
+Press `Ctrl+B`, then `d`, to detach only your client. Shell processes remain alive,
+including jobs in inactive tabs. Reattaching reconnects to those processes.
+Readonly viewers cannot type into the session or resize writable clients' workspace.
+
+Install ezpn on the remote host and make it available on its PATH:
+
+```sh
+ssh -t host 'ezpn -S work'
+ssh -t host 'ezpn a work'
+ssh -J bastion -t host 'ezpn a work'
+```
+
+SSH must allocate a PTY. A disconnected SSH client does not end the remote daemon.
+SSH encryption, authentication, host-key verification and forwarding remain OpenSSH's
+responsibility. Do not expose ezpn's local Unix sockets over an unauthenticated network.
+
+## Mouse and Keyboard
+
+| Interaction | Result |
+| --- | --- |
+| Click pane content | Focus the pane |
+| Drag a separator | Resize the split |
+| Title-bar split buttons | Split the selected pane |
+| Title-bar close button | Ask before closing |
+| Click a tab | Switch tabs |
+| Scroll | Scroll history, or forward to a mouse-aware application |
+| Drag text | Select and copy |
+| Shift + drag | Select ezpn text instead of sending mouse input to the application |
+| Double-click non-mouse application content | Toggle zoom |
+| F1 / F2 | Settings / equalize |
+| Alt + arrows | Navigate panes; configure Option as Meta on macOS |
+
+Application mouse clicks, motion, wheel and release events use the application's
+requested mouse encoding. Keys such as `Ctrl+D`, `Ctrl+E` and `Ctrl+W` go to the
+shell unless explicitly rebound. These no longer split panes or request shutdown.
+
+Prefix keys use `Ctrl+B`, followed by:
+
+| Key | Action |
+| --- | --- |
+| `%` / `"` | Split columns / rows |
+| `o` / arrows | Navigate panes |
+| `x` | Confirm pane close |
+| `z` | Toggle zoom |
+| `R` | Resize mode |
+| `Space` / `E` | Equalize |
+| `c` / `n` / `p` | New / next / previous tab |
+| `0`–`9` | Select tab by zero-based index |
+| `,` / `&` | Rename / confirm tab close |
+| `[` | Copy mode |
+| `:` | Command palette |
+| `r` | Reload global config |
+| `B` | Toggle broadcast input |
+| `d` | Detach this client |
+| `?` | Help |
+| `Ctrl+B` | Send the prefix key to the application |
+
+Copy mode supports vi navigation, `v`/`V` selection, `y` or Enter to copy,
+`/`/`?` search, `n`/`N` next/previous match, and `q`/Escape to exit.
+Supported common tmux bindings are not complete tmux command compatibility.
+
+## Layouts Without Losing Work
+
+```sh
+ezpn -l dev       # 7:3
+ezpn -l ide       # 7:3/1:1
+ezpn -l quad      # 2-by-2
+ezpn -l '7:3/5:5'
+ezpn -b none
+```
+
+Inside the command palette, `select-layout` rearranges existing processes.
+It refuses layouts with a different pane count; split or close panes explicitly.
+A failed split or snapshot load does not destroy the current workspace.
+
+## Trusted Project Workspaces
+
+Inspect repository commands before opting into startup:
 
 ```toml
+# .ezpn.toml
 [workspace]
-layout = "7:3/1:1"
+layout = "7:3"
 
 [[pane]]
-name = "editor"
-command = "nvim ."
+name = "shell"
+cwd = "."
 
 [[pane]]
-name = "server"
-command = "npm run dev"
+name = "worker"
+command = "printf 'ready\\n'; exec sh"
 restart = "on_failure"
-
-[[pane]]
-name = "tests"
-command = "npm test -- --watch"
-
-[[pane]]
-name = "logs"
-command = "tail -f logs/app.log"
 ```
 
-```bash
-$ ezpn   # reads .ezpn.toml, starts everything
+```sh
+ezpn init
+ezpn doctor
+ezpn --trust-project
 ```
 
-No tmuxinator. No YAML. Just a TOML file in your repo.
+`--trust-project` authorizes automatic `.ezpn.toml` / Procfile execution.
+Use an explicit grid, such as `ezpn 1 2`, to start plain shells without loading
+repository commands. `doctor` checks syntax without executing commands or resolving secrets.
 
-## Install
+Project environment interpolation supports environment/file/secret references.
+External values are never printed by diagnostics. Panes whose configuration reads
+external values are excluded from executable snapshot metadata and history:
+restoring those panes opens clean shells. This deliberately favors privacy over
+silently saving resolved credentials. See [configuration](docs/configuration.md)
+and [security](docs/security.md).
 
-```bash
-cargo install ezpn
-```
-
-<details>
-<summary>Build from source</summary>
-
-```bash
-git clone https://github.com/subinium/ezpn
-cd ezpn && cargo install --path .
-```
-
-</details>
-
-## Quick Start
-
-```bash
-ezpn                  # 2 panes (or load .ezpn.toml if present)
-ezpn 2 3              # 2x3 grid
-ezpn -l dev           # Layout preset (dev, monitor, quad, stack, trio...)
-ezpn -e 'cmd1' -e 'cmd2'   # Per-pane commands
-```
-
-### Sessions
-
-```bash
-Ctrl+B d               # Detach (session keeps running)
-ezpn a                 # Reattach to most recent session
-ezpn a myproject       # Reattach by name
-ezpn ls                # List active sessions
-ezpn kill myproject    # Kill a session
-```
-
-### Tabs
-
-```bash
-Ctrl+B c               # New tab
-Ctrl+B n / p           # Next / previous tab
-Ctrl+B 0-9             # Jump to tab
-```
-
-All tmux keys work — `Ctrl+B %` to split, `Ctrl+B x` to close, `Ctrl+B [` for copy mode.
-
-## Features
-
-|                         |                                                                            |
-| ----------------------- | -------------------------------------------------------------------------- |
-| **Zero config**         | Works out of the box. No rc files needed.                                  |
-| **Layout presets**      | `dev`, `ide`, `monitor`, `quad`, `stack`, `main`, `trio`                   |
-| **Session persistence** | Detach/attach like tmux. Background daemon keeps processes alive.          |
-| **Tabs**                | tmux-style windows with tab bar and mouse click switching.                 |
-| **Mouse-first**         | Click to focus, drag to resize, scroll for history, drag to select & copy. |
-| **Copy mode**           | Vi keys, visual selection, incremental search, OSC 52 clipboard.           |
-| **Command palette**     | `Ctrl+B :` with tmux-compatible commands.                                  |
-| **Broadcast mode**      | Type in all panes simultaneously.                                          |
-| **Project config**      | `.ezpn.toml` per project — layout, commands, env vars, auto-restart.       |
-| **Borderless mode**     | `ezpn -b none` for maximum screen space.                                   |
-| **Kitty keyboard**      | `Shift+Enter`, `Ctrl+Arrow`, and modified keys work correctly.             |
-| **CJK/Unicode**         | Proper width calculation for Korean, Chinese, Japanese, and emoji.         |
-
-## Layout Presets
-
-```bash
-ezpn -l dev       # 7:3 — main + side
-ezpn -l ide       # 7:3/1:1 — editor + sidebar + 2 bottom
-ezpn -l monitor   # 1:1:1 — 3 equal columns
-ezpn -l quad      # 2x2 grid
-ezpn -l stack     # 1/1/1 — 3 stacked rows
-ezpn -l main      # 6:4/1 — wide top pair + full bottom
-ezpn -l trio      # 1/1:1 — full top + 2 bottom
-```
-
-Custom ratios: `ezpn -l '7:3/5:5'`
-
-## Project Config
-
-Drop `.ezpn.toml` in your project root and run `ezpn`. That's it.
-
-**Per-pane options:** `command`, `cwd`, `name`, `env`, `restart` (`never`/`on_failure`/`always`), `shell`
-
-```bash
-ezpn init              # Generate .ezpn.toml template
-ezpn from Procfile     # Import from Procfile
-```
-
-<details>
-<summary>Global config</summary>
-
-`~/.config/ezpn/config.toml`:
+## Configuration and Recovery
 
 ```toml
-border = rounded        # single | rounded | heavy | double | none
-shell = /bin/zsh
+# ~/.config/ezpn/config.toml
+[global]
+border = "rounded"
 scrollback = 10000
-status_bar = true
-tab_bar = true
-prefix = b              # prefix key (Ctrl+<key>)
+persist_scrollback = false
+
+[keys]
+prefix = "b"
+
+[theme]
+name = "ezpn-dark"
 ```
 
-</details>
+Themes: `ezpn-dark`, `ezpn-light`, `nord`, `gruvbox-dark`, `solarized-dark`.
+User keymaps live in `[keymap.normal]`, `[keymap.prefix]`, and `[keymap.copy_mode]`.
+`Ctrl+B r` reloads supported fields from one validated file snapshot.
+Settings-panel persistence reports failures instead of claiming a successful save.
 
-## Keybindings
+Disk snapshots are different from a live detached session. `ezpn --restore FILE`
+**starts new processes**. Opt-in persisted history restores text, not a running
+editor, process memory, terminal graphics or exact alternate-screen state.
+Snapshot files have size/decompression limits and private permissions.
 
-**Direct shortcuts:**
+## Compatibility and Evidence
 
-| Key      | Action           |
-| -------- | ---------------- |
-| `Ctrl+D` | Split horizontal |
-| `Ctrl+E` | Split vertical   |
-| `Ctrl+N` | Next pane        |
-| `F2`     | Equalize sizes   |
+- Supported platform scope: macOS and Linux with a UTF-8 ANSI terminal and Unix PTYs.
+  Native Windows is not supported.
+- Child keyboard negotiation is distinct from host capabilities. Legacy applications
+  receive legacy sequences; supported Kitty enhancements are opt-in.
+- Clipboard writes from applications require the configured OSC 52 policy.
+  Over SSH, user copies prefer the attached terminal rather than the remote desktop clipboard.
+- Rendering is bounded and clips tiny viewports. See [terminal compatibility](docs/terminal-protocol.md)
+  for parser limits, supported sequences and untested GUI-emulator combinations.
+- `--features render-diff` enables an optional bounded ANSI delta path; unsupported
+  frames fall back to the original output. It is not a universal speed guarantee.
+- Real PTY tests cover attach/detach, resize, shared/readonly clients and interrupted
+  transports. A separate isolated loopback SSH test distinguishes actual SSH from simulation.
+- Long-duration soak tests and tmux/Zellij performance comparisons are separate evidence.
+  No claim is made that ezpn is always faster or uses less memory than either project.
 
-**Prefix mode** (`Ctrl+B`, then):
-
-| Key         | Action          |
-| ----------- | --------------- |
-| `%` / `"`   | Split H / V     |
-| `o` / Arrow | Navigate panes  |
-| `x`         | Close pane      |
-| `z`         | Zoom toggle     |
-| `R`         | Resize mode     |
-| `[`         | Copy mode       |
-| `B`         | Broadcast       |
-| `:`         | Command palette |
-| `d`         | Detach session  |
-| `?`         | Help            |
-
-<details>
-<summary>Full keybinding reference</summary>
-
-**Tabs:**
-
-| Key              | Action              |
-| ---------------- | ------------------- |
-| `Ctrl+B c`       | New tab             |
-| `Ctrl+B n` / `p` | Next / previous tab |
-| `Ctrl+B 0-9`     | Jump to tab         |
-| `Ctrl+B ,`       | Rename tab          |
-| `Ctrl+B &`       | Close tab           |
-
-**Panes:**
-
-| Key                  | Action                    |
-| -------------------- | ------------------------- |
-| `Ctrl+B {` / `}`     | Swap pane prev / next     |
-| `Ctrl+B E` / `Space` | Equalize                  |
-| `Ctrl+B s`           | Toggle status bar         |
-| `Ctrl+B q`           | Pane numbers + quick jump |
-
-**Copy mode** (`Ctrl+B [`):
-
-| Key                 | Action                             |
-| ------------------- | ---------------------------------- |
-| `h` `j` `k` `l`     | Move cursor                        |
-| `w` / `b`           | Next / previous word               |
-| `0` / `$` / `^`     | Line start / end / first non-blank |
-| `g` / `G`           | Top / bottom of scrollback         |
-| `Ctrl+U` / `Ctrl+D` | Half page up / down                |
-| `v`                 | Character selection                |
-| `V`                 | Line selection                     |
-| `y` / `Enter`       | Copy and exit                      |
-| `/` / `?`           | Search forward / backward          |
-| `n` / `N`           | Next / previous match              |
-| `q` / `Esc`         | Exit                               |
-
-**Mouse:**
-
-| Action       | Effect             |
-| ------------ | ------------------ |
-| Click pane   | Focus              |
-| Double-click | Zoom toggle        |
-| Click tab    | Switch tab         |
-| Click `[x]`  | Close pane         |
-| Drag border  | Resize             |
-| Drag text    | Select + copy      |
-| Scroll wheel | Scrollback history |
-
-**macOS note:** Alt+Arrow for directional navigation requires Option as Meta (iTerm2: Preferences > Profiles > Keys > `Esc+`).
-
-</details>
-
-<details>
-<summary>Command palette commands</summary>
-
-`Ctrl+B :` opens the command prompt. All tmux aliases are supported.
-
-```
-split / split-window         Split horizontally
-split -v                     Split vertically
-new-tab / new-window         Create new tab
-next-tab / prev-tab          Switch tabs
-close-pane / kill-pane       Close active pane
-close-tab / kill-window      Close current tab
-rename-tab <name>            Rename tab
-layout <spec>                Change layout
-equalize / even              Equalize pane sizes
-zoom                         Toggle zoom
-broadcast                    Toggle broadcast mode
-```
-
-</details>
-
-## Why ezpn vs. tmux
-
-Three claims, each measurable in an afternoon. Reproduce them on your
-own workload before you trust them.
-
-| Axis | tmux 3.4 | **ezpn 0.12** | How it was measured |
-| --- | --- | --- | --- |
-| RSS at idle (16 panes, 50 MB scrollback total, Linux 6.6) | ~180 MB | **~28 MB** | `ps -o rss= -p $(pgrep -d, tmux\|ezpn)` after `seq 1 16 | xargs -I{} ezpn-ctl split horizontal` and 1 minute of idle. |
-| `send-keys` reliability | fire-and-forget; no exit signal | **`--await-prompt` blocks until OSC 133 D** | `ezpn-ctl send-keys --await-prompt --timeout 60s -- 'cargo test\n'` — see [scripting.md](docs/scripting.md). |
-| DECSET 2026 (synchronised output) | passed through to host emulator | **intercepted + buffered**; single atomic frame to clients | `printf '\e[?2026h…\e[?2026l'` while attached from two clients — both see the same atomic redraw. |
-
-Beyond the numbers:
-
-- **Zero-config defaults.** Every tmux key works on a fresh install. No `.tmux.conf`, no plugin manager.
-- **TOML, not a YAML satellite.** `.ezpn.toml` lives in your repo; everyone gets the same workspace without `gem install tmuxinator`.
-- **OSC 52 paste-injection guard.** `cat hostile.log` cannot silently overwrite your clipboard ([clipboard.md](docs/clipboard.md), [security.md](docs/security.md)).
-- **Frozen wire protocol.** [`docs/protocol/v1.md`](docs/protocol/v1.md) commits to SemVer on the IPC surface — your scripts won't break across a minor bump.
-
-Trade-offs you should weigh before switching:
-
-- No plugin system. tmux's plugin ecosystem is 10+ years deep; ezpn's is empty.
-- No `pipe-pane`, no `command-alias`, no `if-shell`. Use `[[hooks]]` and the event bus instead.
-- Linux + macOS only. No Windows.
-
-Full migration walkthrough: [docs/migration-from-tmux.md](docs/migration-from-tmux.md).
-
-## ezpn vs. tmux vs. Zellij
-
-|                | tmux                      | Zellij        | **ezpn**                  |
-| -------------- | ------------------------- | ------------- | ------------------------- |
-| Setup          | `.tmux.conf` required     | KDL config    | **Zero config**           |
-| First use      | Empty screen              | Tutorial mode | **`ezpn`**                |
-| Sessions       | `tmux a`                  | `zellij a`    | **`ezpn a`**              |
-| Project config | tmuxinator (gem)          | —             | **`.ezpn.toml` built-in** |
-| Broadcast      | `:setw synchronize-panes` | —             | **`Ctrl+B B`**            |
-| Auto-restart   | —                         | —             | **`restart = "always"`**  |
-| Kitty keyboard | No                        | Yes           | **Yes**                   |
-| Plugin system  | —                         | WASM          | —                         |
-| Ecosystem      | Massive (30 years)        | Growing       | New                       |
-
-**Choose ezpn** if you want terminal splits that just work.
-**Choose tmux** if you need deep scripting and plugin ecosystem.
-**Choose Zellij** if you want a modern UI with WASM plugins.
-
-## CLI Reference
-
-```
-ezpn [ROWS COLS]         Start with grid layout
-ezpn -l <PRESET>         Start with layout preset
-ezpn -e <CMD> [-e ...]   Per-pane commands
-ezpn -S <NAME>           Named session
-ezpn -b <STYLE>          Border style (single/rounded/heavy/double/none)
-ezpn a [NAME]            Attach to session
-ezpn ls                  List sessions
-ezpn kill [NAME]         Kill session
-ezpn rename OLD NEW      Rename session
-ezpn init                Generate .ezpn.toml template
-ezpn from <FILE>         Import from Procfile
-```
+The [release audit](docs/audits/v0.14.0.md) records results and remaining limitations.
+The [preflight script](scripts/preflight.py) records PASS/FAIL/SKIP and real exit codes;
+failed tests are not hidden behind ignored placeholders.
 
 ## Documentation
 
-- [Getting started](docs/getting-started.md) — 5-minute tour
-- [Migration from tmux](docs/migration-from-tmux.md) — key-by-key, command-by-command
-- [Configuration](docs/configuration.md) — full `config.toml` + `.ezpn.toml` reference
-- [Scripting](docs/scripting.md) — `ezpn-ctl`, events, `ls --json`
-- [Clipboard](docs/clipboard.md) — OSC 52, fallback chain, SSH gotcha
-- [Terminal protocol](docs/terminal-protocol.md) — what ezpn passes through, intercepts, modifies
-- [Security](docs/security.md) — threat model and defaults
-- [IPC wire protocol v1](docs/protocol/v1.md) — frozen at v1.0
+[Getting started](docs/getting-started.md) · [Configuration](docs/configuration.md) ·
+[SSH and terminal protocols](docs/terminal-protocol.md) · [Clipboard](docs/clipboard.md) ·
+[Security](docs/security.md) · [Scripting limits](docs/scripting.md) ·
+[Contributing](CONTRIBUTING.md) · [Changelog](CHANGELOG.md)
 
 ## License
 

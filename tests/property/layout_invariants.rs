@@ -122,9 +122,9 @@ proptest! {
     fn equalize_is_idempotent(ops in ops_strategy()) {
         let mut layout = apply(Layout::from_grid(3, 3), &ops);
         layout.equalize();
-        let snapshot_ids = layout.pane_ids();
+        let snapshot = serde_json::to_value(&layout).unwrap();
         layout.equalize();
-        prop_assert_eq!(layout.pane_ids(), snapshot_ids);
+        prop_assert_eq!(serde_json::to_value(&layout).unwrap(), snapshot);
     }
 
     /// `pane_rects` returns one rect per leaf and every rect fits in the

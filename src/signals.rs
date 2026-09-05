@@ -25,8 +25,6 @@
 //! interim window between this commit and the parent's wiring commit.
 //! Remove it once `server.rs` calls `install()` and `dump_session_state`.
 
-#![allow(dead_code)]
-
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -74,13 +72,36 @@ pub struct SignalState {
 /// Returns the underlying [`std::io::Error`] if `signal-hook` cannot
 /// register the handlers (typically only happens if the process has
 /// already exhausted signal slots).
-pub fn install() -> std::io::Result<Arc<SignalState>> {
+pub struct SignalGuard {
+    state: Arc<SignalState>,
+    handle: signal_hook::iterator::Handle,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl std::ops::Deref for SignalGuard {
+    type Target = Arc<SignalState>;
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+impl Drop for SignalGuard {
+    fn drop(&mut self) {
+        self.handle.close();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+pub fn install() -> std::io::Result<SignalGuard> {
     let state = Arc::new(SignalState::default());
     let state_for_thread = Arc::clone(&state);
 
     let mut signals = Signals::new([SIGTERM, SIGHUP, SIGCHLD, SIGUSR1])?;
+    let handle = signals.handle();
 
-    thread::Builder::new()
+    let thread = thread::Builder::new()
         .name("ezpn-signals".to_string())
         .spawn(move || {
             for sig in signals.forever() {
@@ -99,7 +120,11 @@ pub fn install() -> std::io::Result<Arc<SignalState>> {
             }
         })?;
 
-    Ok(state)
+    Ok(SignalGuard {
+        state,
+        handle,
+        thread: Some(thread),
+    })
 }
 
 /// Write a JSON dump of `state` to
@@ -126,16 +151,27 @@ pub fn dump_session_state<T: Serialize>(state: &T) -> std::io::Result<PathBuf> {
             "neither XDG_STATE_HOME nor HOME is set",
         )
     })?;
-    std::fs::create_dir_all(&dir)?;
+    dump_to_dir(state, &dir)
+}
+
+fn dump_to_dir<T: Serialize>(state: &T, dir: &std::path::Path) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
 
     let pid = std::process::id();
     let unix_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_nanos())
         .unwrap_or(0);
 
     let path = dir.join(format!("dump-{pid}-{unix_secs}.json"));
-    let file = std::fs::File::create(&path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&path)?;
     serde_json::to_writer_pretty(file, state).map_err(std::io::Error::other)?;
 
     Ok(path)
@@ -206,13 +242,6 @@ mod tests {
         ));
         std::fs::create_dir_all(&tmp).expect("create tmp");
 
-        // NOTE: this test mutates process-global env. It is the only
-        // test in this module that touches XDG_STATE_HOME, so there is
-        // no intra-module race; cross-module env races are accepted as
-        // a known limitation of std::env::set_var on Rust 2021.
-        let prev = std::env::var("XDG_STATE_HOME").ok();
-        std::env::set_var("XDG_STATE_HOME", &tmp);
-
         #[derive(serde::Serialize)]
         struct Probe {
             kind: &'static str,
@@ -220,7 +249,7 @@ mod tests {
         }
         let probe = Probe { kind: "test", n: 7 };
 
-        let path = dump_session_state(&probe).expect("dump");
+        let path = dump_to_dir(&probe, &tmp.join("ezpn")).expect("dump");
         assert!(path.exists(), "dump file should exist at {path:?}");
         assert!(
             path.starts_with(tmp.join("ezpn")),
@@ -232,11 +261,6 @@ mod tests {
         assert!(body.contains("\"n\""));
         assert!(body.contains("7"));
 
-        // Restore env.
-        match prev {
-            Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-            None => std::env::remove_var("XDG_STATE_HOME"),
-        }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

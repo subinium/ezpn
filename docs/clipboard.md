@@ -1,177 +1,135 @@
-# Clipboard — OSC 52, fallback chain, SSH gotcha
+# Clipboard Behavior
 
-ezpn's clipboard story is built around **OSC 52**, the terminal
-protocol for copy/paste over the wire. This file covers the policy
-chain, the fallbacks ezpn falls back to when OSC 52 is blocked, and the
-SSH gotcha that bites everyone the first time.
+There are two distinct paths: **a user copying a selection** and **an application
+printing OSC 52**. Their authorization and fallback behavior are not identical.
+Both ultimately depend on the receiving terminal's clipboard settings when
+OSC 52 is used.
 
-## 1. What OSC 52 actually is
+## User-Initiated Copy
 
-OSC 52 is a terminal escape sequence the running program emits to set
-or read the user's system clipboard:
+`Ctrl+B [` enters copy mode. Default bindings include `v` for character
+selection, `V` for line selection, `y` or `Enter` to copy and exit, and
+`q` or `Esc` to exit without copying. Copy-mode keymaps can remap these actions.
 
-```
-ESC ] 52 ; c ; <base64-encoded text> ESC \
-```
+A copy-mode yank:
 
-The host emulator (the terminal app the user is staring at) is the only
-party that can actually touch the OS clipboard. OSC 52 lets a program
-running on a remote host send the bytes through the multiplexer and
-the SSH session and have them land on the user's local clipboard. No
-SSH agent forwarding, no `pbcopy`, no `xclip` — it just works as long
-as everyone on the chain forwards the sequence.
+1. Stores the text in the default internal buffer, subject to its size limit.
+2. Attempts the configured or automatically detected system copy command.
+3. Queues OSC 52 to attached clients if that command is unavailable or fails.
 
-## 2. ezpn's policy chain (#79)
+Mouse drag-selection currently queues OSC 52 directly. It does not use the
+copy-mode desktop-command fallback or populate the internal buffer store.
 
-Programs you run sit on the **trust** side of the boundary. Output you
-display from elsewhere (`cat hostile.log`, `curl …`, `tail` on a network
-log) sits on the **untrust** side. ezpn applies a per-pane policy chain
-to every OSC 52 set sequence:
+These explicit user copies do not pass back through the child-output OSC 52
+confirmation filter. Setting `clipboard.osc52_set = "deny"` blocks application
+requests, not the user's own copy action. A successful internal buffer write or
+a successfully queued OSC 52 envelope does not prove that a host clipboard changed.
 
-1. **Hard byte cap** — `clipboard.osc52_max_bytes` (default 1 MiB,
-   absolute ceiling 16 MiB). Larger payloads are dropped with a `warn`
-   log line. Defends against memory-exhaustion via crafted output.
-2. **Per-pane decision cache** — once the user answers the prompt for
-   a given pane, the answer (`Allowed` or `Denied`) is cached for the
-   pane's lifetime.
-3. **Configured policy** (`clipboard.osc52_set`):
-    * `allow` — pass through unchanged. **Documented as insecure.**
-    * `confirm` (default) — park the sequence, raise a status-bar
-      prompt. The first OSC 52 set per pane prompts; subsequent writes
-      use the cached decision.
-    * `deny` — drop silently, log at warn level.
+The internal store supports up to 100 named buffers, with a 16 MiB per-buffer
+payload cap and oldest-write eviction for new names at capacity. It is runtime
+state and is not restored from workspace snapshots. This storage API does not
+by itself imply that every tmux buffer command is implemented.
 
-Reads (`OSC 52 ; c ; ?`) default to `deny`. Read is the dominant
-attack vector — apps that legitimately read clipboard contents are
-vanishingly rare, while malware exfiltrating recent clipboard contents
-is not.
+## System Copy Commands and SSH
 
-### 2.1 Tuning
+A non-empty `clipboard.copy_command` array is executed as program plus arguments,
+without a shell. An empty array means automatic detection.
+
+For a local daemon, detection checks:
+
+| Environment | Command |
+|---|---|
+| `WAYLAND_DISPLAY` and an available tool | `wl-copy` |
+| `DISPLAY` and an available tool | `xclip -selection clipboard`, otherwise `xsel --clipboard --input` |
+| macOS with an available tool | `pbcopy` |
+
+Auto-detection chooses an available command; failure falls back to OSC 52, not
+to an endless retry of desktop tools. Commands have a bounded write/wait deadline
+of about two seconds on the supported Unix platforms, with failed children
+terminated and reaped. A successful command means the daemon-side tool succeeded,
+not necessarily that the attached user's local clipboard changed.
+
+If the daemon environment contains `SSH_CONNECTION` or `SSH_TTY`, automatic
+desktop clipboard detection is disabled. User yanks prefer OSC 52 over the SSH
+connection instead of silently running `pbcopy` or `xclip` on the remote host.
+A non-empty command override is an explicit opt-in to running that remote tool:
 
 ```toml
-# ~/.config/ezpn/config.toml
 [clipboard]
-osc52_set = "allow"           # disable confirm prompt — see warning below
-osc52_get = "deny"            # leave as default unless you really need read
-osc52_max_bytes = 524288      # 512 KiB
+copy_command = ["my-copy-tool", "--clipboard"]
 ```
 
-**`osc52_set = "allow"` reintroduces the v0.5 vulnerability** — anything
-you `cat` to the terminal can silently overwrite your clipboard. Use it
-only when you fully trust every byte your panes display, e.g. on a
-dedicated dev workstation that never `tail`s untrusted logs.
+Detection uses the daemon environment, not per-attachment origin. A daemon
+started locally and attached later through SSH is not automatically reclassified.
+There is no per-client desktop clipboard negotiation. The parsed
+`paste_command` setting is not a complete system-clipboard read workflow.
 
-### 2.2 Auditing
+## Application OSC 52 Policy
+
+Any process output, including text from an untrusted log, can contain OSC 52.
+ezpn cannot distinguish a trusted application request from the same bytes printed
+by another source.
+
+For child-emitted writes, the interceptor validates the selection field and
+base64-character payload, applies size limits, then resolves the policy:
+
+- Explicit `deny` or a cached denial blocks the write.
+- Cached approval allows subsequent writes unless configuration explicitly denies them.
+- Otherwise `allow`, `confirm`, or `deny` applies. The default is `confirm`.
+
+Confirmation is per pane, not per application or client. `y` approves the queued
+requests and caches approval; `n` drops them and caches denial. `Esc` defers by
+requeuing, so the prompt can appear again. A new process in a newly spawned pane
+gets fresh state; a terminal reset is not a way for output to clear a denial.
+
+The configured `osc52_max_bytes` defaults to 1 MiB and checks the encoded
+payload, not decoded clipboard text. The stream parser also caps the whole OSC
+payload at 1 MiB. A larger configured value does not bypass that parser bound.
+Application forwarding/confirmation queues are bounded to eight envelopes and
+2 MiB per queue; excess requests can be dropped.
+
+Use conservative defaults:
+
+```toml
+[clipboard]
+osc52_set = "confirm"
+osc52_get = "deny"
+osc52_max_bytes = 1048576
+```
+
+`osc52_set = "allow"` permits displayed process output to overwrite a receiving
+clipboard without an ezpn prompt. It is not required for ordinary user yanks.
+
+Reads (`OSC 52 ; c ; ?`) default to denial. Enabling `osc52_get = "allow"`
+can forward the query, but there is no complete origin-correlated host reply
+relay to the requesting child. Do not rely on clipboard reads working, especially
+with multiple clients, and do not enable them as a copy troubleshooting step.
+
+## Delivery and Troubleshooting
+
+OSC 52 requires the receiving host terminal and any outer multiplexer to permit
+clipboard writes. ezpn does not receive an acknowledgment that the clipboard was
+updated. There is no verified all-emulator support matrix here: emulator versions,
+preferences, remote environments, and nested multiplexers can change the result.
+
+This manual probe intentionally requests a clipboard write:
 
 ```sh
-ezpn-ctl config show | grep -A4 '\[clipboard\]'
+printf '\033]52;c;%s\007' "$(printf 'ezpn clipboard test' | base64 | tr -d '\r\n')"
 ```
 
-If `osc52_set = "allow"`, the v0.5 vulnerability is back; treat anything
-that prints to your terminal as trusted-equivalent.
+Run it inside a pane and answer the ezpn confirmation prompt if shown. Inspect
+the clipboard yourself. Compare the same probe outside ezpn, then outside SSH,
+to locate where behavior changes; consult the host terminal's and outer
+multiplexer's own settings. Avoid enabling unrestricted clipboard reads or
+weakening unrelated SSH security settings.
 
-## 3. Fallback chain
+Forwarded envelopes are sent to all currently attached clients, including
+readonly viewers. A viewer's input restriction is not a clipboard-output filter.
+Past clipboard writes are not restored when a new client attaches. See
+[multi-client OSC behavior](multi-client-osc.md).
 
-OSC 52 only works if every link in the chain forwards the sequence:
-
-```
-program → ezpn (multiplexer) → host emulator → OS clipboard
-```
-
-When a link drops the sequence, ezpn does NOT try to bridge the
-clipboard via `wl-copy` / `xclip` / `pbcopy` — that fallback is deferred
-to v0.16 (#80 family). Until then:
-
-| Failure mode                                 | Symptom                                  | Fix |
-|----------------------------------------------|------------------------------------------|-----|
-| `osc52_set = "deny"`                         | OSC 52 silently dropped at ezpn          | Re-enable `confirm` or `allow`. |
-| Host emulator doesn't speak OSC 52           | OSC 52 reaches host, then dropped        | Use a terminal that supports OSC 52 (kitty, WezTerm, iTerm2 ≥ 3.4, foot, Alacritty ≥ 0.13, Terminal.app — see §6). |
-| Nested multiplexer (tmux outside ezpn)       | Outer tmux drops OSC 52                  | Set `set-option -g set-clipboard on` in the outer tmux. |
-| SSH client strips control sequences          | Rare; some terminal pagers do it         | Run `LESS=-R` for `less`; check `tmux`'s `escape-time`. |
-
-ezpn's copy-mode `y` / `Enter` always emits OSC 52 — there is no
-"silently degrade to internal buffer" path. If the chain breaks, the
-user sees an empty clipboard, not stale data.
-
-## 4. SSH gotcha (the one that bites everyone)
-
-When you SSH into a remote host, run `ezpn` there, and copy from inside
-ezpn, **the OSC 52 envelope must travel back through the SSH session**
-to your local terminal. Three things have to be true:
-
-1. **Your local emulator must accept OSC 52**. iTerm2, kitty, WezTerm,
-   Terminal.app on macOS Ventura+, foot, and Alacritty 0.13+ do. macOS
-   built-in Terminal.app on Big Sur and earlier does not.
-2. **No outer multiplexer between your local emulator and ezpn must
-   strip OSC 52**. If you have local tmux around your SSH session, set
-   `set-option -g set-clipboard on` in `~/.tmux.conf`. (tmux 3.2+ has
-   `external` as the default; older tmux defaults to `external` too,
-   but check.) Zellij does not strip OSC 52 by default.
-3. **ezpn's policy must allow the write**. Default is `confirm` — the
-   first paste per pane raises a status-bar prompt. If you accept once,
-   subsequent writes from that pane go through silently until the pane
-   exits.
-
-### 4.1 Diagnosing a broken chain
-
-Run inside an ezpn pane on the remote host:
-
-```sh
-printf 'TEST\n' | base64 | xargs -I{} printf '\e]52;c;{}\e\\'
-```
-
-If your local clipboard now contains the literal string `TEST`, the
-chain works. If not, walk the chain backwards:
-
-* Run the same line **inside the SSH session but outside ezpn**. If
-  this works, ezpn is the broken link — check `osc52_set`.
-* Run the same line **outside the SSH session in your local terminal**.
-  If this works, your SSH path drops the sequence — check for nested
-  multiplexers or aggressive `escape-time` settings.
-* If even local doesn't work, your terminal emulator does not implement
-  OSC 52 set; nothing on the ezpn side can fix that.
-
-## 5. OSC 52 from copy mode
-
-`Ctrl+B [` enters copy mode. Default copy bindings (configurable in
-`[keymap.copy_mode]`):
-
-| Key             | Action                          |
-|-----------------|---------------------------------|
-| `v`             | Begin character selection.       |
-| `V`             | Begin line selection.            |
-| `y` / `Enter`   | Copy selection and exit copy mode (emits OSC 52). |
-| `q` / `Esc`     | Exit copy mode without copying.  |
-
-The OSC 52 emit goes through the **same policy chain** as program-emitted
-OSC 52 — if you set `osc52_set = "deny"`, your own copy-mode yanks will
-also be dropped. (This is intentional: the policy is a property of the
-multiplexer, not of the source.)
-
-## 6. Terminal emulator support matrix
-
-| Emulator           | OSC 52 set | OSC 52 read | Notes |
-|--------------------|------------|-------------|-------|
-| kitty              | yes        | yes         | Reliable; the reference impl. |
-| WezTerm            | yes        | yes         | Configurable per-window. |
-| iTerm2 ≥ 3.4       | yes        | opt-in      | "Allow clipboard access" toggle. |
-| Terminal.app (macOS Ventura+) | yes | no       | Read disabled. |
-| foot               | yes        | yes         | Wayland. |
-| Alacritty ≥ 0.13   | yes        | no          | Read intentionally absent. |
-| GNOME Terminal     | partial    | no          | OSC 52 set behind a config flag. |
-| xterm              | yes        | yes         | `XTerm*disallowedWindowOps` may block. |
-
-Emulators not listed: assume they don't support OSC 52 until proven
-otherwise.
-
-## 7. Multi-client behaviour
-
-When a clipboard set is allowed, the OSC 52 envelope is forwarded to
-**every** attached client. If you're attached from laptop A and laptop
-B simultaneously, both clipboards get the write. This matches user
-expectation: detaching from A and attaching from B should still leave
-the clipboard set on B's machine.
-
-A pending OSC 52 confirm prompt is **per-pane, not per-client** — the
-first client to answer the prompt makes the decision for everyone
-attached to that pane.
+The [release audit](audits/v0.14.0.md) distinguishes tested copy flows from known
+parser/selection limitations. In particular, wide-character soft-wrap metadata
+was an unresolved audit regression; neither a clipboard setting nor successful
+OSC delivery repairs incorrect text extraction.

@@ -49,6 +49,7 @@ pub(super) fn render_frame_to_buf(
     selection_chars: usize,
     zoomed_pane: Option<usize>,
     default_shell: &str,
+    session_name: &str,
     tab_names: &[(usize, String, bool)],
     flash_message: Option<&str>,
     palette_overlay: Option<&PaletteOverlayState<'_>>,
@@ -72,6 +73,7 @@ pub(super) fn render_frame_to_buf(
         selection_chars,
         zoomed_pane,
         default_shell,
+        session_name,
         tab_names,
         flash_message,
         palette_overlay,
@@ -80,6 +82,7 @@ pub(super) fn render_frame_to_buf(
     if let Some(state) = osc52_confirm {
         let palette = Some(&settings.resolved_palette);
         render::draw_osc52_confirm_overlay(buf, state.pane_id, state.byte_count, palette, tw, th)?;
+        queue!(buf, cursor::Hide)?;
     }
     Ok(())
 }
@@ -111,6 +114,7 @@ pub(super) fn render_frame_to_buf_with_palette(
     selection_chars: usize,
     zoomed_pane: Option<usize>,
     default_shell: &str,
+    session_name: &str,
     tab_names: &[(usize, String, bool)],
     flash_message: Option<&str>,
     palette_overlay: Option<&PaletteOverlayState<'_>>,
@@ -149,7 +153,7 @@ pub(super) fn render_frame_to_buf_with_palette(
                 &label,
                 settings.border_style,
                 tw,
-                th,
+                crate::bootstrap::terminal_render_height(th, settings),
                 settings.show_status_bar,
             )?;
         }
@@ -181,7 +185,7 @@ pub(super) fn render_frame_to_buf_with_palette(
             layout,
             active,
             settings.border_style,
-            settings.show_status_bar,
+            false, // status is composed once below, at the physical terminal row
             tw,
             th,
             dragging,
@@ -197,10 +201,7 @@ pub(super) fn render_frame_to_buf_with_palette(
             InputMode::RenameTab { .. } | InputMode::CommandPalette { .. }
         );
         // Status bar (skip if text input mode will draw over it)
-        if !is_text_input
-            && settings.show_status_bar
-            && (!mode_label.is_empty() || selection_chars > 0)
-        {
+        if !is_text_input && settings.show_status_bar {
             let pane_order = border_cache.pane_order();
             let active_idx = pane_order.iter().position(|&id| id == active).unwrap_or(0);
             let pane_name = panes.get(&active).and_then(|p| p.name()).unwrap_or("");
@@ -223,6 +224,24 @@ pub(super) fn render_frame_to_buf_with_palette(
         queue!(buf, terminal::EndSynchronizedUpdate)?;
     }
 
+    if settings.show_status_bar
+        && matches!(
+            mode,
+            InputMode::Normal | InputMode::Prefix { .. } | InputMode::CopyMode(_)
+        )
+    {
+        super::status_bar::draw(
+            buf,
+            &settings.config().status_bar,
+            session_name,
+            tab_names.len().max(1),
+            mode_label,
+            tw,
+            th,
+            &settings.resolved_palette,
+        )?;
+    }
+
     // Tab bar (only when multiple tabs exist and show_tab_bar is enabled)
     if tab_names.len() > 1 && settings.show_tab_bar {
         render::draw_tab_bar(buf, tw, th, tab_names, settings.show_status_bar, palette)?;
@@ -233,7 +252,7 @@ pub(super) fn render_frame_to_buf_with_palette(
         render::draw_help_overlay(buf, tw, th)?;
     }
     if matches!(mode, InputMode::PaneSelect) {
-        let inner = crate::make_inner(tw, th, settings.show_status_bar);
+        let inner = crate::bootstrap::terminal_content_area(tw, th, settings);
         render::draw_pane_numbers(buf, layout, &inner)?;
     }
 
@@ -264,8 +283,36 @@ pub(super) fn render_frame_to_buf_with_palette(
         }
     }
 
-    // Ensure cursor is hidden at the end — prevents blinking on status/tab bar
-    queue!(buf, cursor::Hide)?;
+    if settings.visible {
+        settings.render_overlay(buf, tw, th, broadcast)?;
+        queue!(buf, cursor::Hide)?;
+    } else if let Some(pane) = panes.get(&active) {
+        let zoom_rect = crate::bootstrap::terminal_content_area(tw, th, settings);
+        let rect = if zoomed_pane.is_some() {
+            Some(&zoom_rect)
+        } else {
+            border_cache.pane_rects().get(&active)
+        };
+        if let Some(rect) = rect {
+            match mode {
+                InputMode::CopyMode(state) => {
+                    render::draw_copy_mode_overlay(buf, pane.screen(), rect, state)?;
+                    if let crate::copy_mode::Phase::Search { forward, query } = &state.phase {
+                        render::draw_text_input(
+                            buf,
+                            tw,
+                            th,
+                            if *forward { "/" } else { "?" },
+                            query,
+                        )?;
+                        queue!(buf, cursor::Hide)?;
+                    }
+                }
+                InputMode::Normal => render::draw_pane_cursor(buf, pane, rect)?,
+                _ => queue!(buf, cursor::Hide)?,
+            }
+        }
+    }
 
     Ok(())
 }

@@ -212,12 +212,16 @@ impl StatusBarConfig {
     }
 }
 
-const SCROLLBACK_MAX: usize = 100_000;
+pub const SCROLLBACK_MAX: usize = 100_000;
 /// Default byte-budget for scrollback (#67): 32 MiB.
 pub const DEFAULT_SCROLLBACK_BYTES: usize = 32 * 1024 * 1024;
 /// Hard ceiling on `scrollback_bytes` to keep a misconfigured value from
 /// crashing the daemon: 4 GiB. Anything past this is silently clamped.
-pub const SCROLLBACK_BYTES_MAX: usize = 4 * 1024 * 1024 * 1024;
+pub const SCROLLBACK_BYTES_MAX: usize = if usize::BITS > 32 {
+    (4_u64 * 1024 * 1024 * 1024) as usize
+} else {
+    usize::MAX
+};
 const KNOWN_GLOBAL_KEYS: &[&str] = &[
     "border",
     "shell",
@@ -411,6 +415,30 @@ fn parse_hooks(contents: &str, source: Option<&Path>) -> Vec<Hook> {
     out
 }
 
+/// Checked parser for the exact bytes accepted by a reload transaction.
+pub(crate) fn parse_hooks_checked(contents: &str) -> Result<Vec<Hook>, String> {
+    if !has_toml_table_header(contents) {
+        return Ok(Vec::new());
+    }
+    let raw: RawConfig = toml::from_str(contents).map_err(|e| e.message().to_string())?;
+    raw.hooks
+        .into_iter()
+        .map(|hook| Hook::from_raw(hook).map_err(|e| e.to_string()))
+        .collect()
+}
+
+/// Keybindings from supplied content, without a second file read.
+pub(crate) fn parse_keymap_checked(contents: &str) -> Result<Keymap, String> {
+    let mut keymap = load_defaults();
+    if has_toml_table_header(contents) {
+        let raw: RawConfig = toml::from_str(contents).map_err(|e| e.message().to_string())?;
+        if let Some(table) = raw.keymap {
+            apply_keymap_section(&mut keymap, &table).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(keymap)
+}
+
 fn emit_hook_error(label: &str, index: usize, err: &HookParseError) {
     eprintln!("config: {label}: [[hooks]][{index}] rejected: {err} — dropping entry");
 }
@@ -481,6 +509,141 @@ fn parse_config(contents: &str, source: Option<&Path>) -> EzpnConfig {
     }
 
     config
+}
+
+/// Strict reload entry point. Validate the complete document before applying
+/// anything; the lenient startup parser otherwise masks errors with defaults.
+pub(crate) fn parse_config_checked(contents: &str, source: &Path) -> Result<EzpnConfig, String> {
+    if has_toml_table_header(contents) {
+        let raw: RawConfig = toml::from_str(contents).map_err(|e| e.message().to_string())?;
+        if let Some(tbl) = &raw.global {
+            let g: GlobalSection = tbl
+                .clone()
+                .try_into()
+                .map_err(|e: toml::de::Error| e.message().to_string())?;
+            if g.border
+                .as_deref()
+                .is_some_and(|v| BorderStyle::from_str(v).is_none())
+            {
+                return Err("invalid global.border".into());
+            }
+            if g.shell
+                .as_deref()
+                .is_some_and(|v| v.trim().is_empty() || v.contains('\0'))
+            {
+                return Err("global.shell must be a non-empty program".into());
+            }
+            if g.scrollback.is_some_and(|n| n < 0) {
+                return Err("global.scrollback must be non-negative".into());
+            }
+            if let Some(v) = &g.scrollback_bytes {
+                parse_scrollback_bytes(v)?;
+            }
+            if g.scrollback_eviction
+                .as_deref()
+                .is_some_and(|s| ScrollbackEviction::from_str(s).is_none())
+            {
+                return Err("invalid global.scrollback_eviction".into());
+            }
+        }
+        if let Some(tbl) = &raw.keys {
+            let keys: KeysSection = tbl
+                .clone()
+                .try_into()
+                .map_err(|e: toml::de::Error| e.message().to_string())?;
+            if keys
+                .prefix
+                .as_deref()
+                .is_some_and(|p| parse_prefix(p).is_none())
+            {
+                return Err("keys.prefix must be one ASCII letter".into());
+            }
+        }
+        if let Some(tbl) = &raw.clipboard {
+            let c: ClipboardSection = tbl
+                .clone()
+                .try_into()
+                .map_err(|e: toml::de::Error| e.message().to_string())?;
+            if c.osc52_max_bytes.is_some_and(|v| v <= 0) {
+                return Err("clipboard.osc52_max_bytes must be positive".into());
+            }
+            for argv in [c.copy_command, c.paste_command].into_iter().flatten() {
+                if !valid_command_argv(&argv) {
+                    return Err("clipboard command has an empty program or NUL byte".into());
+                }
+            }
+        }
+        if let Some(tbl) = &raw.theme {
+            if tbl.len() == 1 && tbl.contains_key("name") {
+                if tbl["name"].as_str().and_then(Theme::builtin).is_none() {
+                    return Err("unknown theme name".into());
+                }
+            } else {
+                let mut wrapped = toml::Table::new();
+                wrapped.insert("theme".into(), toml::Value::Table(tbl.clone()));
+                Theme::from_toml(&toml::to_string(&wrapped).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        if let Some(tbl) = &raw.status_bar {
+            for side in ["left", "right"] {
+                if let Some(v) = tbl.get(side) {
+                    value_as_string_array(v)?;
+                }
+            }
+            if let Some(segments) = tbl.get("segments") {
+                let segments = segments
+                    .as_table()
+                    .ok_or("status_bar.segments must be a table")?;
+                for (name, value) in segments {
+                    parse_segment(name, value)?;
+                }
+            }
+        }
+        for raw_hook in raw.hooks {
+            Hook::from_raw(raw_hook).map_err(|e| e.to_string())?;
+        }
+        if let Some(tbl) = raw.keymap {
+            apply_keymap_section(&mut load_defaults(), &tbl).map_err(|e| e.to_string())?;
+        }
+    } else {
+        // Legacy unquoted shell paths remain supported, but malformed known
+        // values must not reset a live session to defaults.
+        for line in contents
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.starts_with('#'))
+        {
+            let (key, value) = line
+                .split_once('=')
+                .ok_or("expected key = value in legacy config")?;
+            let value = strip_quotes(value.trim());
+            let valid = match key.trim() {
+                "border" => BorderStyle::from_str(value).is_some(),
+                "shell" => !value.trim().is_empty() && !value.contains('\0'),
+                "scrollback" => value.parse::<usize>().is_ok(),
+                "status_bar" | "tab_bar" => matches!(value, "true" | "false"),
+                "prefix" => parse_prefix(value).is_some(),
+                _ => true,
+            };
+            if !valid {
+                return Err(format!("invalid legacy config key {}", key.trim()));
+            }
+        }
+    }
+    Ok(parse_config(contents, Some(source)))
+}
+
+fn parse_prefix(value: &str) -> Option<char> {
+    if value.len() == 1 && value.as_bytes()[0].is_ascii_alphabetic() {
+        Some(value.as_bytes()[0].to_ascii_lowercase() as char)
+    } else {
+        None
+    }
+}
+
+fn valid_command_argv(argv: &[String]) -> bool {
+    !argv.first().is_some_and(|s| s.trim().is_empty()) && !argv.iter().any(|s| s.contains('\0'))
 }
 
 // ─── Modern TOML application ───────────────────────────────
@@ -697,10 +860,11 @@ fn parse_segment(name: &str, raw: &toml::Value) -> Result<StatusBarSegment, Stri
             SegmentKind::Literal(text.to_string())
         }
         "key_hints" => {
-            let mode = match tbl.get("mode").and_then(|v| v.as_str()) {
-                Some(s) => {
+            let mode = match tbl.get("mode") {
+                Some(toml::Value::String(s)) => {
                     HintMode::from_str(s).ok_or_else(|| format!("unknown key_hints mode '{s}'"))?
                 }
+                Some(_) => return Err("key_hints mode must be a string".into()),
                 None => HintMode::Auto,
             };
             let max_width = match tbl.get("max_width") {
@@ -736,6 +900,8 @@ fn parse_segment(name: &str, raw: &toml::Value) -> Result<StatusBarSegment, Stri
                         .to_string();
                     keys.push(KeyHint { key, label });
                 }
+            } else if tbl.contains_key("keys") {
+                return Err("key_hints keys must be an array".into());
             }
             SegmentKind::KeyHints {
                 mode,
@@ -768,7 +934,7 @@ fn apply_clipboard(config: &mut EzpnConfig, c: ClipboardSection, label: &str) {
         }
     }
     if let Some(argv) = c.copy_command {
-        if argv.iter().any(|s| s.is_empty()) {
+        if !valid_command_argv(&argv) {
             eprintln!("config: {label}: clipboard.copy_command contains an empty entry, ignoring");
         } else {
             // Empty array == auto-detect; non-empty == verbatim override
@@ -777,7 +943,7 @@ fn apply_clipboard(config: &mut EzpnConfig, c: ClipboardSection, label: &str) {
         }
     }
     if let Some(argv) = c.paste_command {
-        if argv.iter().any(|s| s.is_empty()) {
+        if !valid_command_argv(&argv) {
             eprintln!("config: {label}: clipboard.paste_command contains an empty entry, ignoring");
         } else {
             config.clipboard_paste_command = argv;
@@ -799,7 +965,7 @@ fn apply_global(config: &mut EzpnConfig, g: GlobalSection, label: &str) {
         if n < 0 {
             eprintln!("config: {label}: scrollback must be non-negative, ignoring");
         } else {
-            config.scrollback = (n as usize).min(SCROLLBACK_MAX);
+            config.scrollback = n.min(SCROLLBACK_MAX as i64) as usize;
         }
     }
     if let Some(v) = g.scrollback_bytes {
@@ -832,9 +998,8 @@ fn apply_global(config: &mut EzpnConfig, g: GlobalSection, label: &str) {
 
 fn apply_keys(config: &mut EzpnConfig, k: KeysSection, label: &str) {
     if let Some(p) = k.prefix {
-        let lower = p.to_lowercase();
-        match lower.chars().next() {
-            Some(c) if c.is_ascii_lowercase() => config.prefix_key = c,
+        match parse_prefix(&p) {
+            Some(c) => config.prefix_key = c,
             _ => eprintln!("config: {label}: keys.prefix must be an ASCII letter, ignoring"),
         }
     }
@@ -868,11 +1033,8 @@ fn apply_legacy_flat(config: &mut EzpnConfig, contents: &str, label: &str) {
             "status_bar" => config.show_status_bar = value == "true",
             "tab_bar" => config.show_tab_bar = value == "true",
             "prefix" => {
-                let lower = value.to_lowercase();
-                if let Some(c) = lower.chars().next() {
-                    if c.is_ascii_lowercase() {
-                        config.prefix_key = c;
-                    }
+                if let Some(c) = parse_prefix(value) {
+                    config.prefix_key = c;
                 }
             }
             _ => {
@@ -899,7 +1061,7 @@ pub fn parse_scrollback_bytes(value: &toml::Value) -> Result<usize, String> {
             if *n < 0 {
                 Err("must be non-negative".into())
             } else {
-                Ok(*n as usize)
+                Ok(usize::try_from(*n).unwrap_or(usize::MAX))
             }
         }
         toml::Value::String(s) => parse_byte_size_str(s),
@@ -955,7 +1117,7 @@ fn parse_byte_size_str(s: &str) -> Result<usize, String> {
         let v: u64 = num_part
             .parse()
             .map_err(|_| format!("cannot parse integer '{num_part}'"))?;
-        Ok(v.saturating_mul(multiplier) as usize)
+        Ok(usize::try_from(v.saturating_mul(multiplier)).unwrap_or(usize::MAX))
     }
 }
 
@@ -983,7 +1145,11 @@ fn warn_unknown(label: &str, key: &str, line: usize, col: usize, scope: &str) {
 fn has_toml_table_header(contents: &str) -> bool {
     contents.lines().any(|l| {
         let t = l.trim_start();
-        t.starts_with('[') && !t.starts_with("[[")
+        t.starts_with('[')
+    }) || toml::from_str::<toml::Table>(contents).is_ok_and(|tbl| {
+        tbl.iter().any(|(key, value)| {
+            KNOWN_TOP_LEVEL.contains(&key.as_str()) && (value.is_table() || value.is_array())
+        })
     })
 }
 
@@ -1088,6 +1254,33 @@ mod tests {
     /// only assert on the resulting `EzpnConfig`.
     fn parse(s: &str) -> EzpnConfig {
         parse_config(s, None)
+    }
+
+    #[test]
+    fn reliability_dotted_modern_schema_is_not_legacy() {
+        let config = parse("global.border = 'double'\nkeys.prefix = 'a'\n");
+        assert_eq!(config.border, BorderStyle::Double);
+        assert_eq!(config.prefix_key, 'a');
+    }
+
+    #[test]
+    fn reliability_checked_config_rejects_invalid_semantics() {
+        for src in [
+            "[global]\nborder = 'wrong'",
+            "[keys]\nprefix = 'abc'",
+            "[clipboard]\nosc52_max_bytes = 0",
+            "[theme]\nname = 'missing'",
+            "[status_bar.segments.hints]\ntype = 'key_hints'\nmode = 2",
+            "[status_bar.segments.hints]\ntype = 'key_hints'\nkeys = 'bad'",
+            "[[hooks]]\nevent = 'bad-event'\nexec = ['true']",
+            "[keymap.prefix]\nx = 'nonexistent-action'",
+            "status_bar = perhaps",
+        ] {
+            assert!(
+                parse_config_checked(src, Path::new("test.toml")).is_err(),
+                "accepted {src}"
+            );
+        }
     }
 
     // ─── strip_quotes ──────────────────────────────────────
@@ -1446,8 +1639,7 @@ mod tests {
         assert!(has_toml_table_header("[global]\nx = 1\n"));
         assert!(!has_toml_table_header("x = 1\n"));
         assert!(!has_toml_table_header("# [global]\nx = 1\n"));
-        // Array-of-tables is not a plain section header for our purposes.
-        assert!(!has_toml_table_header("[[arr]]\nx = 1\n"));
+        assert!(has_toml_table_header("[[arr]]\nx = 1\n"));
     }
 
     // ─── [[hooks]] (#83) ───────────────────────────────────────

@@ -5,106 +5,53 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  schedule:
-    # Weekly coverage measurement — Mondays 03:00 UTC. Coverage is too slow
-    # (cargo-llvm-cov re-instruments the whole build) to run on every PR; the
-    # `area:test` PR label opt-in below also triggers it for opted-in PRs.
-    - cron: "0 3 * * 1"
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
-  CARGO_TERM_COLOR: always
-  # Pin proptest case count so a developer's local override doesn't change
-  # what CI exercises. 128 mirrors the per-test config in `tests/property_*.rs`.
+  CARGO_TERM_COLOR: never
   PROPTEST_CASES: "128"
 
 jobs:
   check:
+    name: check (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-24.04
+            ssh: required
+          - os: macos-15
+            ssh: optional
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt -- --check
-      # Strict clippy gate (restored in v0.13.1 after deferred-wiring landed in v0.13.0).
-      - run: cargo clippy --all-targets -- -D warnings
-      - name: Unit tests (in src/**)
-        run: cargo test --bins
-      - run: cargo build --release
-
-  integration:
-    name: integration tests
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
-      # v0.12.0: integration suite collapsed into a single `integration`
-      # test target (tests/integration/main.rs). PTY-bound tests #56/#57/
-      # #62 ship as #[ignore]'d placeholders awaiting v0.12.1 wiring;
-      # they're skipped by default so CI stays green on the foundations.
-      - name: Integration tests (tests/**)
-        run: cargo test --test 'integration' -- --test-threads=4
-
-  property:
-    name: property tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
-      # Single-threaded to keep proptest seed logging deterministic when a
-      # property fails. PROPTEST_CASES is set globally above.
-      # v0.12.0: property suite collapsed into a single `property` target.
-      - run: cargo test --test 'property' -- --test-threads=1
-
-  msrv:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/setup-python@v5
         with:
-          toolchain: "1.82"
+          python-version: '3.12'
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check
-
-  coverage:
-    name: coverage gate
-    # Run on cron (weekly) AND on PRs that opt in via the `area:test` label.
-    # The default PR doesn't pay the cargo-llvm-cov re-instrumentation tax.
-    if: |
-      github.event_name == 'schedule' ||
-      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'area:test'))
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95.0
-        with:
-          components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Coverage gate (relaxed for v0.13.0 release)
-        # v0.12.0 deferred-wiring modules landed in v0.13.0 (#108) but
-        # the server runtime modules (input_modes, mod, mouse, render_glue,
-        # actions, connection) are gated behind PTY harness coverage that
-        # CI runners cannot reach. Net effect: 49.26% measured coverage
-        # despite the wiring landing. Threshold drops to 48 for v0.13.0;
-        # ratchets back to 65 in v0.13.x or v0.14 when the integration
-        # harness gains a PTY-on-CI mode (tracked under RFC #105's CI
-        # gate work).
-        env:
-          COVERAGE_THRESHOLD: "48"
-        run: bash scripts/coverage.sh
+      - name: Install real SSH prerequisites on the ephemeral Linux runner
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends openssh-server
+          sudo install -d -m 0755 /run/sshd
+      - name: Install declared MSRV
+        run: |
+          msrv=$(cargo metadata --locked --format-version=1 --no-deps | python3 -c 'import json,sys; print(next(p["rust_version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "ezpn"))')
+          rustup toolchain install "$msrv" --profile minimal
+      - name: Locked default and all-feature gates, real PTY tests
+        run: python3 scripts/preflight.py --ssh ${{ matrix.ssh }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: lcov-info
-          path: lcov.info
-          if-no-files-found: warn
+          name: preflight-${{ matrix.os }}
+          path: target/preflight/
+          if-no-files-found: error

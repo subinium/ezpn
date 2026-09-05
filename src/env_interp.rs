@@ -16,11 +16,13 @@
 //! 4. process environment (`std::env::vars`)
 //!
 //! Secrets are wrapped in [`Redacted`] so they never leak through `Debug` or
-//! `Display`. The module provides a [`SecretsFile`] loader that mandates a
+//! `Display`. The module provides a [`load_secrets`] loader that mandates a
 //! `0600` permission mask on Unix; loading aborts on wider perms.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// A value that must never appear in `Debug` or `Display` output.
@@ -117,7 +119,7 @@ impl std::error::Error for SecretsLoadError {}
 
 /// Lookup context for [`expand`]. Build once per `.ezpn.toml` parse; the
 /// per-pane override map can be swapped per pane via [`Self::with_pane`].
-#[derive(Default, Debug)]
+#[derive(Default)]
 pub struct EnvContext {
     /// Per-pane `env =` overrides. Highest priority.
     per_pane: HashMap<String, String>,
@@ -128,6 +130,20 @@ pub struct EnvContext {
     secrets: HashMap<String, Redacted<String>>,
     /// Process environment snapshot (`std::env::vars`).
     process: HashMap<String, String>,
+    sensitive_read: Cell<bool>,
+}
+
+impl fmt::Debug for EnvContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Plain environment layers can also contain credentials, including
+        // secrets resolved into per-pane overrides.
+        f.debug_struct("EnvContext")
+            .field("per_pane_entries", &self.per_pane.len())
+            .field("dotenv_entries", &self.dotenv.len())
+            .field("secret_entries", &self.secrets.len())
+            .field("process_entries", &self.process.len())
+            .finish()
+    }
 }
 
 impl EnvContext {
@@ -137,12 +153,15 @@ impl EnvContext {
         dotenv: HashMap<String, String>,
         secrets: HashMap<String, Redacted<String>>,
     ) -> Self {
-        let process = std::env::vars().collect();
+        let process = std::env::vars_os()
+            .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+            .collect();
         Self {
             per_pane: HashMap::new(),
             dotenv,
             secrets,
             process,
+            sensitive_read: Cell::new(false),
         }
     }
 
@@ -160,6 +179,7 @@ impl EnvContext {
             dotenv,
             secrets,
             process,
+            sensitive_read: Cell::new(false),
         }
     }
 
@@ -170,6 +190,7 @@ impl EnvContext {
             dotenv: self.dotenv.clone(),
             secrets: self.secrets.clone(),
             process: self.process.clone(),
+            sensitive_read: Cell::new(false),
         }
     }
 
@@ -180,12 +201,17 @@ impl EnvContext {
             return Some(v.as_str());
         }
         if let Some(v) = self.dotenv.get(name) {
+            self.sensitive_read.set(true);
             return Some(v.as_str());
         }
-        self.process.get(name).map(|s| s.as_str())
+        self.process.get(name).map(|s| {
+            self.sensitive_read.set(true);
+            s.as_str()
+        })
     }
 
     fn lookup_secret(&self, key: &str) -> Option<&str> {
+        self.sensitive_read.set(true);
         self.secrets.get(key).map(|r| r.expose().as_str())
     }
 }
@@ -247,17 +273,40 @@ pub fn default_secrets_path() -> PathBuf {
 /// not exist (secrets are optional). On Unix, refuses to load if the file's
 /// mode is wider than `0600`.
 pub fn load_secrets(path: &Path) -> Result<HashMap<String, Redacted<String>>, SecretsLoadError> {
-    if !path.exists() {
-        return Ok(HashMap::new());
+    let io_error = |e: std::io::Error| SecretsLoadError::Io {
+        path: path.to_path_buf(),
+        error: e.to_string(),
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(e) => return Err(io_error(e)),
+    };
+    let meta = file.metadata().map_err(io_error)?;
+    if !meta.is_file() {
+        return Err(SecretsLoadError::Io {
+            path: path.to_path_buf(),
+            error: "secrets must be a regular file".into(),
+        });
     }
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let meta = std::fs::metadata(path).map_err(|e| SecretsLoadError::Io {
-            path: path.to_path_buf(),
-            error: e.to_string(),
-        })?;
+        // Inspect the opened descriptor, not a pathname checked before open.
+        if meta.uid() != unsafe { libc::geteuid() } {
+            return Err(SecretsLoadError::Io {
+                path: path.to_path_buf(),
+                error: "secrets file must belong to the current user".into(),
+            });
+        }
         let mode = meta.mode() & 0o777;
         if mode != 0o600 {
             return Err(SecretsLoadError::InsecurePermissions {
@@ -267,13 +316,23 @@ pub fn load_secrets(path: &Path) -> Result<HashMap<String, Redacted<String>>, Se
         }
     }
 
-    let contents = std::fs::read_to_string(path).map_err(|e| SecretsLoadError::Io {
-        path: path.to_path_buf(),
-        error: e.to_string(),
-    })?;
+    const MAX_SECRETS_BYTES: u64 = 1024 * 1024;
+    let mut contents = String::new();
+    file.take(MAX_SECRETS_BYTES + 1)
+        .read_to_string(&mut contents)
+        .map_err(io_error)?;
+    if contents.len() as u64 > MAX_SECRETS_BYTES {
+        return Err(SecretsLoadError::Io {
+            path: path.to_path_buf(),
+            error: "secrets file exceeds 1 MiB".into(),
+        });
+    }
     let table: toml::Table = toml::from_str(&contents).map_err(|e| SecretsLoadError::Parse {
         path: path.to_path_buf(),
-        error: e.to_string(),
+        error: format!(
+            "invalid TOML near byte {}",
+            e.span().map_or(0, |span| span.start)
+        ),
     })?;
 
     let mut out = HashMap::new();
@@ -337,11 +396,26 @@ pub fn expand(template: &str, ctx: &EnvContext) -> Result<String, ExpandError> {
             continue;
         }
 
-        out.push(b as char);
-        i += 1;
+        let ch = template[i..]
+            .chars()
+            .next()
+            .expect("in-bounds UTF-8 boundary");
+        out.push(ch);
+        i += ch.len_utf8();
     }
 
     Ok(out)
+}
+
+/// Reports whether expansion read external values. Callers must not persist
+/// those resolved values just because they no longer contain secret syntax.
+pub fn expand_with_sensitivity(
+    template: &str,
+    ctx: &EnvContext,
+) -> Result<(String, bool), ExpandError> {
+    ctx.sensitive_read.set(false);
+    let value = expand(template, ctx)?;
+    Ok((value, ctx.sensitive_read.get()))
 }
 
 /// Find the index of the `}` matching the `{` at `bytes[open_idx]`.
@@ -399,7 +473,10 @@ fn expand_braced(inner: &str, ctx: &EnvContext) -> Result<String, ExpandError> {
     }
 
     // `${VAR:?msg}` — required (unset OR empty triggers).
-    if let Some(idx) = inner.find(":?") {
+    if let Some(idx) = inner
+        .find(':')
+        .filter(|&idx| inner[idx..].starts_with(":?"))
+    {
         let name = &inner[..idx];
         let msg = &inner[idx + 2..];
         validate_name(name)?;
@@ -413,7 +490,10 @@ fn expand_braced(inner: &str, ctx: &EnvContext) -> Result<String, ExpandError> {
     }
 
     // `${VAR:-default}` — default on unset OR empty.
-    if let Some(idx) = inner.find(":-") {
+    if let Some(idx) = inner
+        .find(':')
+        .filter(|&idx| inner[idx..].starts_with(":-"))
+    {
         let name = &inner[..idx];
         let default = &inner[idx + 2..];
         validate_name(name)?;
@@ -452,6 +532,77 @@ fn validate_name(name: &str) -> Result<(), ExpandError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reliability_expansion_preserves_unicode() {
+        let ctx = ctx_with(&[("NAME", "세계")]);
+        assert_eq!(
+            expand("안녕 $NAME / café", &ctx).unwrap(),
+            "안녕 세계 / café"
+        );
+    }
+
+    #[test]
+    fn reliability_default_can_contain_required_operator_text() {
+        let ctx = ctx_with(&[]);
+        assert_eq!(expand("${MISSING:-why:?}", &ctx).unwrap(), "why:?");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reliability_secret_parse_error_does_not_show_source() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.toml");
+        std::fs::write(&path, "TOKEN = \"private-value\" trailing\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let err = load_secrets(&path).unwrap_err();
+        assert!(!format!("{err:?} {err}").contains("private-value"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reliability_secret_symlink_is_refused() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, "TOKEN = \"private\"\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let path = dir.path().join("secrets.toml");
+        symlink(target, &path).unwrap();
+        assert!(load_secrets(&path).is_err());
+    }
+
+    #[test]
+    fn reliability_context_debug_redacts_all_environment_layers() {
+        let ctx = ctx_with(&[("TOKEN", "private-process")])
+            .with_pane([("KEY".into(), "private-pane".into())].into());
+        let debug = format!("{ctx:?}");
+        assert!(!debug.contains("private-process"));
+        assert!(!debug.contains("private-pane"));
+    }
+
+    #[test]
+    fn reliability_sensitivity_tracks_reads_not_variable_names() {
+        let ctx = ctx_with(&[("INNOCENT_NAME", "credential")]);
+        assert_eq!(
+            expand_with_sensitivity("$INNOCENT_NAME", &ctx).unwrap(),
+            ("credential".into(), true)
+        );
+        assert_eq!(
+            expand_with_sensitivity("$$INNOCENT_NAME", &ctx).unwrap(),
+            ("$INNOCENT_NAME".into(), false)
+        );
+        assert_eq!(
+            expand_with_sensitivity("${UNSET:-literal}", &ctx).unwrap(),
+            ("literal".into(), false)
+        );
+        let ctx = ctx.with_pane([("EXPLICIT".into(), "literal".into())].into());
+        assert_eq!(
+            expand_with_sensitivity("$EXPLICIT", &ctx).unwrap(),
+            ("literal".into(), false)
+        );
+    }
 
     fn ctx_with(process: &[(&str, &str)]) -> EnvContext {
         let process: HashMap<String, String> = process

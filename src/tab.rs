@@ -177,6 +177,11 @@ impl TabManager {
         }
     }
 
+    /// Background PTYs must be serviced even when their tab is not rendered.
+    pub fn inactive_mut(&mut self) -> impl Iterator<Item = &mut Tab> {
+        self.tabs.iter_mut()
+    }
+
     /// Get an inactive tab by its logical index.
     /// Returns `None` if the index is the active tab or out of bounds.
     pub fn get_inactive(&self, logical_idx: usize) -> Option<&Tab> {

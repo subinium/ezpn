@@ -1,272 +1,140 @@
-# Configuration reference
+# Configuration
 
-ezpn reads two TOML files, in order of increasing specificity:
+Global settings live at `$XDG_CONFIG_HOME/ezpn/config.toml`, falling back to
+`~/.config/ezpn/config.toml`. Project commands live in `./.ezpn.toml` and
+require `ezpn --trust-project` for automatic execution.
 
-1. **`~/.config/ezpn/config.toml`** (or `$XDG_CONFIG_HOME/ezpn/config.toml`)
-   — global per-user settings.
-2. **`./.ezpn.toml`** — per-project workspace file. Loaded automatically
-   when `ezpn` is run with no layout arguments and the file exists in
-   the current directory.
+Configuration versioning is separate from the client/server wire protocol.
+A reserved schema field is not evidence that its runtime feature is implemented.
 
-Both schemas are **frozen at v1.0**. Adding a new key is a `proto_minor`
-bump; renaming or removing one is a major bump.
-
-* Sections marked _frozen_ below cannot change in v1.x.
-* Sections marked _additive_ may gain new keys in v1.x, but existing
-  keys keep their semantics.
-
-## 1. Global config — `~/.config/ezpn/config.toml`
-
-### 1.1 `[global]` (additive)
+## Global settings
 
 ```toml
 [global]
-border = "rounded"           # single | rounded | heavy | double | none
-shell = "/bin/zsh"           # default $SHELL when spawning panes
-scrollback = 10000           # per-pane line cap (max 100_000)
-scrollback_bytes = "32M"     # byte budget; 0 disables. integer or "32M"/"512K"/"2G"
-scrollback_eviction = "oldest_line"  # oldest_line | largest_line
+border = "rounded"
+shell = "/bin/sh"
+scrollback = 10000
+scrollback_bytes = "32M"
 status_bar = true
 tab_bar = true
-```
+persist_scrollback = false
 
-| Key                   | Type                | Default          | Notes |
-|-----------------------|---------------------|------------------|-------|
-| `border`              | string              | `"rounded"`      | Border style. |
-| `shell`               | string              | `$SHELL` or `/bin/sh` | Default shell for new panes. |
-| `scrollback`          | integer ≥ 0         | `10000`          | Per-pane line cap. Clamped to 100 000. |
-| `scrollback_bytes`    | integer or string   | `"32M"` (32 MiB) | Byte cap. Suffixes: `K`/`KB`/`KiB` and `M`/`MB`/`MiB` and `G`/`GB`/`GiB` (all map to powers of 1024). `0` disables. Hard cap `4 GiB`. |
-| `scrollback_eviction` | string              | `"oldest_line"`  | Policy when `scrollback_bytes` is exceeded. |
-| `status_bar`          | bool                | `true`           | Show bottom status bar. |
-| `tab_bar`             | bool                | `true`           | Show top tab bar. |
-
-### 1.2 `[keys]` (frozen)
-
-```toml
 [keys]
-prefix = "b"   # ASCII letter; the prefix is Ctrl+<letter>. Default: b.
+prefix = "b"
+
+[theme]
+name = "ezpn-dark"
+
+[clipboard]
+osc52_set = "confirm"
+osc52_get = "deny"
+osc52_max_bytes = 1048576
 ```
 
-| Key      | Type   | Default | Notes |
-|----------|--------|---------|-------|
-| `prefix` | string | `"b"`   | First character (lowercased) is the prefix letter. |
+Borders: single, rounded, heavy, double, none.
+Themes: ezpn-dark, ezpn-light, nord, gruvbox-dark, solarized-dark.
+Mouse coordinates, PTY sizes, zoom and borders use the same content geometry.
 
-### 1.3 `[clipboard]` (frozen)
+Scrollback is capped by configured lines and a conservative per-pane allocation
+budget. This is not a process RSS limit or proof of zero memory growth.
+`largest_line` remains a compatibility setting; arbitrary sparse-row eviction
+is not implemented by the bundled vt100 grid. See the release audit.
+
+## Reload and settings
+
+`Ctrl+B r` or SIGHUP validates one complete file before applying supported
+settings, hooks and keymaps. Invalid input leaves the running configuration
+unchanged. Fields requiring process restart are reported instead of silently
+changing existing processes. A failed settings write is visible.
+
+## Keymaps
 
 ```toml
-[clipboard]
-osc52_set = "confirm"        # allow | confirm | deny
-osc52_get = "deny"           # allow | deny
-osc52_max_bytes = 1048576    # hard cap on clipboard payload. Capped at 16 MiB.
+[keymap.normal]
+"F1" = "toggle-settings"
+
+[keymap.prefix]
+"r" = "reload-config"
+
+[keymap.copy_mode]
+"v" = "begin-selection"
+"y" = "copy-selection-and-cancel"
+"q" = "cancel"
 ```
 
-| Key                | Type    | Default     | Notes |
-|--------------------|---------|-------------|-------|
-| `osc52_set`        | string  | `"confirm"` | Per-pane confirm prompt for OSC 52 set. See [`clipboard.md`](./clipboard.md). |
-| `osc52_get`        | string  | `"deny"`    | Read is the dominant attack vector. |
-| `osc52_max_bytes`  | integer | `1048576`   | Drop sequences whose payload exceeds this. Hard ceiling at 16 MiB. |
+`clear = true` clears defaults in that table. Modifier prefixes are C-, M-, S-.
+Normal shell control keys are not stolen by undocumented split shortcuts.
+The full default map is [assets/default-keymap.toml](../assets/default-keymap.toml).
 
-### 1.4 `[[hooks]]` (frozen — issue #83)
+## Status bar
 
-Declarative shell-out on lifecycle events. **`exec` is always an array**;
-no shell-string form. Variable substitution is single-shot (no
-re-tokenisation), so payload values that contain whitespace or shell
-metacharacters cannot break out of the argv element they appear in.
+```toml
+[status_bar]
+left = ["{session}", "{mode}"]
+right = ["{time}"]
+```
+
+Builtin fields include session, tab_count, mode and time. Literal/key-hint
+segments are bounded to display width. Custom key-hint arrays are static
+cheatsheets, not automatically generated descriptions of every remapped binding.
+Confirmation prompts and text input remain visible above custom layouts.
+
+## Project settings
+
+```toml
+[workspace]
+layout = "7:3"
+
+[[pane]]
+name = "shell"
+cwd = "."
+
+[[pane]]
+name = "worker"
+command = "printf 'ready\\n'; exec sh"
+restart = "on_failure"
+env = { PROJECT_ROOT = "${PWD}" }
+persist_scrollback = false
+```
+
+Per-pane fields: name, command, cwd, shell, env, restart and persist_scrollback.
+An explicit CLI grid/layout bypasses automatic project loading.
+`on_failure` does not restart a successful exit. Restart attempts have finite
+retry/backoff budgets, including failed spawns.
+
+## Environment interpolation
+
+Supported forms are `$VAR`, `${VAR}`, `${VAR:-default}`,
+`${VAR:?message}`, `$$` for a literal dollar and `${secret:KEY}`.
+Environment precedence is per-pane values, .env.local, then process environment.
+Secrets are consulted only by the explicit secret form.
+
+These are interpolation rules, not a shell evaluator. External reads mark the
+whole pane as sensitive for snapshot exclusion. See [security](security.md).
+
+## Snapshots
+
+Live detach keeps processes running. Disk restore starts new processes and may
+restore opt-in text history; it does not resurrect process memory, terminal
+graphics, hyperlink metadata or exact alternate-screen state.
+
+Limits include 64 MiB JSON/payload, 128 MiB aggregate decoded history, 200,000 rows
+per history blob, 100 tabs, 1,000 panes in a snapshot and 100 panes per tab.
+The current writer uses private atomic files. Oversized/corrupt snapshots fail
+before replacing the running workspace.
+
+Per-pane external-value sensitivity takes precedence over history persistence.
+Readonly diagnostics never print resolved secret values.
+
+## Hooks
 
 ```toml
 [[hooks]]
 event = "after_pane_exit"
-exec  = ["sh", "-c", "echo '${pane.command} exited code=${pane.exit_code}' >> ~/.ezpn-pane.log"]
-
-[[hooks]]
-event = "on_cwd_change"
-exec  = ["notify-send", "ezpn", "cwd → ${pane.cwd}"]
-when  = "session.name == 'work'"
+exec = ["notify-send", "ezpn", "pane ${pane.id} exited"]
 ```
 
-| Field   | Type     | Required | Notes |
-|---------|----------|----------|-------|
-| `event` | string   | yes      | One of the names below. |
-| `exec`  | string[] | yes      | argv. `exec[0]` is the program; `${var.path}` placeholders are substituted at fire time without re-tokenising. |
-| `when`  | string   | no       | Predicate evaluated against the payload. Drops the hook when false. |
-
-**Frozen event vocabulary** (see [`src/hooks.rs`](../src/hooks.rs)):
-
-* `after_session_create`
-* `before_attach` / `after_attach`
-* `before_detach` / `after_detach`
-* `after_pane_spawn` / `after_pane_exit`
-* `on_cwd_change`
-* `on_focus_change`
-* `on_config_reload`
-* `before_session_destroy`
-
-**Operational notes**:
-
-* 5 s wall-clock timeout per hook child; overruns get `SIGKILL`.
-* Output captured under `$XDG_STATE_HOME/ezpn/hooks/<event>-<unix>.log`,
-  rotated FIFO at 1 MB per file.
-* Hooks are best-effort and cannot abort the triggering action.
-* The daemon's env is inherited unchanged; hooks cannot inject env vars.
-
-### 1.5 `[keymap.<table>]` (frozen vocabulary — issue #84)
-
-Three tables in v1: `prefix`, `normal`, `copy_mode`. Defaults ship in
-[`assets/default-keymap.toml`](../assets/default-keymap.toml). User
-tables **merge** on top of the defaults; setting `clear = true` in a
-table drops every default first.
-
-```toml
-[keymap.prefix]
-"|" = "split-window-h"   # override default %
-"_" = "split-window-v"
-"k" = "kill-pane"
-
-[keymap.normal]
-"M-Tab" = "next-window"
-clear = false            # default — keep built-ins
-
-[keymap.copy_mode]
-clear = true             # nuke every default for this table
-"y"     = "copy-selection-and-cancel"
-"Enter" = "copy-selection-and-cancel"
-"q"     = "cancel"
-```
-
-**Key syntax**:
-
-* Modifiers: `C-` (Ctrl), `M-` (Alt/Meta), `S-` (Shift). Combinable in
-  any order (`C-M-Right`, `M-C-Right`).
-* Named keys: `Enter`, `Esc` (alias `Escape`), `Tab`, `Backspace`,
-  `Delete`, `Insert`, `Home`, `End`, `PageUp`, `PageDown`, `Up`, `Down`,
-  `Left`, `Right`, `Space`, `F1`..`F12`.
-* Single character: literal key. `A` and `a` collapse to lower case
-  unless paired with `S-`.
-
-**Frozen action vocabulary** (see [`src/keymap.rs`](../src/keymap.rs)):
-
-```
-split-window-h, split-window-v, kill-pane,
-new-window [-n NAME], rename-window, kill-window, select-window N,
-next-window, previous-window,
-select-pane (up|down|left|right),
-resize-pane (up|down|left|right) N,
-swap-pane (up|down),
-equalize,
-select-layout NAME,
-detach-session, kill-session,
-copy-mode, cancel, begin-selection, copy-selection-and-cancel,
-reload-config, command-prompt, toggle-settings, toggle-broadcast,
-display-message TEXT,
-set-option KEY VALUE
-```
-
-Unknown actions are rejected at load time with a structured error
-pointing into the offending TOML — the daemon refuses to start.
-
-## 2. Project config — `./.ezpn.toml`
-
-### 2.1 `[workspace]` (frozen)
-
-Either ratio spec or grid spec; not both.
-
-```toml
-[workspace]
-layout = "7:3/1:1"   # ratio spec: outer split | inner split
-# rows = 2
-# cols = 3            # grid spec: rows × cols of equal panes
-```
-
-### 2.2 `[[pane]]` (frozen)
-
-One block per pane, in layout order.
-
-```toml
-[[pane]]
-command = "cargo watch -x test"
-cwd     = "./backend"
-name    = "tests"
-shell   = "/bin/zsh"
-restart = "on_failure"      # never | on_failure | always
-env     = { RUST_LOG = "debug", DATABASE_URL = "${secret:DEV_DB_URL}" }
-```
-
-| Field     | Type    | Required | Notes |
-|-----------|---------|----------|-------|
-| `command` | string  | no       | Command to spawn. Defaults to the resolved shell. |
-| `cwd`     | string  | no       | Initial working directory. Resolved relative to the project root. |
-| `name`    | string  | no       | Pane label (used in tab titles, status bar). |
-| `shell`   | string  | no       | Override `[global].shell` for this pane. |
-| `restart` | string  | no       | `never` (default), `on_failure`, `always`. |
-| `env`     | table   | no       | Per-pane env. Values support `${VAR}` (process env) and `${secret:KEY}` (gated, see §2.3). |
-
-### 2.3 Variable interpolation (frozen — `crate::env_interp`)
-
-Pane-scope strings (`command`, `cwd`, `name`, `shell`, `env` values) go
-through a layered interpolation context:
-
-```
-per-pane env > .env.local > secrets > process env
-```
-
-Two prefixes are recognised:
-
-* `${VAR}` — resolved against the layered context. Missing keys are an
-  error at load time.
-* `${secret:KEY}` — resolved only against `~/.config/ezpn/secrets.toml`
-  (or `$XDG_CONFIG_HOME/ezpn/secrets.toml`). Secret values are tagged
-  `Redacted` internally — they never leak through `Debug` formatting,
-  log lines, or the snapshot file.
-
-`.env.local` (if present at the project root) is parsed as a flat
-`KEY=VALUE` file and contributes to the layered context.
-
-### 2.4 `[[hooks]]` (frozen)
-
-Project-level hooks have the same schema as global hooks (§1.4) and are
-**merged** with the global set at server boot. There is no override
-semantic — both fire.
-
-## 3. Hot-reload
-
-* `Ctrl+B r` (default `prefix.r`) and `SIGHUP` both trigger
-  `reload-config`.
-* Reload re-reads `~/.config/ezpn/config.toml`. The keymap, hooks,
-  clipboard policy, and border style apply immediately. `shell` and
-  `scrollback*` apply only to newly spawned panes.
-* `.ezpn.toml` is **not** re-read on hot-reload — restart `ezpn` for
-  workspace changes.
-
-## 4. Loading order and precedence
-
-```
-defaults
-  ⊕ ~/.config/ezpn/config.toml [global]
-  ⊕ ~/.config/ezpn/config.toml [keys] [clipboard] [keymap.*]
-  ⊕ CLI flags (-b, -l, -e, -S, …)
-```
-
-CLI flags always win. Project `.ezpn.toml` only contributes
-`[workspace]`, `[[pane]]`, and `[[hooks]]` — it does not override
-`[global]` or `[keys]`.
-
-## 5. Errors
-
-* TOML syntax errors print `config: <path>: malformed TOML at line N,
-  column M: <message>` and the daemon falls back to defaults for the
-  affected section.
-* Unknown keys print a warning with line/column and are ignored.
-* Unknown actions in `[keymap.*]` are a hard error — the daemon refuses
-  to start.
-* Unknown events in `[[hooks]]` print a structured warning; the
-  offending entry is dropped, others continue.
-
-## 6. Inspecting the live config
-
-```sh
-ezpn-ctl config show               # entire effective config
-ezpn-ctl config show --keys keymap # one section
-ezpn-ctl --json config show        # JSON for scripting
-```
-
-(See [`scripting.md`](./scripting.md) for the `--json` schema.)
+Global hooks and explicitly trusted project hooks are combined. Hooks use four
+workers and a queue of 64; excess work is rejected, not buffered without limit.
+Use argv instead of constructing shell source from untrusted substitutions.
+The release audit states which lifecycle producers are currently wired.

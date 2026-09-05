@@ -20,7 +20,7 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::env_interp::{self, EnvContext, ExpandError, Redacted, SecretsLoadError};
@@ -103,6 +103,9 @@ pub struct ResolvedProject {
     // `HookExecutor` once the boot path threads `ResolvedProject` through.
     #[allow(dead_code)]
     pub hooks: Vec<Hook>,
+    /// Externally expanded metadata must not be materialized in snapshots.
+    /// Such panes restore as plain shells, without metadata or scrollback.
+    pub snapshot_excluded_panes: HashSet<usize>,
 }
 
 /// Try to find and load `.ezpn.toml` from the current directory.
@@ -118,12 +121,25 @@ pub fn load_project() -> Option<Result<ResolvedProject, String>> {
 fn load_project_from(path: &Path) -> Result<ResolvedProject, String> {
     let contents = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let config: ProjectConfig =
-        toml::from_str(&contents).map_err(|e| format!("parse error in {}: {e}", path.display()))?;
+    let config: ProjectConfig = toml::from_str(&contents).map_err(|e| {
+        format!(
+            "parse error in {} near byte {}: {}",
+            path.display(),
+            e.span().map_or(0, |span| span.start),
+            e.message()
+        )
+    })?;
 
     // Determine layout
     let layout = resolve_layout(&config)?;
     let pane_ids = layout.pane_ids();
+    if config.pane.len() > pane_ids.len() {
+        return Err(format!(
+            "{} pane sections exceed the layout's {} panes",
+            config.pane.len(),
+            pane_ids.len()
+        ));
+    }
 
     // Map pane sections to pane IDs
     let mut launches = HashMap::new();
@@ -133,6 +149,7 @@ fn load_project_from(path: &Path) -> Result<ResolvedProject, String> {
     let mut restarts = HashMap::new();
     let mut shells = HashMap::new();
     let mut persist_scrollback = HashMap::new();
+    let mut snapshot_excluded_panes = HashSet::new();
     let base_dir = path
         .parent()
         .unwrap_or(Path::new("."))
@@ -153,13 +170,20 @@ fn load_project_from(path: &Path) -> Result<ResolvedProject, String> {
 
     for (i, pid) in pane_ids.iter().enumerate() {
         if let Some(section) = config.pane.get(i) {
+            let mut sensitive = false;
+            let mut expand_field = |value: &str, context: &EnvContext| {
+                env_interp::expand_with_sensitivity(value, context).map(|(value, read)| {
+                    sensitive |= read;
+                    value
+                })
+            };
             // Resolve the pane's own env block first, using the base context
             // (no pane overrides yet — the pane's env values are the source
             // for that precedence layer, so they cannot reference themselves).
             let mut resolved_env: HashMap<String, String> = HashMap::new();
             for (k, v) in &section.env {
-                let expanded = env_interp::expand(v, &base_ctx)
-                    .map_err(|e| format_expand_err("env", k, &e))?;
+                let expanded =
+                    expand_field(v, &base_ctx).map_err(|e| format_expand_err("env", k, &e))?;
                 resolved_env.insert(k.clone(), expanded);
             }
             // Build a pane-scoped context that layers the resolved per-pane
@@ -168,21 +192,21 @@ fn load_project_from(path: &Path) -> Result<ResolvedProject, String> {
             let pane_ctx = base_ctx.with_pane(resolved_env.clone());
 
             if let Some(cmd) = &section.command {
-                let expanded = env_interp::expand(cmd, &pane_ctx)
+                let expanded = expand_field(cmd, &pane_ctx)
                     .map_err(|e| format_expand_err("command", "", &e))?;
                 launches.insert(*pid, PaneLaunch::Command(expanded));
             } else {
                 launches.insert(*pid, PaneLaunch::Shell);
             }
             if let Some(cwd) = &section.cwd {
-                let expanded = env_interp::expand(cwd, &pane_ctx)
-                    .map_err(|e| format_expand_err("cwd", "", &e))?;
+                let expanded =
+                    expand_field(cwd, &pane_ctx).map_err(|e| format_expand_err("cwd", "", &e))?;
                 let resolved = base_dir.join(expanded);
                 cwds.insert(*pid, resolved);
             }
             if let Some(name) = &section.name {
-                let expanded = env_interp::expand(name, &pane_ctx)
-                    .map_err(|e| format_expand_err("name", "", &e))?;
+                let expanded =
+                    expand_field(name, &pane_ctx).map_err(|e| format_expand_err("name", "", &e))?;
                 names.insert(*pid, expanded);
             }
             if !resolved_env.is_empty() {
@@ -192,12 +216,15 @@ fn load_project_from(path: &Path) -> Result<ResolvedProject, String> {
                 restarts.insert(*pid, section.restart.clone());
             }
             if let Some(shell) = &section.shell {
-                let expanded = env_interp::expand(shell, &pane_ctx)
+                let expanded = expand_field(shell, &pane_ctx)
                     .map_err(|e| format_expand_err("shell", "", &e))?;
                 shells.insert(*pid, expanded);
             }
             if let Some(flag) = section.persist_scrollback {
                 persist_scrollback.insert(*pid, flag);
+            }
+            if sensitive {
+                snapshot_excluded_panes.insert(*pid);
             }
         } else {
             launches.insert(*pid, PaneLaunch::Shell);
@@ -223,6 +250,7 @@ fn load_project_from(path: &Path) -> Result<ResolvedProject, String> {
         shells,
         persist_scrollback,
         hooks,
+        snapshot_excluded_panes,
     })
 }
 
@@ -240,19 +268,17 @@ fn resolve_layout(config: &ProjectConfig) -> Result<Layout, String> {
         if rows == 0 || cols == 0 {
             return Err("rows and cols must be >= 1".into());
         }
-        if rows * cols > 100 {
-            return Err(format!(
-                "maximum 100 panes (got {}x{}={})",
-                rows,
-                cols,
-                rows * cols
-            ));
+        if rows.checked_mul(cols).is_none_or(|count| count > 100) {
+            return Err(format!("maximum 100 panes (got {}x{})", rows, cols));
         }
         return Ok(Layout::from_grid(rows, cols));
     }
 
     // No [workspace] section — infer from pane count
     let pane_count = config.pane.len().max(2);
+    if pane_count > 100 {
+        return Err(format!("maximum 100 panes (got {pane_count})"));
+    }
     Ok(Layout::from_grid(1, pane_count))
 }
 
@@ -270,6 +296,26 @@ fn format_expand_err(field: &str, key: &str, err: &ExpandError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reliability_grid_overflow_is_rejected_without_panic() {
+        let config = ProjectConfig {
+            workspace: Some(WorkspaceSection {
+                layout: None,
+                rows: Some(usize::MAX),
+                cols: Some(2),
+            }),
+            pane: vec![],
+            hooks: vec![],
+        };
+        assert!(resolve_layout(&config).is_err());
+    }
+
+    #[test]
+    fn reliability_inferred_layout_respects_pane_limit() {
+        let config: ProjectConfig = toml::from_str(&"[[pane]]\n".repeat(101)).unwrap();
+        assert!(resolve_layout(&config).is_err());
+    }
 
     #[test]
     fn parse_basic_toml() {
@@ -668,6 +714,7 @@ API_URL = "${EZPN_TEST_BASE_URL}/v1"
 "#;
         let path = write_project(tmp.path(), toml);
         let resolved = load_project_from(&path).expect("load");
+        assert_eq!(resolved.snapshot_excluded_panes.len(), 1);
 
         // The pane's env value should have been expanded.
         let (_, env) = resolved.envs.iter().next().expect("one pane env map");
@@ -684,6 +731,21 @@ API_URL = "${EZPN_TEST_BASE_URL}/v1"
         }
 
         std::env::remove_var("EZPN_TEST_BASE_URL");
+        std::env::remove_var("EZPN_TEST_SECRETS_DIR");
+    }
+
+    #[test]
+    fn reliability_literal_only_pane_env_remains_persistable() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        isolate_secrets_dir(tmp.path());
+        let path = write_project(
+            tmp.path(),
+            "[[pane]]\ncommand = 'echo ${PORT}'\n[pane.env]\nPORT = '3000'\n",
+        );
+        let resolved = load_project_from(&path).unwrap();
+        assert!(resolved.snapshot_excluded_panes.is_empty());
+        assert_eq!(resolved.envs[&0]["PORT"], "3000");
         std::env::remove_var("EZPN_TEST_SECRETS_DIR");
     }
 

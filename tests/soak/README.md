@@ -1,90 +1,81 @@
-# Soak test
+# Runtime Evidence
 
-Long-running stress harness for ezpn (issue #95).
+All harnesses isolate HOME, XDG directories, sockets and working directories
+under private temporary directories. They never use existing ezpn sessions.
+Python 3.9+ and Unix PTYs are required. Processes and IPC waits are bounded.
 
-## Why
-
-Memory and lifecycle bugs surface only over hours. tmux/4029 (memory not
-freed after `clear-history`) and zellij/3598 (RSS growth on tab
-open/close) are exactly the kind of bug a soak test catches that no unit
-test does. This script exercises the daemon under a synthetic workload
-and emits CSV samples so regressions are easy to spot in CI artifacts.
-
-## Profiles
-
-| Profile  | Duration | Panes | Tab cycle | Cadence                  |
-|----------|----------|-------|-----------|--------------------------|
-| `full`   | 24 h     | 100   | 10 s      | monthly (self-hosted)    |
-| `smoke`  | 30 min   | 5     | 30 s      | every PR (GH-hosted)     |
-
-The smoke profile is ~5% of the full workload, sized to fit GitHub
-Actions' 6 h job cap with budget for cold start + report upload.
-
-## Usage
-
-```bash
-# Build first.
-cargo build --release
-
-# 30-min CI smoke.
-tests/soak/run.sh --profile=smoke --out=/tmp/soak-smoke
-
-# 24-h manual run.
-tests/soak/run.sh --profile=full --out=/var/log/ezpn-soak
+```sh
+cargo build --locked --release --bins
+bash tests/soak/run.sh --profile=smoke --out=target/soak-smoke --build-features=default
+bash tests/soak/run.sh --profile=full --out=target/soak-full --build-features=default
+# A short diagnostic run is explicitly labeled custom, not a completed soak.
+bash tests/soak/run.sh --duration=30 --out=target/soak-diagnostic
+python3 scripts/ssh-smoke.py --out=target/ssh-smoke
+python3 scripts/preflight.py --mode=ci --ssh=optional
+python3 scripts/preflight.py --mode=release --ssh=required
+python3 scripts/bench-regression.py --base=origin/main
 ```
 
-Override the binary path with `--bin=/path/to/ezpn` or
-`EZPN_BIN=/path/to/ezpn` for sanitizer / coverage builds.
+## Soak
 
-## Output layout
+Smoke runs 30 minutes with 5 panes; full runs 24 hours with 100 panes.
+Every pane runs real bounded bursts of output. The actual interactive client
+creates/closes a tab, detaches and reattaches periodically. Each cycle saves
+and validates a real snapshot. RSS samples, actual elapsed time, completed
+cycles, snapshots and lifecycle events are recorded in the output directory.
 
-```
-$OUT_DIR/
-├── rss.csv             # epoch,rss_kb every 10 s
-├── snapshot_size.csv   # epoch,bytes  every 60 s
-├── lifecycle.log       # tab / detach / cleanup events
-└── summary.txt         # pass / fail report
-```
+Criteria remain final RSS <=1.30 times the hour-one sample (initial workload-ready
+sample for shorter runs), zero daemon-child zombies, and snapshot growth <=100 MiB.
+Each pane must finish its first 1 MiB burst before the initial sample; setup
+duration is recorded separately, avoiding an idle-before-workload RSS baseline.
+Missing samples, failed IPC, incomplete cycles and daemon exits fail. No
+signal is substituted for tab work; no failure is converted into a warning.
+A short run cannot establish 24-hour stability or real-editor compatibility.
 
-## Pass criteria
+Each report includes the executable path, SHA-256, version and explicitly
+supplied `--build-features=default|all-features` label (otherwise unspecified).
+Do not infer features from `target/release/ezpn`: an all-feature Cargo bench
+build can replace it. Preflight builds benches first and materializes the
+default-feature release binary last. For both-mode validation, copy each
+just-built executable to a distinct artifact path and test both, retaining
+failed results; a default-feature pass does not excuse a render-diff failure.
 
-Per #95 acceptance:
+## Terminal And SSH
 
-- **RSS growth**: `final_rss ≤ 1.30 × hour1_rss` (allows steady-state,
-  blocks unbounded). For the smoke profile we use `initial_rss` as the
-  baseline since the run is shorter than 1 h.
-- **Zombies**: 0 `<defunct>` processes whose ppid is the soak daemon at
-  the end of the run.
-- **Snapshot bloat**: net snapshot file growth ≤ 100 MB over the run.
+`cargo test --locked --test integration` runs real client PTYs with
+`xterm-256color`, `screen-256color`, `tmux-256color` and `vt100` TERM values.
+This checks terminal protocol paths, not those GUI emulators themselves.
+Tests cover process/state preservation, kernel resize, readonly/shared
+clients, alternate-screen/raw-mode restoration and abrupt socket loss.
 
-## Exit codes
+The SSH script starts only a private loopback sshd on an ephemeral high port,
+with temporary host/client keys, authorized keys, known hosts and config.
+It does not enable Remote Login, edit `/etc/ssh`, modify `~/.ssh`, use sudo,
+or install missing privilege-separation directories. It makes three real
+`ssh -tt` connections, checking the same shell PID and retained variable
+after clean detach and a killed SSH transport. Authentication/runtime errors
+fail; absent binaries or failed `sshd -t` prerequisites exit 77 with a reason.
+`--ssh=required` treats that explicit skip as a failed prerequisite.
 
-| Code | Meaning                            |
-|------|------------------------------------|
-| 0    | pass                               |
-| 1    | unbounded RSS growth               |
-| 2    | zombie processes left over         |
-| 3    | snapshot bloat                     |
-| 4    | daemon crashed mid-run             |
-| 64   | usage / setup error                |
+An available unprivileged sshd, usable current account and platform-provided
+privilege-separation support are requirements for real SSH evidence. GUI
+emulator/version, remote host and network-failure matrices still require
+separate measured runs. No universal terminal/SSH guarantee is implied.
 
-## CI integration
+## Gates
 
-Wired in `.github/workflows/bench.yml` as the `soak-smoke` job — runs on
-every PR and uploads `rss.csv` + `summary.txt` as artifacts. The full
-24 h run is intentionally **not** in CI; it lives on a self-hosted
-runner with a separate cron schedule.
+Preflight records commands, durations, exit codes, PASS/FAIL/SKIP and actual
+libtest summaries in `status.json` plus per-command logs. It explicitly uses
+the manifest's `cargo +<MSRV>`; install that exact toolchain first. Ignored,
+filtered, empty or failed test runs cannot pass the evidence parser. Counts
+are executions, including mounted-module tests, not unique test definitions.
+Release preflight also requires cargo-llvm-cov, cargo-audit and cargo-deny,
+release tests and package verification. Coverage floors are 65% overall
+source lines and 70% for protocol/layout/workspace; missing records fail.
 
-## Limitations
-
-The current synthetic workload sends `SIGUSR1` to the daemon as a
-placeholder for the IPC tab-cycle path because the IPC test harness
-(#62) is not yet wired into `tests/soak/`. As soon as `ezpn-ctl` ships
-a stable `tab new` / `tab kill` command we will swap the signal stub
-for a real IPC dispatch. Until then the script catches RSS regressions
-in the daemon's idle / signal path but does not exercise the full
-tab/pane lifecycle hot loop.
-
-Real-app workloads (vim/nvim long-living sessions) are out of scope
-for v0.16 — the synthetic `yes | head -c 1M; sleep 1` workload is what
-the issue calls for.
+Run the separate performance gate against the reviewed base revision before
+release. It archives the entire baseline source, not just bench files, and
+does not touch the current branch. All four Criterion suites must produce
+the same metric set. A metric whose mean confidence-interval lower bound
+exceeds +5% in at least two of three runs fails. This is an ezpn revision
+comparison, not a tmux/Zellij comparison or a live-daemon RSS benchmark.

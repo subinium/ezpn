@@ -1,274 +1,139 @@
-# Terminal protocol — what ezpn passes through, intercepts, and modifies
+# Terminal Protocol and Compatibility
 
-ezpn sits between the PTY (where your shell, editor, and tools emit
-escape sequences) and the host emulator (the terminal app the user is
-actually staring at). For each protocol the question is the same:
-**does ezpn forward the bytes verbatim, intercept and act on them, or
-modify them on the way through?**
+This document describes the current implementation, not a certification of every
+terminal, shell, editor, or SSH configuration. See the [release audit](audits/v0.14.0.md)
+for test evidence and unresolved regressions.
 
-This document is the reference for the v1 behaviour of every protocol
-ezpn touches. The implementation lives in:
+## Two Separate Terminal Boundaries
 
-* [`src/terminal_state.rs`](../src/terminal_state.rs) — per-pane DECSET
-  bits, Kitty keyboard stack, OSC 7 cwd cache, OSC 52 decision cache,
-  theme palette.
-* [`src/pane.rs`](../src/pane.rs) — the byte stream interceptor that
-  sees PTY output before vt100 does.
+Output follows this path:
 
-## 1. Quick map
-
-| Protocol            | ezpn behaviour          | Owner issue | See also |
-|---------------------|-------------------------|-------------|----------|
-| DECSET ?2026 (sync) | Intercept + buffer      | #73         | §2 |
-| DECSET ?2004 (bracketed paste) | Track per-pane state | #78    | §3 |
-| DECSET ?1004 (focus reporting) | Track per-pane state | #78    | §3 |
-| DECSET ?1000/?1002/?1003 (mouse) | Track per-pane state, encode in §3 | #78 | §3 |
-| DECSET ?1006 (SGR mouse) | Track per-pane state | #78        | §3 |
-| DECSET ?1049 (alt screen) | Vt100 owns it      | —           | §3 |
-| Kitty keyboard (`CSI > … u`, `CSI = … ; … u`, `CSI < … u`, `CSI ? u`) | Intercept; per-pane stack | #74 | §4 |
-| OSC 4 (palette query) | Multiplexer-side reply when theme set, else pass-through | #77 | §5 |
-| OSC 7 (reported cwd) | Intercept per pane, fed into `live_cwd()` | #75 | §6 |
-| OSC 8 (hyperlink)    | **Lost end-to-end** (vt100 limitation) | #76 | §7 |
-| OSC 10/11/12 (fg/bg/cursor query) | Multiplexer-side reply when theme set, else pass-through | #77 | §5 |
-| OSC 52 (clipboard)   | Per-pane policy chain   | #79         | [clipboard.md](./clipboard.md) |
-| OSC 133 D (semantic prompt) | Intercept; emit `pane.prompt` event | #81 | §8 |
-| Bracketed paste content | Pass-through unchanged | —          | §3 |
-
-## 2. DECSET ?2026 — synchronised output
-
-Apps send `CSI ? 2026 h` to begin a frame and `CSI ? 2026 l` to end it.
-The terminal is supposed to buffer everything in between and present it
-atomically to the user — no partial repaints during a long redraw.
-
-ezpn intercepts these brackets **before vt100 sees them** ([`Pane::in_sync`](../src/pane.rs)).
-While `in_sync` is true, ezpn buffers PTY output in a per-pane staging
-buffer and does NOT emit frames to clients. When the closing bracket
-arrives (or a sync watchdog fires after 250 ms), ezpn flushes the entire
-staged buffer to vt100 and emits a single `S_OUTPUT` frame to clients.
-
-**Why this matters**: applications like helix, neovim with the
-`render-incremental` patch, and modern TUI frameworks emit hundreds of
-small writes per redraw. Without sync brackets, ezpn would push partial
-frames every couple of ms and the user would see tearing. With sync
-brackets, the user sees one clean repaint.
-
-ezpn always advertises support for `?2026` in its DA2 reply. There is
-no opt-out.
-
-## 3. Per-pane state machine (#78)
-
-The fields in [`PaneTerminalState`](../src/terminal_state.rs) track
-DECSET bits the multiplexer needs to respond to **before** vt100 does:
-
-```rust
-pub struct PaneTerminalState {
-    pub bracketed_paste: bool,        // ?2004
-    pub focus_reporting: bool,        // ?1004
-    pub mouse_mode: MouseMode,        // ?1000/?1002/?1003 + ?1006
-    pub kitty_kbd: KittyKbdStack,     // CSI u stack (§4)
-    pub reported_cwd: Option<(PathBuf, Instant)>,  // OSC 7 (§6)
-    pub osc52_decision: Osc52Decision,             // OSC 52 (clipboard.md)
-    pub osc52_pending_confirm: Vec<Vec<u8>>,
-}
+```text
+child process -> pane PTY -> interceptor -> vt100 screen -> renderer -> attached client -> host terminal
 ```
 
-Every pane gets a fresh state on spawn. When a pane slot is reused for
-a new shell, `PaneTerminalState::reset()` zeroes everything — no leak
-of the previous occupant's state.
+ezpn is a cell-based terminal multiplexer, not a transparent ANSI proxy. Most
+child output is interpreted and redrawn. A sequence reaching the pane parser
+does not mean its original bytes reach the host terminal.
 
-**Not tracked here**:
+Input travels in the opposite direction as decoded crossterm events. The client
+requests host mouse, focus, bracketed-paste, and keyboard-disambiguation reporting.
+The server then encodes input according to the **child application's** requested
+modes. Host support and child negotiation are separate.
 
-* `?1049` alternate-screen — vt100's `Screen::alternate_screen()` is
-  authoritative.
-* `?2026` sync brackets — owned by [`Pane::in_sync`](../src/pane.rs)
-  (§2).
+The client/server version handshake and its capability strings describe ezpn's
+transport. They do not negotiate the host emulator's complete terminal feature
+set or replace a child's Kitty keyboard requests.
 
-### 3.1 Mouse encoding
+## Input Contract
 
-| Wire request   | Effective `MouseProtocol` |
-|----------------|---------------------------|
-| `?1000 h`      | `X10`                     |
-| `?1002 h`      | `Btn`                     |
-| `?1003 h`      | `Any`                     |
+| Input | Current behavior |
+|---|---|
+| Legacy keyboard | Applications that have not requested Kitty enhancements receive legacy text, control bytes, CSI/SS3 navigation and function-key sequences. Application-cursor mode is respected. |
+| Kitty keyboard | Per-pane push, pop, modify and query handling. Accepted bits are disambiguation (1), event reporting (2), and report-all-as-escapes (8). Alternate key codes (4) and associated text (16) are masked out. |
+| Key releases | Forwarded only when the child's active encoding requests event reports and that key is encoded as an enhanced report. ezpn cannot recover events the host did not report. |
+| Paste | In normal mode, decoded paste text goes to the active pane, or live broadcast targets. Each child gets bracketed-paste delimiters only if it enabled `?2004`. This is not byte-for-byte forwarding of host paste envelopes. |
+| Focus | Focus-gained/lost reports go to the active child only if it enabled `?1004`. |
+| Mouse | Child modes include `?9`, `?1000`, `?1002`, and `?1003`; encodings include legacy, UTF-8 (`?1005`), SGR (`?1006`), and urxvt (`?1015`). Events are filtered by the requested mode and translated to pane-relative coordinates. |
+| Multiplexer selection | Pane chrome is handled by ezpn. Shift-modified mouse input retains ezpn selection instead of being sent to the child. |
 
-| Wire request   | Effective `MouseEncoding` |
-|----------------|---------------------------|
-| `?1006 h`      | `Sgr`                     |
-| (default)      | `X10` (legacy 6-byte)     |
+The Kitty flag stack is bounded to 32 entries and separated between normal and
+alternate screens. Unsupported flags do not become supported merely because the
+host terminal implements them. In particular, crossterm events do not retain
+every field of the full Kitty protocol.
 
-ezpn re-emits mouse events to the child using the **child's requested
-encoding**, even if the host emulator forwards them in a different
-encoding. Crossterm's mouse-event abstraction is used in between.
+Legacy mouse encodings have coordinate limits. Unrepresentable reports are
+dropped rather than wrapped or clamped to a different cell. There is no promise
+of pixel-mouse or every terminal-specific mouse extension.
 
-## 4. Kitty keyboard protocol (#74)
+## Output Contract
 
-The Kitty progressive enhancement protocol (https://sw.kovidgoyal.net/kitty/keyboard-protocol/)
-adds modifier-aware key reports via `CSI u`. ezpn implements the **flag
-stack** semantics:
+| Output | Current behavior |
+|---|---|
+| Text, cursor movement, scrolling and alternate screens | Interpreted by the pane parser and redrawn within pane geometry. This is not raw pass-through or complete terminal emulation. |
+| Cell styles | Foreground/background, bold, italic, underline and inverse are represented. Do not assume every SGR attribute, underline style, font selection or decoration survives. |
+| OSC 0/2 titles | Bounded, control-filtered per-pane title metadata. The attached client's host window title identifies the ezpn session; it does not simply follow whichever child writes last. |
+| OSC 7 cwd | A fresh, accepted local-host file URI can supply the pane's working directory. Details below. |
+| OSC 4/10/11/12 queries | A pane-side responder can answer populated `ThemePalette` entries. Unanswered queries are not relayed to the host. Normal UI theme initialization does not populate this separate pane query palette. |
+| OSC 52 | Selected envelopes use a separate forwarding queue and clipboard policy. See [clipboard behavior](clipboard.md). |
+| OSC 8 hyperlinks | Hyperlink metadata is not preserved or forwarded end-to-end. Visible anchor text remains; copy and history contain text, not the hidden URL. A host may independently detect a URL printed literally. |
+| OSC 133 semantic markers | No complete prompt-boundary implementation. An event type or CLI flag is not evidence that the PTY interceptor publishes prompt events. Do not rely on `--await-prompt` as a command-completion guarantee. |
+| Sixel, Kitty graphics and other DCS/APC payloads | No supported graphics pass-through, cell storage, or replay contract. |
+| Other terminal queries, bells and notifications | No general raw relay to the host. Only specifically implemented parser/interceptor behavior is available; ezpn does not advertise universal support through DA1/DA2. |
 
-| Wire request                  | Action |
-|-------------------------------|--------|
-| `CSI > <flags> u`             | Push `flags` on the stack (becomes new top). |
-| `CSI = <flags> ; <mode> u`    | Modify top entry. `mode = 1` set, `2` OR (enable bits), `3` AND-NOT (disable bits). Modes outside `1..=3` are ignored. |
-| `CSI < <n> u`                 | Pop `n` entries (default `1`). Saturates at empty. |
-| `CSI ? u`                     | Query: ezpn replies with `CSI ? <flags> u` for the current top. |
+Implementation pointers: [pane parsing and input encoding](../src/pane.rs),
+[per-pane modes](../src/terminal_state.rs), [input routing](../src/server/input_modes.rs),
+and [rendering](../src/render.rs).
 
-The flag bits (low 5 bits, see `KittyKbdFlags`):
+## Synchronized Output
 
-* `0b00001` — disambiguate
-* `0b00010` — report events
-* `0b00100` — report alternates
-* `0b01000` — report all as escapes
-* `0b10000` — report associated text
+`CSI ? 2026 h` opens a per-pane synchronization window; `CSI ? 2026 l` closes it.
+Repeated opens do not create a nesting counter.
 
-Stack depth is capped at 32 entries (apps that push without ever
-popping silently rotate out the oldest). ezpn forwards key reports in
-the encoding the **active flags** require — modifier-only key presses,
-key releases, alternate keysyms — without translating them to legacy
-crossterm reports.
+The daemon continues processing output into the pane's vt100 screen while the
+window is open. It coalesces output-driven dirty updates until close, EOF, or a
+roughly **33 ms** watchdog. It does **not** maintain a private, complete staging
+screen that is committed atomically afterward.
 
-The client must advertise the `kitty-kbd-stack` capability in
-`ClientHello.supported_features` (see
-[`docs/protocol/v1.md`](./protocol/v1.md#5-capability-strings-frozen))
-before ezpn forwards Kitty-encoded key reports; older clients see only
-the legacy `Esc + char` form.
+A resize, focus change, overlay, or another user-forced redraw can expose the
+already-updated screen before the child closes its window. Host-side
+synchronized-update envelopes reduce visible intermediate writes when supported
+by the host; they do not turn this into transaction isolation or a timing
+guarantee. There is no special DA2 advertisement of `?2026`.
 
-## 5. OSC 4 / 10 / 11 / 12 — colour queries (#77)
+## Color and Unicode Limits
 
-Apps query the terminal's colour palette to auto-detect light vs dark
-backgrounds (`bat`, `delta`, `fzf` respect this).
+The renderer emits actual basic/bright ANSI-16 SGR for palette indices 0..15,
+rather than assuming crossterm named colors imply basic ANSI output. Higher
+indices and RGB have separate output paths. Child cell colors are preserved
+independently of the daemon's `NO_COLOR` UI preference.
 
-| OSC | Subject |
-|-----|---------|
-| 4   | Indexed-colour query (`OSC 4 ; <n> ; ?`). |
-| 10  | Foreground query. |
-| 11  | Background query. |
-| 12  | Cursor colour query. |
+UI `ColorDepth` is detected from the **daemon's startup environment**. Theme
+reload retains that depth. It is not renegotiated for each attached terminal:
+a later SSH client or a mixed 16-color/truecolor client set does not automatically
+get independent palettes. Do not infer child RGB down-conversion from the UI
+theme's fallback.
 
-ezpn answers from its own theme palette **only when a theme override is
-active** (any field of `ThemePalette` is `Some`). Otherwise the query
-passes through to the host emulator unchanged so the host can answer
-authoritatively.
+CJK width, combining text, selections and clipping have regression coverage.
+That is not complete grapheme-cluster support across all emulators. The parser
+has bounded cell text storage, and terminals can disagree on emoji and ambiguous
+character widths.
 
-The xterm-format response uses 4 hex digits per channel, byte-doubled
-to fill 16-bit channels:
+The optional `--features render-diff` path uses a bounded virtual screen to emit
+ANSI deltas. Complete redraws establish a baseline; unsupported controls,
+unmodelled text widths and oversized grids retain original output and disable
+diffing until a new full redraw. Clipboard side effects are outside that frame
+model. This is not a universal speed or memory guarantee.
 
-```
-ESC ] 11 ; rgb:1d1d/2020/2424 ESC \
-```
+## Working Directories and History
 
-This matches what real xterms send and is the form `bat` and friends
-parse.
+OSC 7 accepts `file://` URIs for an empty host, `localhost`, or the daemon's own
+hostname. The decoded path must be absolute and contain no control characters.
+A report is preferred for 30 seconds, then OS process lookup or the launch
+directory is used. A local ezpn pane running SSH does not acquire an arbitrary
+remote filesystem cwd; a daemon running on that remote host is a different case.
 
-## 6. OSC 7 — reported cwd (#75)
+The reported directory is untrusted process output and can influence the
+working directory used for a new pane. It is neither process authentication nor
+a filesystem permission boundary.
 
-Modern shells emit `OSC 7 ; file://<host><path>` on every directory
-change. ezpn intercepts the sequence per pane and stores the path in
-`PaneTerminalState::reported_cwd`. `live_cwd()` then prefers this value
-over `/proc/<pid>/cwd` polling — and over SSH that's the **only** way
-to know the remote shell's cwd.
+A live detached session keeps its daemon and processes. Disk or named workspace
+snapshots instead recreate processes. Opt-in history replay restores sanitized
+text, not process memory, executable terminal controls, hyperlink/graphics
+metadata, or an exact live alternate-screen application. Internal copy buffers
+are runtime state, not snapshot-backed clipboard history.
 
-Stale values are detected via the timestamp paired with the cwd. If
-the value is older than the procfs poll interval and procfs disagrees,
-procfs wins (handles `cd` from a child shell that didn't emit OSC 7).
+## Audit Status
 
-See [shell-integration.md](./shell-integration.md) for shell snippets.
+The reliability audit reproduced upstream vt100 0.16.2 failures involving
+one-column wide output, one-row wrapping, and shrinking a wide cell before
+erase, plus missing soft-wrap metadata at a wide-character boundary. These
+are covered by passing real regression tests using the private MIT-licensed
+parser in `src/vt100/`. Its upstream revision and narrow boundary patches are
+documented in `src/vt100/UPSTREAM.md` and shipped in the crate. Passing these
+regressions does not establish compatibility with every terminal emulator.
 
-## 7. OSC 8 — hyperlinks (#76)
-
-OSC 8 lets terminal apps emit clickable hyperlinks:
-
-```
-ESC ] 8 ; id=link1 ; https://example.com ESC \
-Anchor text
-ESC ] 8 ; ; ESC \
-```
-
-ezpn does NOT intercept OSC 8 — the bytes pass through to vt100. But
-**`vt100` v0.15 does not preserve OSC 8 in cell state**. The hyperlink
-metadata is dropped on the floor at vt100 parse time. End-to-end:
-
-* In live mode the hyperlink is **lost** (vt100 drops it; clients only
-  see the cell-grid output, not the original byte stream).
-* In copy mode the selection contains the visible text only, no URL.
-* In snapshot replay the hyperlink is gone (it was never stored).
-* In scrollback re-render it's gone.
-
-Apps that fall back gracefully (printing the URL inline when hyperlinks
-aren't supported) work fine. Apps that emit hyperlinks unconditionally
-show the anchor text only.
-
-**Path forward**: cell-by-cell preservation requires either forking
-vt100 to add a per-cell hyperlink ID or rewriting the cell store. Both
-are out of scope for v0.12 — see issue #76 for the v0.14 plan.
-
-## 8. OSC 133 D — semantic prompt (#81)
-
-`OSC 133 ; D ; <exit_code>` marks the boundary between a command's
-output and the next prompt. ezpn intercepts D markers and emits a
-`pane.prompt` event on the event bus
-([`docs/scripting.md`](./scripting.md)). The `send-keys --await-prompt`
-flag in `ezpn-ctl` filters these events to detect when a scripted
-command has finished.
-
-ezpn does not synthesise OSC 133 — the shell must emit it. Snippets
-for bash, zsh, and fish are in
-[shell-integration.md](./shell-integration.md).
-
-## 9. Pass-through, unmodified
-
-These protocols pass through ezpn unchanged. ezpn never inspects the
-content; the host emulator handles them.
-
-* Bracketed paste content (between `?2004` brackets).
-* SGR colours and attributes (FG/BG, bold, italic, underline, strike).
-* Cursor movement (`CSI A/B/C/D`, `CSI H`, `CSI <r>;<c>H`, scroll
-  regions).
-* Title-bar OSC (OSC 0/1/2). The host emulator's window title reflects
-  whichever pane wrote last; ezpn does not synthesise titles.
-* Bell (`BEL`).
-* DA1/DA2 device attribute queries — the host emulator answers, except
-  ezpn injects `?2026` into its DA2 advertisement so apps that probe
-  for sync support see it.
-
-## 10. Off — never forwarded
-
-* OSC 9 / 777 (iTerm2-style notifications) — currently dropped. A
-  multiplexer-aware notification API is on the roadmap (#90 family).
-* DCS sequences other than the few above — currently dropped by vt100.
-  Apps that depend on Sixel or kitty graphics need to attach to the
-  host emulator directly, outside ezpn.
-
-## 11. Verification
-
-For each protocol, a one-liner that exercises it from inside an ezpn
-pane:
-
-```sh
-# DECSET 2026 sync (no visible effect; check `Pane::in_sync` toggle in trace logs)
-printf '\e[?2026h\e[2J\e[H[redrawing]\e[?2026l'
-
-# Kitty kbd stack push, query, pop
-printf '\e[>1u'         # push DISAMBIGUATE
-printf '\e[?u'          # query → server replies with current top
-printf '\e[<1u'         # pop
-
-# OSC 7
-printf '\e]7;file://%s/tmp\e\\' "$(hostname)"
-
-# OSC 52 (subject to clipboard policy)
-printf '\e]52;c;%s\e\\' "$(printf 'hello' | base64)"
-
-# OSC 4 / 10 / 11 / 12 (responses appear inline as `\e]N;rgb:…\e\\`)
-printf '\e]11;?\e\\'
-
-# OSC 133 D
-printf '\e]133;D;0\e\\'
-```
-
-If a sequence misbehaves, enable trace logging:
-
-```sh
-EZPN_LOG=trace ezpn 2>ezpn.log
-grep -E '(decset|osc[0-9]+|kitty)' ezpn.log
-```
+Geometry tests, a simulated terminal, a real Unix PTY, loopback SSH, and a GUI
+emulator session are different kinds of evidence. Consult the
+[release audit](audits/v0.14.0.md) and [preflight checks](../scripts/preflight.py)
+rather than treating this protocol description as a 100% compatibility claim.

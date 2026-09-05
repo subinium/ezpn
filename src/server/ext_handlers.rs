@@ -166,7 +166,7 @@ fn build_tab_info(
         let screen = pane.screen();
         let (rows, cols) = screen.size();
         let title = {
-            let t = screen.title();
+            let t = pane.title();
             if t.is_empty() {
                 pane.name().map(|s| s.to_string())
             } else {

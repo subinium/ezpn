@@ -8,17 +8,15 @@
 //!      but we sanity-check that a follow-up `ezpn ls` no longer reports
 //!      the session).
 //!
-//! GATED: `#[ignore]` until `EZPN_TEST_SOCKET_DIR` is honored by the daemon.
 
 use std::time::Duration;
 
 use crate::common::{kill_session, ls, spawn_daemon, wait_for, TestEnv};
 
 #[test]
-#[ignore = "requires EZPN_TEST_SOCKET_DIR support in src/main.rs (#62 follow-up commit)"]
 fn kill_removes_socket_and_session() {
     let env = TestEnv::new();
-    let daemon = spawn_daemon(&env, "killable");
+    let mut daemon = spawn_daemon(&env, "killable");
     let socket = daemon.socket.clone();
 
     // Sanity: the socket exists before we ask for kill.
@@ -56,5 +54,8 @@ fn kill_removes_socket_and_session() {
 
     // Drop the handle explicitly so a stale `child.wait()` doesn't hang
     // the test process if the daemon has already exited cleanly.
-    drop(daemon);
+    assert!(
+        daemon.wait_exit().success(),
+        "daemon kill did not exit cleanly"
+    );
 }

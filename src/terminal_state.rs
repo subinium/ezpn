@@ -7,9 +7,8 @@
 //! this struct rather than scanning vt100's screen each frame.
 //!
 //! Designed for issues #74–#79 (terminal-protocol foundations). The
-//! struct deliberately does NOT include the DECSET 2026 sync bit —
-//! that's owned by issue #73 (`Pane::in_sync`), and DECSET ?1049
-//! (alternate screen) which vt100 already tracks internally.
+//! vt100 remains authoritative for the display grid; alternate-screen
+//! transitions also select the corresponding Kitty keyboard stack here.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -23,6 +22,8 @@ pub enum MouseProtocol {
     /// No mouse reporting (default).
     #[default]
     Off,
+    /// `?9` - button presses only, without modifiers or wheel events.
+    Press,
     /// `?1000` — press/release only.
     X10,
     /// `?1002` — press/release + drag motion while button held.
@@ -37,6 +38,10 @@ pub enum MouseEncoding {
     /// X10 6-byte encoding (`ESC [ M` + 3 bytes).
     #[default]
     X10,
+    /// UTF-8 encoding of button and coordinates (`?1005`).
+    Utf8,
+    /// Decimal encoding with the legacy button offset (`?1015`).
+    Urxvt,
     /// SGR encoding (`ESC [ < … M/m`), enabled by `?1006`.
     Sgr,
 }
@@ -136,6 +141,9 @@ impl KittyKbdStack {
     /// `mode`: 1 = set, 2 = OR (enable bits), 3 = AND-NOT (disable bits).
     /// Modes outside 1..=3 are ignored.
     pub fn modify_top(&mut self, flags: KittyKbdFlags, mode: u8) {
+        if !(1..=3).contains(&mode) {
+            return;
+        }
         if self.entries.is_empty() {
             self.entries.push(KittyKbdFlags(0));
         }
@@ -249,9 +257,8 @@ impl Rgb {
 /// The active theme's foreground / background / cursor colours plus the
 /// 256-colour palette consulted when an app sends `OSC 4 ; N ; ?`.
 ///
-/// `None` for any field disables interception for that query — ezpn passes
-/// the request through to the host emulator unchanged so the host can
-/// answer authoritatively.
+/// `None` for a field leaves that query unanswered. Host query/reply routing
+/// is not implemented by the pane interceptor.
 #[derive(Clone, Debug)]
 pub struct ThemePalette {
     pub fg: Option<Rgb>,
@@ -259,7 +266,7 @@ pub struct ThemePalette {
     pub cursor: Option<Rgb>,
     /// 256-colour ANSI palette. Indices 0–15 are the canonical 16, 16–231
     /// the 6×6×6 cube, 232–255 the greyscale ramp. `None` per-index means
-    /// "let the host emulator answer".
+    /// "no local answer".
     pub palette: [Option<Rgb>; 256],
 }
 
@@ -276,7 +283,7 @@ impl Default for ThemePalette {
 
 impl ThemePalette {
     /// Whether ezpn should answer any OSC colour query at all. If every slot
-    /// is `None` we fall through to the host emulator.
+    /// is `None` no local colour answer is available.
     pub fn is_active(&self) -> bool {
         self.fg.is_some()
             || self.bg.is_some()
@@ -289,12 +296,13 @@ impl ThemePalette {
 
 /// Aggregate per-pane terminal state. Owned by [`crate::pane::Pane`].
 ///
-/// **Not included** (intentionally):
-/// - `?1049` alternate-screen — vt100's `Screen::alternate_screen()` is
-///   authoritative.
-/// - `?2026` synchronised output — issue #73 owns `Pane::in_sync`.
+/// vt100 is authoritative for the display grid; the alternate-screen bit
+/// here only selects the keyboard stack. Pane exposes the sync timestamp
+/// through `in_sync` and `sync_opened_at` for the renderer.
 #[derive(Clone, Debug, Default)]
 pub struct PaneTerminalState {
+    /// Most recent bounded OSC 0/2 title from the child.
+    pub title: String,
     /// `?2004` bracketed paste mode.
     pub bracketed_paste: bool,
     /// `?1004` focus reporting mode.
@@ -303,21 +311,46 @@ pub struct PaneTerminalState {
     pub mouse_mode: MouseMode,
     /// Kitty keyboard protocol flag stack (#74).
     pub kitty_kbd: KittyKbdStack,
+    inactive_kitty_kbd: KittyKbdStack,
+    alternate_screen: bool,
+    /// DECSET 2026 is a mode, not a nestable bracket counter.
+    pub sync_opened_at: Option<Instant>,
     /// Most recent OSC 7 reported cwd from the shell, with a timestamp so
     /// stale values can fall back to procfs polling (#75).
     pub reported_cwd: Option<(PathBuf, Instant)>,
     /// Per-pane OSC 52 decision cache (#79).
     pub osc52_decision: Osc52Decision,
     /// Pending pane-scoped OSC 52 set-clipboard prompts awaiting user
-    /// confirmation. Each entry is the **decoded** payload (not the raw
-    /// `OSC 52 ; c ; …` envelope) so the prompt can show byte counts and
-    /// the multiplexer can re-emit the canonical envelope on accept.
+    /// confirmation. Entries are complete OSC 52 envelopes, ready for
+    /// forwarding on accept; the UI byte count includes the envelope.
     pub osc52_pending_confirm: Vec<Vec<u8>>,
 }
 
 impl PaneTerminalState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn set_alternate_screen(&mut self, alternate: bool) {
+        if self.alternate_screen != alternate {
+            std::mem::swap(&mut self.kitty_kbd, &mut self.inactive_kitty_kbd);
+            self.alternate_screen = alternate;
+        }
+    }
+
+    pub fn alternate_screen(&self) -> bool {
+        self.alternate_screen
+    }
+
+    /// RIS resets terminal modes, but must not forget a clipboard denial.
+    pub fn reset_terminal_modes(&mut self) {
+        let decision = self.osc52_decision;
+        let pending = std::mem::take(&mut self.osc52_pending_confirm);
+        let title = std::mem::take(&mut self.title);
+        *self = Self::default();
+        self.osc52_decision = decision;
+        self.osc52_pending_confirm = pending;
+        self.title = title;
     }
 
     /// Reset state when a pane slot is reused for a freshly spawned shell.
@@ -335,6 +368,13 @@ impl PaneTerminalState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reliability_invalid_modify_does_not_create_stack_entry() {
+        let mut stack = KittyKbdStack::new();
+        stack.modify_top(KittyKbdFlags(1), 99);
+        assert_eq!(stack.depth(), 0);
+    }
 
     #[test]
     fn kitty_stack_push_pop_top() {

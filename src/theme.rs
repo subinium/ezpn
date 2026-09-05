@@ -1,15 +1,8 @@
 //! TOML palette + true-color downgrade matrix (issue #85).
 //!
-//! Today the renderer uses crossterm's hardcoded colour choices and only
-//! `BorderStyle` is themed. This module ships a declarative palette with a
-//! deterministic downgrade path so a single theme file looks consistent on
-//! true-colour, 256-colour, and 16-colour terminals.
-//!
-//! Scope of *this* commit (worktree-isolated):
-//! - Pure data + parser. Renderer wiring lives in `render.rs` and is the
-//!   parent-side responsibility — kept off-limits per the task brief.
-//! - Five built-in themes embedded via `include_str!`.
-//! - Hex parsing, contrast helpers, and a 24-bit -> 256/16 quantizer.
+//! Declarative palettes, five embedded themes, and deterministic 24-bit to
+//! 256/16-color quantization. Callers select the output capability; environment
+//! detection alone is not negotiation with an attached terminal.
 //!
 //! ```toml
 //! [theme]
@@ -126,10 +119,10 @@ fn parse_byte(hi: u8, lo: u8) -> Result<u8, ThemeError> {
 }
 
 /// Terminal palette depth, surfaced by callers based on `$COLORTERM`,
-/// `$TERM`, or a DA1/CSI 0c probe.
+/// `$TERM`, or explicit client capability information.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColorDepth {
-    /// 24-bit. `$COLORTERM` is `truecolor` or `24bit`, or DA1 reports it.
+    /// 24-bit RGB output.
     TrueColor,
     /// 256-colour palette (8-bit indexed, e.g. `xterm-256color`).
     Palette256,
@@ -138,9 +131,7 @@ pub enum ColorDepth {
 }
 
 impl ColorDepth {
-    /// Best-effort detection from environment variables. Callers that hold
-    /// a live terminal handle should prefer a DA1 probe and pass the result
-    /// in directly.
+    /// Best-effort environment detection, not a live terminal probe.
     pub fn detect() -> Self {
         if let Ok(ct) = std::env::var("COLORTERM") {
             let lower = ct.to_ascii_lowercase();
@@ -179,19 +170,10 @@ pub enum Resolved {
 /// system 0..=15 vary by emulator configuration and would defeat the
 /// purpose of a deterministic theme.
 pub fn rgb_to_xterm256(rgb: RgbColor) -> u8 {
-    // Grayscale check first: if r ≈ g ≈ b, the grayscale ramp is closer
-    // (it has 24 steps vs the cube's 6, so ~4× the resolution on the
-    // achromatic axis).
-    let max = rgb.r.max(rgb.g).max(rgb.b) as i32;
-    let min = rgb.r.min(rgb.g).min(rgb.b) as i32;
-    let chroma = max - min;
-
     let (cube_idx, cube_dist) = nearest_cube(rgb);
-    if chroma < 8 {
-        let (gray_idx, gray_dist) = nearest_grayscale(rgb);
-        if gray_dist <= cube_dist {
-            return gray_idx;
-        }
+    let (gray_idx, gray_dist) = nearest_grayscale(rgb);
+    if gray_dist <= cube_dist {
+        return gray_idx;
     }
     cube_idx
 }
@@ -222,12 +204,11 @@ fn nearest_cube_axis(v: u8) -> usize {
 
 fn nearest_grayscale(rgb: RgbColor) -> (u8, u32) {
     // The xterm grayscale ramp is `8 + 10*i` for i in 0..24.
-    let avg = ((rgb.r as u32 + rgb.g as u32 + rgb.b as u32) / 3) as i32;
     let mut best_idx = 232u8;
     let mut best_d = u32::MAX;
     for i in 0..24u8 {
-        let level = 8 + 10 * i as i32;
-        let d = (avg - level).unsigned_abs();
+        let level = 8 + 10 * i;
+        let d = dist_sq(rgb, RgbColor::new(level, level, level));
         if d < best_d {
             best_d = d;
             best_idx = 232 + i;
@@ -241,8 +222,7 @@ fn nearest_grayscale(rgb: RgbColor) -> (u8, u32) {
 /// Map an RGB triplet to the closest of the 16 ANSI colours.
 ///
 /// ANSI doesn't have a fixed mapping (palette 0..=15 vary by emulator) so
-/// we use the xterm default values, which match VT100 reference and are
-/// the de-facto standard.
+/// we use a fixed reference palette for reproducible nearest-color choices.
 pub fn rgb_to_ansi16(rgb: RgbColor) -> u8 {
     const ANSI16: [(u8, u8, u8); 16] = [
         (0, 0, 0),       // 0  black
@@ -473,6 +453,14 @@ impl std::error::Error for ThemeError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reliability_xterm256_considers_grays_for_tinted_colors() {
+        let rgb = RgbColor::new(40, 50, 60);
+        let (gray, gray_dist) = nearest_grayscale(rgb);
+        assert!(gray_dist < nearest_cube(rgb).1);
+        assert_eq!(rgb_to_xterm256(rgb), gray);
+    }
 
     #[test]
     fn parses_six_digit_hex() {

@@ -8,8 +8,8 @@
 #     any order (`C-M-Right`, `M-C-Right`).
 #   - Named keys: Enter, Esc, Tab, BackTab, Backspace, Delete, Insert,
 #     Home, End, PageUp, PageDown, Up, Down, Left, Right, Space, F1..F12.
-#   - Single character: literal key. Unmodified `A` and `a` collapse to
-#     lower case (matches crossterm's reporting).
+#   - Single character: literal key. `A` and `S-a` match shifted A;
+#     `%` matches the same glyph with or without a reported Shift modifier.
 #
 # Action vocabulary (frozen v1) — see `src/keymap.rs::Action`.
 
@@ -57,6 +57,7 @@
 
 [keymap.normal]
 # Always-on bindings (no prefix).
+"F1"      = "toggle-settings"
 "M-Up"    = "select-pane up"
 "M-Down"  = "select-pane down"
 "M-Left"  = "select-pane left"

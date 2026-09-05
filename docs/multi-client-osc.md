@@ -1,124 +1,100 @@
-# Multi-client OSC semantics
+# Multi-Client OSC Behavior
 
-This document covers how ezpn handles OSC (Operating System Command) escape
-sequences when multiple clients are attached to the same session, and the
-limitations in v0.12.x.
+Clients share the daemon's active session view and rendered output. They do not
+receive independent raw child-terminal streams. This distinction determines
+which OSC effects are visible, shared, discarded, or not implemented.
 
-## Overview
+See [terminal protocols](terminal-protocol.md) for the input/output boundary and
+[clipboard behavior](clipboard.md) for user-copy versus application authorization.
 
-| OSC code | Subject              | ezpn behaviour                     | Owner issue |
-|---------:|----------------------|------------------------------------|-------------|
-| OSC 4    | Indexed colour query | Multiplexer-side reply when theme set, else pass-through to host | #77 |
-| OSC 7    | Reported cwd         | Captured per pane, used by `live_cwd()` | #75 |
-| OSC 8    | Hyperlink            | Pass-through (limitations below)   | #76 |
-| OSC 10/11/12 | fg / bg / cursor query | Multiplexer-side reply when theme set, else pass-through | #77 |
-| OSC 52   | Clipboard set/get    | Per-pane policy (`allow`/`confirm`/`deny`) + 1 MiB hard cap | #79 |
+## Current Routing
 
-## OSC 8 — hyperlinks
+| Sequence | Routing |
+|---|---|
+| OSC 0/2 title | Stored per pane and used as pane metadata. Client host window titles identify the ezpn session, not the last emitting child. |
+| OSC 7 cwd | Consumed by the daemon as bounded, local-host pane metadata. Not forwarded as a host terminal cwd update. |
+| OSC 4/10/11/12 query | Answered directly to the child only when the pane query palette has the requested entry. No generic host-query fallback or per-client response arbitration. |
+| OSC 8 hyperlink | Metadata is discarded; clients receive visible text only. No live, history, selection or snapshot hyperlink guarantee. |
+| OSC 52 write | Approved application requests and explicit user-copy envelopes use a separate output queue and fan out to attached clients. |
+| OSC 52 read | Denied by default. Allowing a query does not provide a complete reply-routing implementation. |
+| OSC 133 markers and terminal graphics | No complete semantic-prompt, hyperlink-ID, Sixel or Kitty-graphics forwarding/replay contract. |
 
-OSC 8 lets terminal apps emit clickable hyperlinks:
+## Clipboard Fan-Out and Consent
 
-```
-\e]8;id=link1;https://example.com\e\\Anchor text\e]8;;\e\\
-```
+When the daemon drains an approved OSC 52 queue, it sends the envelopes to every
+client attached at that time. This includes readonly clients. Each host terminal
+independently decides whether to accept the request, so one clipboard may change
+while another does not.
 
-ezpn does **not** intercept OSC 8 — the bytes pass through to the host
-emulator. However, ezpn's vt100 backend (`vt100` crate v0.15) does **not**
-preserve OSC 8 in screen state. The hyperlink is invisible in:
+The confirmation prompt and cached decision are **per pane**, shared by the
+session. The first accepted answer from an input-capable client resolves that
+prompt for everyone. A readonly viewer cannot supply the answer but can receive
+the resulting write. There is no per-client clipboard consent or destination
+selection in this path.
 
-- copy mode (selection contains the visible text only — no URL)
-- snapshot replay (hyperlink metadata is lost on detach/reattach)
-- scrollback re-render
+An explicit user copy bypasses the child-output confirmation filter; this does
+not bypass the receiving terminal's own clipboard policy. Copy-mode yanks may
+instead succeed through a daemon-side desktop command, in which case they do
+not also emit fallback OSC 52. On SSH-launched daemons, automatic desktop
+commands are disabled unless explicitly overridden.
 
-In live mode, hyperlinks generally work for apps that emit them in a single
-write, because vt100 sees the bytes once, drops them on the floor, and the
-host emulator (running underneath ezpn) has already received the bytes via
-its own input channel… **wait, no — that's not how it works.** ezpn reads
-PTY output, runs it through vt100, and re-renders cells to clients. OSC 8
-is therefore **lost end-to-end** in v0.12.x.
+A write is an event, not persistent clipboard state. A new or reattached client
+does not receive past writes simply because it gets a full screen redraw.
+Bounded queues, disconnections and terminal policy can prevent delivery.
+Neither an enqueue nor a successful socket write confirms a changed clipboard.
 
-### Workarounds
+## Color and Other Terminal State
 
-- Apps that fall back gracefully (printing the URL inline when hyperlinks
-  aren't supported) are unaffected.
-- Apps that emit hyperlinks unconditionally show the anchor text only.
+The daemon detects UI color depth at startup and shares its resulting rendering
+choices. It does not negotiate separate 16-color, 256-color or truecolor output
+for heterogeneous attached terminals. Actual basic ANSI-16 UI codes are available,
+but that is not per-client capability negotiation or automatic down-conversion
+of all child output.
 
-### Path forward
+The pane-side OSC color-query palette is separate from the resolved UI palette.
+Normal UI theme setup does not populate the former, so selecting a theme is not
+a guarantee that an application's OSC 4/10/11/12 probe receives a response.
+Unanswered probes are not broadcast to whichever host might answer first.
 
-Preserving OSC 8 cell-by-cell requires either forking `vt100` to store a
-per-cell hyperlink ID or rewriting the cell store. Both are out of scope
-for v0.12 — see issue #76.
+Host keyboard reporting is also separate from the child's mode. The client asks
+the host for keyboard disambiguation; the daemon sends legacy or supported
+enhanced reports according to the child. The transport's `kitty-kbd-stack`
+feature string is not proof of complete Kitty support in every attached emulator.
 
-## Multi-client OSC 8 ID collisions
+Mouse and focus input represent events from individual clients routed into the
+shared session. They do not establish independent per-client pane focus or
+application terminal state.
 
-OSC 8 supports an optional `id=…` parameter so that adjacent runs of the
-same hyperlink can be drawn as a single visual link. Different clients
-attached to the same session share the same byte stream, but each client's
-host emulator tracks IDs in its own namespace. There is no collision risk
-between clients today **because** ezpn drops OSC 8 entirely (see above).
+## Cwd, Hyperlinks and Snapshots
 
-If/when OSC 8 gets full pass-through, two attached clients may see
-visually-merged links if the underlying app reuses an ID across logically
-distinct anchors. Fixing this requires per-client ID renumbering — also
-deferred.
+OSC 7 accepts only an empty host, `localhost`, or the daemon's own hostname.
+Its percent-decoded absolute path is untrusted input used for pane cwd display
+and new-pane working-directory selection, with a freshness limit and OS fallback.
+Do not treat it as authenticated remote-process identity or assume arbitrary
+remote-host paths are usable on a local daemon.
 
-## OSC 52 — clipboard
+There is no OSC 8 ID-renumbering problem to solve in the current output path:
+hyperlink metadata is not retained or emitted. The visible label is preserved;
+a literal URL can still be copied or detected independently by a host terminal.
 
-OSC 52 lets apps write to (and, less commonly, read from) the user's
-system clipboard. ezpn applies a per-pane policy chain:
+Runtime copy buffers, live detached processes, and disk snapshots are different
+state. Snapshots recreate processes; opt-in history restores sanitized text.
+They do not replay clipboard events, preserve graphics or hidden hyperlinks,
+or resume a live editor's process memory.
 
-1. **Hard cap** (`clipboard.osc52_max_bytes`, default 1 MiB) — anything
-   larger is dropped with a `warn`-level log line. Defends against memory
-   exhaustion via crafted output.
-2. **Effective policy** — cached per-pane decision from a previous prompt
-   (`Allowed` / `Denied`) overrides the configured `confirm` policy.
-3. **Configured policy** (`clipboard.osc52_set`):
-   - `allow` — pass through unchanged. Documented as insecure.
-   - `confirm` (default) — park the sequence, show a status-bar prompt.
-   - `deny` — drop silently, log.
+## Evidence and Limits
 
-Reads (`OSC 52 ; c ; ?`) default to `deny` because read is the dominant
-attack vector — apps that legitimately need the clipboard contents are
-extremely rare, while malware exfiltrating recent clipboard contents
-(e.g. password manager output) is not.
+The same frame model can be shared only while clients receive the same output
+at the shared dimensions. Attach, resize and lost-output handling must establish
+a valid redraw baseline; optional render diffing is not a capability-discovery
+layer.
 
-### Multi-client behaviour
+Child `?2026` windows coalesce output-driven redraws until close or approximately
+33 ms. The parser continues updating during that interval, so an unrelated
+forced redraw can reveal partial application output. Shared-client delivery does
+not make this a privately staged, atomic application frame.
 
-When a clipboard set is allowed, the OSC 52 envelope is forwarded to
-**every** attached client. This matches user expectation: detaching from
-laptop A and attaching from laptop B should still result in the laptop-B
-host emulator seeing the clipboard set. The downside is that on
-multi-client detached/reattach scenarios, the clipboard write happens on
-both clients' machines.
-
-## OSC 4 / 10 / 11 / 12 — colour queries
-
-When ezpn has a theme override active (palette set on `Pane.theme_palette`),
-queries are answered multiplexer-side with the theme's colours. When no
-theme override is active, queries pass through to the host emulator.
-
-This avoids the failure mode where `bat`/`delta` auto-detect light vs dark
-based on the host emulator's bg, but the user has applied a dark theme
-inside ezpn — the apps would render with the wrong colour scheme.
-
-Per-tab themes are out of scope for v0.12.x. The active palette is
-session-wide.
-
-## OSC 7 — cwd
-
-When a shell emits OSC 7 (`\e]7;file://host/path\e\\`), ezpn parses the
-URI, percent-decodes the path, and stores `(path, instant_now)` on the
-pane. `live_cwd()` consults this first; if it's older than 30 s, falls
-back to procfs polling.
-
-Shell snippets to emit OSC 7 — `bash`, `zsh`, `fish` — are documented in
-each shell's wiki entry; `fish >= 3.x` and `zsh` with `vcs_info` already
-emit OSC 7 by default in many distros. ezpn does not modify the user's
-shell config.
-
-### Forgery safety
-
-OSC 7 input is treated as untrusted: the path is only used for status-bar
-display and the "open new pane here" action. It is not passed to system
-calls without normalisation, and a hostile process printing a fake OSC 7
-can at most mislead the user about the cwd of its own pane.
+The [release audit](audits/v0.14.0.md) records unresolved tiny/wide parser
+regressions and the actual PTY/SSH coverage. These contracts are not a claim of
+universal GUI-emulator support, successful clipboard delivery to every client,
+or a fully passing compatibility certification.

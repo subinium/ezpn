@@ -4,9 +4,10 @@
 //!
 //! # Version negotiation
 //!
-//! Every server-accepted connection MUST emit an [`S_VERSION`] frame as the
-//! very first message. The client then replies with [`C_HELLO`] before any
-//! other traffic. If the major version disagrees the server replies with
+//! Every authenticated connection emits an [`S_VERSION`] frame first.
+//! Negotiating clients reply with [`C_HELLO`] before attaching; v1 framed
+//! attach requests and out-of-band ping/kill requests remain supported.
+//! If the major version disagrees the server replies with
 //! [`S_INCOMPAT`] and closes the connection. Minor-version mismatch is
 //! tolerated: additive payload fields are forward-compatible.
 //!
@@ -60,7 +61,144 @@ pub const PROTO_MAJOR: u16 = 1;
 pub const PROTO_MINOR: u16 = 0;
 
 /// Maximum message payload size (16 MB).
-const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
+pub const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
+const READ_WINDOW: usize = 8 * 1024;
+const GROWTH_WINDOW: usize = 64 * 1024;
+
+/// A socket operation budget shared by every read/write in one exchange.
+/// Socket timeouts alone restart after each partial transfer.
+#[cfg(unix)]
+pub struct DeadlineStream<'a> {
+    stream: &'a std::os::unix::net::UnixStream,
+    deadline: std::time::Instant,
+}
+
+#[cfg(unix)]
+impl<'a> DeadlineStream<'a> {
+    pub fn new(stream: &'a std::os::unix::net::UnixStream, timeout: std::time::Duration) -> Self {
+        Self {
+            stream,
+            deadline: std::time::Instant::now() + timeout,
+        }
+    }
+
+    fn remaining(&self) -> io::Result<std::time::Duration> {
+        self.deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "socket operation deadline exceeded",
+                )
+            })
+    }
+
+    fn wait(&self, events: libc::c_short) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        loop {
+            let timeout = self.remaining()?.as_millis().max(1).min(i32::MAX as u128) as i32;
+            let mut poll = libc::pollfd {
+                fd: self.stream.as_raw_fd(),
+                events,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut poll, 1, timeout) };
+            if ready > 0 {
+                return Ok(());
+            }
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Read for DeadlineStream<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        use std::os::fd::AsRawFd;
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            self.wait(libc::POLLIN)?;
+            // Per-call nonblocking I/O preserves the other half's flags.
+            // Repeated SO_RCVTIMEO updates fail with EINVAL on macOS after
+            // peer close even while received bytes are still buffered.
+            let n = unsafe {
+                libc::recv(
+                    self.stream.as_raw_fd(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if n >= 0 {
+                return Ok(n as usize);
+            }
+            let error = io::Error::last_os_error();
+            if !matches!(
+                error.kind(),
+                io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+            ) {
+                return Err(error);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Write for DeadlineStream<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        use std::os::fd::AsRawFd;
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            self.wait(libc::POLLOUT)?;
+            let n = unsafe {
+                libc::send(
+                    self.stream.as_raw_fd(),
+                    buf.as_ptr().cast(),
+                    buf.len(),
+                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                )
+            };
+            if n >= 0 {
+                return Ok(n as usize);
+            }
+            let error = io::Error::last_os_error();
+            if !matches!(
+                error.kind(),
+                io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+            ) {
+                return Err(error);
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+/// Idle connections may wait indefinitely, but a started frame must finish.
+#[cfg(unix)]
+pub fn read_socket_msg(stream: &std::os::unix::net::UnixStream) -> io::Result<(u8, Vec<u8>)> {
+    let mut first = [0];
+    (&*stream).read_exact(&mut first)?;
+    let deadline = DeadlineStream::new(stream, std::time::Duration::from_secs(2));
+    read_msg(&mut first.as_slice().chain(deadline))
+}
+
+/// Clamp dimensions before allocating terminal grids, not in the wire codec.
+pub fn normalize_size(cols: u16, rows: u16) -> (u16, u16) {
+    (cols.clamp(1, 1000), rows.clamp(1, 500))
+}
 
 /// Write a length-prefixed framed message.
 pub fn write_msg(w: &mut impl Write, tag: u8, payload: &[u8]) -> io::Result<()> {
@@ -71,8 +209,7 @@ pub fn write_msg(w: &mut impl Write, tag: u8, payload: &[u8]) -> io::Result<()> 
         ));
     }
     let len = (payload.len() as u32).to_be_bytes();
-    w.write_all(&[tag])?;
-    w.write_all(&len)?;
+    w.write_all(&[tag, len[0], len[1], len[2], len[3]])?;
     if !payload.is_empty() {
         w.write_all(payload)?;
     }
@@ -80,23 +217,62 @@ pub fn write_msg(w: &mut impl Write, tag: u8, payload: &[u8]) -> io::Result<()> 
 }
 
 /// Read a length-prefixed framed message. Returns `(tag, payload)`.
+#[inline]
 pub fn read_msg(r: &mut impl Read) -> io::Result<(u8, Vec<u8>)> {
-    let mut tag = [0u8; 1];
-    r.read_exact(&mut tag)?;
-    let mut len_buf = [0u8; 4];
-    r.read_exact(&mut len_buf)?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_PAYLOAD {
+    read_msg_limited(r, MAX_PAYLOAD)
+}
+
+/// Limit control-plane frames without changing the v1 data-plane cap.
+#[inline]
+pub fn read_msg_limited(r: &mut impl Read, limit: usize) -> io::Result<(u8, Vec<u8>)> {
+    let mut header = [0u8; 5];
+    r.read_exact(&mut header)?;
+    let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+    if len > limit.min(MAX_PAYLOAD) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("message too large: {} bytes", len),
         ));
     }
-    let mut payload = vec![0u8; len];
-    if len > 0 {
-        r.read_exact(&mut payload)?;
+    // Take preserves the next frame while allowing Read's standard Vec-fill
+    // specialization for small payloads. Generic readers still get initialized
+    // buffers from the standard library.
+    if len <= READ_WINDOW {
+        let mut payload = Vec::with_capacity(len);
+        r.take(len as u64).read_to_end(&mut payload)?;
+        if payload.len() != len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "incomplete frame payload",
+            ));
+        }
+        return Ok((header[0], payload));
     }
-    Ok((tag[0], payload))
+    // Medium frames use one bounded read buffer; large advertised frames
+    // still need payload progress before additional allocation.
+    if len <= GROWTH_WINDOW {
+        let mut payload = vec![0u8; len];
+        r.read_exact(&mut payload)?;
+        return Ok((header[0], payload));
+    }
+    Ok((header[0], read_large_payload(r, len)?))
+}
+
+#[cold]
+fn read_large_payload(r: &mut impl Read, len: usize) -> io::Result<Vec<u8>> {
+    // A header alone reserves at most 8 KiB. Only after that prefix arrives
+    // may capacity grow, always at most 64 KiB beyond completed reads.
+    let mut payload = vec![0u8; READ_WINDOW];
+    r.read_exact(&mut payload)?;
+    while payload.len() < len {
+        let received = payload.len();
+        let next_len = (received + GROWTH_WINDOW).min(len);
+        // Avoid Vec's geometric capacity growth getting ahead of received data.
+        payload.reserve_exact(next_len - received);
+        payload.resize(next_len, 0);
+        r.read_exact(&mut payload[received..])?;
+    }
+    Ok(payload)
 }
 
 /// Encode a terminal resize as 4 bytes: `[cols_hi][cols_lo][rows_hi][rows_lo]`.
@@ -108,7 +284,7 @@ pub fn encode_resize(cols: u16, rows: u16) -> [u8; 4] {
 
 /// Decode a terminal resize from 4 bytes.
 pub fn decode_resize(payload: &[u8]) -> Option<(u16, u16)> {
-    if payload.len() < 4 {
+    if payload.len() != 4 {
         return None;
     }
     let cols = u16::from_be_bytes([payload[0], payload[1]]);
@@ -252,6 +428,7 @@ pub enum FirstByteKind {
 #[allow(dead_code)] // wired by the server-side commit follow-up to #57
 pub fn classify_first_byte(b: u8) -> FirstByteKind {
     match b {
+        b' ' | b'\t' | b'\r' | b'\n' => FirstByteKind::LegacyJson,
         0x00..=0x20 => FirstByteKind::Tag,
         b'{' | b'[' => FirstByteKind::LegacyJson,
         _ => FirstByteKind::Unknown,
@@ -318,10 +495,9 @@ pub enum HandshakeOutcome {
 ///
 /// Reads the first frame (must be [`S_VERSION`]), then writes a
 /// [`C_HELLO`] advertising [`PROTO_MAJOR`] / [`PROTO_MINOR`] and
-/// [`CLIENT_FEATURES`]. If the server replies with [`S_INCOMPAT`] before
-/// or after our hello (some servers may push [`S_INCOMPAT`] without
-/// reading our hello first when they detect a legacy first byte) the
-/// outcome is [`HandshakeOutcome::Incompat`].
+/// [`CLIENT_FEATURES`]. An initial [`S_INCOMPAT`] is returned immediately.
+/// There is no v1 hello acknowledgement; callers must also handle a later
+/// [`S_INCOMPAT`] in their normal message loop.
 ///
 /// A major-version mismatch where the server's major is greater than
 /// ours is reported as [`HandshakeOutcome::Incompat`] synthesized
@@ -399,6 +575,297 @@ pub fn parse_client_hello(payload: &[u8]) -> io::Result<ClientHello> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_payload_windows_preserve_boundaries_and_following_frames() {
+        for size in [
+            0,
+            1,
+            READ_WINDOW - 1,
+            READ_WINDOW,
+            READ_WINDOW + 1,
+            READ_WINDOW * 8 + 1,
+            READ_WINDOW + GROWTH_WINDOW - 1,
+            READ_WINDOW + GROWTH_WINDOW,
+            READ_WINDOW + GROWTH_WINDOW + 1,
+            READ_WINDOW + GROWTH_WINDOW * 2 + 1,
+        ] {
+            let payload: Vec<u8> = (0..size).map(|index| index as u8).collect();
+            let mut wire = Vec::new();
+            write_msg(&mut wire, S_OUTPUT, &payload).unwrap();
+            write_msg(&mut wire, S_EXIT, &[]).unwrap();
+            let mut reader = std::io::Cursor::new(wire);
+            assert_eq!(read_msg(&mut reader).unwrap(), (S_OUTPUT, payload));
+            assert_eq!(read_msg(&mut reader).unwrap(), (S_EXIT, Vec::new()));
+        }
+    }
+
+    #[test]
+    fn header_only_large_frame_requests_at_most_one_initialized_window() {
+        struct HeaderOnly {
+            header: std::io::Cursor<[u8; 5]>,
+            payload_requested: usize,
+        }
+        impl Read for HeaderOnly {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if self.header.position() < 5 {
+                    return self.header.read(buffer);
+                }
+                self.payload_requested = buffer.len();
+                assert!(buffer.len() <= READ_WINDOW);
+                assert!(buffer.iter().all(|byte| *byte == 0));
+                Ok(0)
+            }
+        }
+        let length = (MAX_PAYLOAD as u32).to_be_bytes();
+        let mut reader = HeaderOnly {
+            header: std::io::Cursor::new([S_OUTPUT, length[0], length[1], length[2], length[3]]),
+            payload_requested: 0,
+        };
+        assert_eq!(
+            read_msg(&mut reader).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(reader.payload_requested, READ_WINDOW);
+    }
+
+    #[test]
+    fn header_only_small_frame_allocation_is_bounded_to_64k() {
+        struct HeaderOnly {
+            header: std::io::Cursor<[u8; 5]>,
+            requested: usize,
+        }
+        impl Read for HeaderOnly {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                if self.header.position() < 5 {
+                    return self.header.read(bytes);
+                }
+                self.requested = bytes.len();
+                assert!(bytes.len() <= GROWTH_WINDOW);
+                assert!(bytes.iter().all(|byte| *byte == 0));
+                Ok(0)
+            }
+        }
+        let length = (GROWTH_WINDOW as u32).to_be_bytes();
+        let mut reader = HeaderOnly {
+            header: std::io::Cursor::new([S_OUTPUT, length[0], length[1], length[2], length[3]]),
+            requested: 0,
+        };
+        assert_eq!(
+            read_msg(&mut reader).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(reader.requested, GROWTH_WINDOW);
+    }
+
+    #[test]
+    fn small_vec_fill_retries_interrupts_and_preserves_frame_boundaries() {
+        struct Fragmented {
+            wire: std::io::Cursor<Vec<u8>>,
+            chunk: usize,
+            interrupt: bool,
+        }
+        impl Read for Fragmented {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if std::mem::replace(&mut self.interrupt, false) {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                self.interrupt = true;
+                let count = buffer.len().min(self.chunk);
+                self.wire.read(&mut buffer[..count])
+            }
+        }
+        for size in [0, 1, 257, 4096, READ_WINDOW] {
+            for chunk in [1, 7, 1024] {
+                let expected: Vec<u8> = (0..size).map(|i| i as u8).collect();
+                let mut wire = Vec::new();
+                write_msg(&mut wire, S_OUTPUT, &expected).unwrap();
+                write_msg(&mut wire, S_EXIT, &[]).unwrap();
+                let mut reader = Fragmented {
+                    wire: std::io::Cursor::new(wire),
+                    chunk,
+                    interrupt: true,
+                };
+                let (tag, payload) = read_msg(&mut reader).unwrap();
+                assert_eq!(tag, S_OUTPUT);
+                assert_eq!(payload, expected);
+                assert!(payload.capacity() <= READ_WINDOW);
+                assert_eq!(reader.wire.position(), (size + 5) as u64);
+                assert_eq!(read_msg(&mut reader).unwrap(), (S_EXIT, Vec::new()));
+            }
+        }
+    }
+
+    #[test]
+    fn small_vec_fill_exposes_only_initialized_bounded_storage() {
+        struct HeaderOnly {
+            header: std::io::Cursor<[u8; 5]>,
+            requested: usize,
+        }
+        impl Read for HeaderOnly {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if self.header.position() < 5 {
+                    return self.header.read(buffer);
+                }
+                self.requested = buffer.len();
+                assert!(buffer.len() <= READ_WINDOW);
+                assert!(buffer.iter().all(|byte| *byte == 0));
+                Ok(0)
+            }
+        }
+        for size in [1, 4096, READ_WINDOW] {
+            let bytes = (size as u32).to_be_bytes();
+            let mut reader = HeaderOnly {
+                header: std::io::Cursor::new([S_OUTPUT, bytes[0], bytes[1], bytes[2], bytes[3]]),
+                requested: 0,
+            };
+            assert_eq!(
+                read_msg(&mut reader).unwrap_err().kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+            assert!(reader.requested > 0 && reader.requested <= size);
+        }
+    }
+
+    #[test]
+    fn truncated_small_and_large_payloads_are_not_accepted() {
+        for size in [1, READ_WINDOW, READ_WINDOW + 1, READ_WINDOW * 2 + 1] {
+            let mut wire = Vec::new();
+            write_msg(&mut wire, S_OUTPUT, &vec![b'x'; size]).unwrap();
+            wire.pop();
+            assert_eq!(
+                read_msg(&mut wire.as_slice()).unwrap_err().kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+        }
+    }
+
+    #[test]
+    fn large_frame_growth_requires_payload_progress_and_stays_bounded() {
+        struct PrefixOnly {
+            header: std::io::Cursor<[u8; 5]>,
+            delivered: usize,
+            requests: Vec<usize>,
+        }
+        impl Read for PrefixOnly {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if self.header.position() < 5 {
+                    return self.header.read(buffer);
+                }
+                self.requests.push(buffer.len());
+                assert!(buffer.iter().all(|byte| *byte == 0));
+                if self.delivered == 0 {
+                    assert!(buffer.len() <= READ_WINDOW);
+                    buffer.fill(b'x');
+                    self.delivered += buffer.len();
+                    Ok(buffer.len())
+                } else {
+                    assert!(buffer.len() <= GROWTH_WINDOW);
+                    Ok(0)
+                }
+            }
+        }
+        let length = (MAX_PAYLOAD as u32).to_be_bytes();
+        let mut reader = PrefixOnly {
+            header: std::io::Cursor::new([S_OUTPUT, length[0], length[1], length[2], length[3]]),
+            delivered: 0,
+            requests: Vec::new(),
+        };
+        assert_eq!(
+            read_msg(&mut reader).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(reader.requests, [READ_WINDOW, GROWTH_WINDOW]);
+        assert_eq!(reader.delivered, READ_WINDOW);
+    }
+
+    #[test]
+    fn per_call_limit_rejects_payload_before_reading_body() {
+        let wire = [S_OUTPUT, 0, 0, 0, 9];
+        assert_eq!(
+            read_msg_limited(&mut wire.as_slice(), 8)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        let wire = [S_OUTPUT, 1, 0, 0, 1];
+        assert_eq!(
+            read_msg_limited(&mut wire.as_slice(), usize::MAX)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn framed_header_is_batched_and_handles_short_writes() {
+        #[derive(Default)]
+        struct Writer {
+            bytes: Vec<u8>,
+            requested: Vec<usize>,
+        }
+        impl Write for Writer {
+            fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+                self.requested.push(buffer.len());
+                let count = buffer.len().min(2);
+                self.bytes.extend_from_slice(&buffer[..count]);
+                Ok(count)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut writer = Writer::default();
+        write_msg(&mut writer, S_OUTPUT, b"abc").unwrap();
+        assert_eq!(writer.requested[0], 5);
+        assert_eq!(writer.bytes, [S_OUTPUT, 0, 0, 0, 3, b'a', b'b', b'c']);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deadline_reader_drains_frames_after_peer_close() {
+        let (client, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
+        write_msg(&mut server, S_OUTPUT, b"last output").unwrap();
+        write_msg(&mut server, S_EXIT, &[]).unwrap();
+        drop(server);
+        let mut io = DeadlineStream::new(&client, std::time::Duration::from_secs(1));
+        assert_eq!(
+            read_msg(&mut io).unwrap(),
+            (S_OUTPUT, b"last output".to_vec())
+        );
+        assert_eq!(read_msg(&mut io).unwrap().0, S_EXIT);
+        assert_eq!(
+            read_msg(&mut io).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_deadline_is_not_reset_by_partial_reads() {
+        use std::time::{Duration, Instant};
+        let (client, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            let frame = [S_OUTPUT, 0, 0, 0, 20];
+            server.write_all(&frame).unwrap();
+            for _ in 0..20 {
+                if server.write_all(b"x").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(15));
+            }
+        });
+        let start = Instant::now();
+        assert!(read_msg(&mut DeadlineStream::new(&client, Duration::from_millis(50))).is_err());
+        assert!(start.elapsed() < Duration::from_millis(250));
+        drop(client);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn resize_rejects_trailing_bytes() {
+        assert_eq!(decode_resize(&[0, 80, 0, 24, 1]), None);
+    }
 
     #[test]
     fn attach_request_round_trip() {
@@ -614,6 +1081,8 @@ mod tests {
         assert_eq!(classify_first_byte(b'{'), FirstByteKind::LegacyJson);
         // JSON arrays would also be a legacy marker.
         assert_eq!(classify_first_byte(b'['), FirstByteKind::LegacyJson);
+        assert_eq!(classify_first_byte(b' '), FirstByteKind::LegacyJson);
+        assert_eq!(classify_first_byte(b'\n'), FirstByteKind::LegacyJson);
 
         // Anything else: protocol violation.
         assert_eq!(classify_first_byte(b'A'), FirstByteKind::Unknown);

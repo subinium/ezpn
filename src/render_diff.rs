@@ -1,420 +1,295 @@
-//! Cell-grid render diff (issue #93) — opt-in via the `render-diff` feature.
+//! Optional ANSI frame differ for the renderer's bounded output vocabulary.
 //!
-//! Computes the delta between two consecutive cell grids so the server can
-//! emit only changed cells instead of a full ANSI redraw per dirty pane.
-//!
-//! ## Design notes
-//!
-//! - This module is self-contained: it does **not** depend on `render.rs` and
-//!   defines its own minimal [`Cell`] / [`CellGrid`] types. The wire format
-//!   that integrates with the existing pane buffer plumbing lives at the
-//!   call-site (`server.rs`) and is intentionally out of scope here.
-//! - The diff is row-major linear scan: `O(rows * cols)` worst case. That is
-//!   the same complexity as the current full redraw and matches the
-//!   `< 200 µs / frame on 80×24` budget from the issue's acceptance criteria.
-//! - The module exposes a [`MAX_GRID_BYTES`] cap (1 MB per client). When the
-//!   incoming grid exceeds the cap the caller is expected to fall back to
-//!   full-redraw mode for that frame — `diff()` itself does not enforce the
-//!   cap so that test code can still exercise large grids.
-//!
-//! The whole file is gated behind `#[cfg(feature = "render-diff")]` at the
-//! module declaration site (see `src/main.rs`); enabling the feature does
-//! not change any default code path.
+//! This is not a general terminal proxy. Unknown controls, oversized screens,
+//! and incomplete frames pass through unchanged. After bypass, only a full
+//! redraw establishes a new baseline. Callers must force that redraw on attach,
+//! resize, or lost output. Share a baseline only between clients receiving
+//! identical frames at identical terminal dimensions.
 
-use std::fmt;
+use crate::vt100;
 
-/// Maximum total bytes of a single client's previous-frame buffer before the
-/// caller should fall back to full-redraw mode (issue #93 acceptance: 1 MB).
-pub const MAX_GRID_BYTES: usize = 1024 * 1024;
+const MAX_MODEL_BYTES: u64 = 1024 * 1024;
+const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
+const SYNC_END: &[u8] = b"\x1b[?2026l";
 
-/// 16-bit color slot.
-///
-/// Default = `Color::Default` ≈ "use the terminal's current default fg/bg".
-/// Indexed (`Idx`) covers the 256-color palette; `Rgb` covers truecolor.
-/// Kept intentionally narrow — anything richer (blink, hyperlink, etc.) is
-/// out of scope per the issue's "Out of scope: compression of the diff
-/// stream" stance.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum Color {
-    #[default]
-    Default,
-    Idx(u8),
-    Rgb(u8, u8, u8),
+#[derive(Default)]
+pub struct AnsiFrameDiffer {
+    parser: Option<vt100::Parser>,
 }
 
-/// Cell attributes packed into a single byte.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct Attrs(u8);
-
-impl Attrs {
-    pub const BOLD: u8 = 1 << 0;
-    pub const ITALIC: u8 = 1 << 1;
-    pub const UNDERLINE: u8 = 1 << 2;
-    pub const INVERSE: u8 = 1 << 3;
-
-    pub const fn empty() -> Self {
-        Self(0)
-    }
-
-    pub const fn new(bits: u8) -> Self {
-        Self(bits)
-    }
-
-    pub const fn bits(self) -> u8 {
-        self.0
-    }
-
-    pub const fn contains(self, flag: u8) -> bool {
-        self.0 & flag != 0
-    }
-}
-
-/// A single rendered cell. `ch` is a `char` (not a byte) so that wide
-/// characters survive the diff intact; `is_continuation` marks the trailing
-/// half of a wide cell (its `ch` is meaningless and skipped when emitting).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Cell {
-    pub ch: char,
-    pub fg: Color,
-    pub bg: Color,
-    pub attrs: Attrs,
-    pub is_continuation: bool,
-}
-
-impl Default for Cell {
-    fn default() -> Self {
-        Self {
-            ch: ' ',
-            fg: Color::Default,
-            bg: Color::Default,
-            attrs: Attrs::empty(),
-            is_continuation: false,
+impl AnsiFrameDiffer {
+    /// Full redraws and bypasses preserve original bytes and side effects.
+    /// Sparse diffs are wrapped in one synchronized-update block.
+    pub fn encode(&mut self, frame: &[u8], cols: u16, rows: u16, full_redraw: bool) -> Vec<u8> {
+        // Budget both grids plus row metadata before allocation, not overall RSS.
+        let estimate =
+            u64::from(rows) * u64::from(cols) * std::mem::size_of::<vt100::Cell>() as u64 * 2
+                + u64::from(rows) * 128;
+        if cols == 0 || rows == 0 || estimate > MAX_MODEL_BYTES || !supported_frame(frame) {
+            self.parser = None;
+            return frame.to_vec();
         }
-    }
-}
-
-/// Row-major cell grid: `cells[row * cols + col]`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CellGrid {
-    rows: u16,
-    cols: u16,
-    cells: Vec<Cell>,
-}
-
-impl CellGrid {
-    /// Build an all-default grid sized `rows × cols`.
-    pub fn new(rows: u16, cols: u16) -> Self {
-        let total = rows as usize * cols as usize;
-        Self {
-            rows,
-            cols,
-            cells: vec![Cell::default(); total],
+        if self
+            .parser
+            .as_ref()
+            .is_some_and(|p| p.screen().size() != (rows, cols))
+        {
+            self.parser = None;
         }
-    }
-
-    /// Build a grid from an existing flat row-major `Vec<Cell>`.
-    pub fn from_cells(rows: u16, cols: u16, cells: Vec<Cell>) -> Result<Self, GridError> {
-        let expected = rows as usize * cols as usize;
-        if cells.len() != expected {
-            return Err(GridError::SizeMismatch {
-                expected,
-                got: cells.len(),
-            });
+        if full_redraw {
+            let mut parser = vt100::Parser::new(rows, cols, 0);
+            parser.process(frame);
+            self.parser = Some(parser);
+            return frame.to_vec();
         }
-        Ok(Self { rows, cols, cells })
-    }
-
-    pub fn rows(&self) -> u16 {
-        self.rows
-    }
-
-    pub fn cols(&self) -> u16 {
-        self.cols
-    }
-
-    pub fn cells(&self) -> &[Cell] {
-        &self.cells
-    }
-
-    pub fn get(&self, row: u16, col: u16) -> Option<&Cell> {
-        if row >= self.rows || col >= self.cols {
-            return None;
+        let Some(parser) = &mut self.parser else {
+            return frame.to_vec();
+        };
+        let previous = parser.screen().clone();
+        parser.process(frame);
+        let delta = parser.screen().state_diff(&previous);
+        if delta.is_empty() {
+            return Vec::new();
         }
-        self.cells
-            .get(row as usize * self.cols as usize + col as usize)
-    }
-
-    pub fn set(&mut self, row: u16, col: u16, cell: Cell) -> Result<(), GridError> {
-        if row >= self.rows || col >= self.cols {
-            return Err(GridError::OutOfBounds { row, col });
+        if delta.len() + SYNC_BEGIN.len() + SYNC_END.len() >= frame.len() {
+            return frame.to_vec();
         }
-        self.cells[row as usize * self.cols as usize + col as usize] = cell;
-        Ok(())
-    }
-
-    /// Approximate byte footprint — used for the [`MAX_GRID_BYTES`] cap.
-    pub fn byte_size(&self) -> usize {
-        self.cells.len() * std::mem::size_of::<Cell>()
+        let mut output = Vec::with_capacity(delta.len() + SYNC_BEGIN.len() + SYNC_END.len());
+        output.extend_from_slice(SYNC_BEGIN);
+        output.extend_from_slice(&delta);
+        output.extend_from_slice(SYNC_END);
+        output
     }
 }
 
-/// Errors raised by the diff machinery.
-#[derive(Debug, PartialEq, Eq)]
-pub enum GridError {
-    SizeMismatch { expected: usize, got: usize },
-    OutOfBounds { row: u16, col: u16 },
-    DimensionMismatch { prev: (u16, u16), next: (u16, u16) },
-}
-
-impl fmt::Display for GridError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::SizeMismatch { expected, got } => {
-                write!(
-                    f,
-                    "cell vec size {} does not match grid size {}",
-                    got, expected
-                )
-            }
-            Self::OutOfBounds { row, col } => {
-                write!(f, "cell ({}, {}) out of bounds", row, col)
-            }
-            Self::DimensionMismatch { prev, next } => write!(
-                f,
-                "grid dimensions changed: prev={}x{} next={}x{}",
-                prev.0, prev.1, next.0, next.1
-            ),
-        }
-    }
-}
-
-impl std::error::Error for GridError {}
-
-/// One changed cell in a diff: position + new value.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CellDelta {
-    pub row: u16,
-    pub col: u16,
-    pub cell: Cell,
-}
-
-/// Result of [`diff`]: either a list of changed cells or a "full redraw"
-/// signal when the dimensions changed (or the prev grid was absent).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Diff {
-    /// Caller should emit the full new grid (e.g. first frame, resize, or
-    /// over-cap fallback).
-    FullRedraw,
-    /// Sparse list of changed cells. Empty vec = no-op frame.
-    Cells(Vec<CellDelta>),
-}
-
-impl Diff {
-    /// True if this diff carries no actual updates.
-    pub fn is_noop(&self) -> bool {
-        matches!(self, Diff::Cells(c) if c.is_empty())
-    }
-
-    /// Number of cells that would actually be emitted (0 for `FullRedraw`,
-    /// since the caller streams the whole grid via a different path).
-    pub fn changed_cells(&self) -> usize {
-        match self {
-            Diff::FullRedraw => 0,
-            Diff::Cells(c) => c.len(),
-        }
-    }
-}
-
-/// Compute the delta from `prev` → `next`.
-///
-/// Behaviour:
-/// - `prev` is `None` (first frame for this client) → [`Diff::FullRedraw`].
-/// - dimensions differ → [`Diff::FullRedraw`] (caller must reseed prev).
-/// - identical grids → `Diff::Cells(vec![])` (caller MAY skip the frame).
-/// - otherwise → list of every `(row, col)` whose cell differs.
-///
-/// Wide-character continuation cells are emitted alongside their lead so the
-/// caller can re-print both halves atomically.
-pub fn diff(prev: Option<&CellGrid>, next: &CellGrid) -> Diff {
-    let Some(prev) = prev else {
-        return Diff::FullRedraw;
+/// Only accept complete UTF-8 text and the CSI vocabulary emitted by render.rs.
+/// OSC, DCS, alternate-screen, cursor-shape, and unknown SGR must not be lost.
+fn supported_frame(frame: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(frame) else {
+        return false;
     };
-    if prev.rows != next.rows || prev.cols != next.cols {
-        return Diff::FullRedraw;
-    }
-
-    let cols = next.cols;
-    let mut deltas = Vec::new();
-    for (idx, (p, n)) in prev.cells.iter().zip(next.cells.iter()).enumerate() {
-        if p != n {
-            let row = (idx / cols as usize) as u16;
-            let col = (idx % cols as usize) as u16;
-            deltas.push(CellDelta { row, col, cell: *n });
+    for ch in text.chars() {
+        if ch.is_control() && ch != '\x1b' {
+            return false;
         }
     }
-
-    Diff::Cells(deltas)
-}
-
-/// Apply a diff to `prev` in place, producing the post-frame grid.
-///
-/// `FullRedraw` requires the caller to pass the new grid via `full`. This
-/// helper exists so chaos-test code (per #93's risk note) can sanity-check
-/// that `apply(diff(p, n)) == n` for all `p, n`.
-pub fn apply(prev: &mut CellGrid, diff: &Diff, full: Option<&CellGrid>) -> Result<(), GridError> {
-    match diff {
-        Diff::FullRedraw => {
-            let Some(full) = full else {
-                return Err(GridError::DimensionMismatch {
-                    prev: (prev.rows, prev.cols),
-                    next: (0, 0),
-                });
-            };
-            *prev = full.clone();
-            Ok(())
-        }
-        Diff::Cells(cells) => {
-            for d in cells {
-                prev.set(d.row, d.col, d.cell)?;
+    let mut index = 0;
+    while index < frame.len() {
+        match frame[index] {
+            0x1b => {
+                if frame.get(index + 1) != Some(&b'[') {
+                    return false;
+                }
+                let start = index + 2;
+                let mut end = start;
+                while frame.get(end).is_some_and(|b| (0x20..=0x3f).contains(b)) {
+                    end += 1;
+                }
+                let Some(&command) = frame.get(end) else {
+                    return false;
+                };
+                let params = &frame[start..end];
+                let supported = match command {
+                    b'H' | b'f' | b'J' | b'K' => {
+                        params.iter().all(|b| b.is_ascii_digit() || *b == b';')
+                    }
+                    b'h' | b'l' => params == b"?25" || params == b"?2026",
+                    b'm' => supported_sgr(params),
+                    _ => false,
+                };
+                if !supported {
+                    return false;
+                }
+                index = end + 1;
             }
-            Ok(())
+            0..=0x1f | 0x7f => return false,
+            _ => {
+                let start = index;
+                while frame.get(index).is_some_and(|b| *b >= 0x20 && *b != 0x7f) {
+                    index += 1;
+                }
+                let run = &text[start..index];
+                // vt100 0.16.2 appends zero-width scalars only while a cell's
+                // UTF-8 payload is below 18 bytes. UI labels can exceed it.
+                let mut cell_bytes = 0;
+                for ch in run.chars() {
+                    if unicode_width::UnicodeWidthChar::width(ch) == Some(0) {
+                        if cell_bytes == 0 || cell_bytes >= 18 {
+                            return false;
+                        }
+                        cell_bytes += ch.len_utf8();
+                    } else {
+                        cell_bytes = ch.len_utf8();
+                    }
+                }
+                // Measure only printed text, not escape bytes or CSI parameters.
+                // vt100 is cell/codepoint based, not a grapheme-cluster terminal.
+                let scalar_width: usize = run
+                    .chars()
+                    .map(|ch| unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0))
+                    .sum();
+                if unicode_width::UnicodeWidthStr::width(run) != scalar_width {
+                    return false;
+                }
+            }
         }
     }
+    true
 }
 
-/// Test the cap from issue #93 — caller uses this to decide whether to
-/// fall back to full-redraw mode.
-pub fn exceeds_cap(grid: &CellGrid) -> bool {
-    grid.byte_size() > MAX_GRID_BYTES
+fn supported_sgr(params: &[u8]) -> bool {
+    let Ok(params) = std::str::from_utf8(params) else {
+        return false;
+    };
+    let mut parts = params.split(';');
+    while let Some(part) = parts.next() {
+        let Ok(code) = (if part.is_empty() { "0" } else { part }).parse::<u16>() else {
+            return false;
+        };
+        match code {
+            0
+            | 1
+            | 3
+            | 4
+            | 7
+            | 22
+            | 23
+            | 24
+            | 27
+            | 30..=37
+            | 39
+            | 40..=47
+            | 49
+            | 90..=97
+            | 100..=107 => {}
+            38 | 48 => {
+                let count = match parts.next() {
+                    Some("5") => 1,
+                    Some("2") => 3,
+                    _ => return false,
+                };
+                for _ in 0..count {
+                    if parts.next().and_then(|s| s.parse::<u8>().ok()).is_none() {
+                        return false;
+                    }
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn cell(ch: char) -> Cell {
-        Cell {
-            ch,
-            ..Cell::default()
+    fn full(text: &str) -> Vec<u8> {
+        format!("\x1b[?2026h\x1b[0m\x1b[2J\x1b[1;1H{text}\x1b[?25l\x1b[?2026l").into_bytes()
+    }
+
+    #[test]
+    fn reliability_diff_replays_unicode_attributes_and_cursor() {
+        let mut differ = AnsiFrameDiffer::default();
+        let mut expected = vt100::Parser::new(4, 40, 0);
+        let mut actual = vt100::Parser::new(4, 40, 0);
+        let first = full("\x1b[1;38;2;10;20;30m한e\u{301}🙂 tail\x1b[0m");
+        assert_eq!(differ.encode(&first, 40, 4, true), first);
+        expected.process(&first);
+        actual.process(&first);
+        for text in [
+            "\x1b[3;31m한e\u{301}🙂 changed\x1b[0m",
+            "short",
+            "\x1b[4;7mCJK 字\x1b[0m",
+        ] {
+            let frame = full(text);
+            expected.process(&frame);
+            actual.process(&differ.encode(&frame, 40, 4, false));
+            assert_eq!(
+                actual.screen().state_formatted(),
+                expected.screen().state_formatted()
+            );
+        }
+        let cursor = b"\x1b[3;10H\x1b[?25h";
+        expected.process(cursor);
+        actual.process(&differ.encode(cursor, 40, 4, false));
+        assert_eq!(
+            actual.screen().cursor_position(),
+            expected.screen().cursor_position()
+        );
+        assert_eq!(
+            actual.screen().hide_cursor(),
+            expected.screen().hide_cursor()
+        );
+    }
+
+    #[test]
+    fn reliability_unchanged_frame_is_noop_and_sparse_change_is_smaller() {
+        let mut differ = AnsiFrameDiffer::default();
+        let first = full(&"a".repeat(200));
+        differ.encode(&first, 80, 24, true);
+        assert!(differ.encode(&first, 80, 24, false).is_empty());
+        let changed = full(&format!("b{}", "a".repeat(199)));
+        let delta = differ.encode(&changed, 80, 24, false);
+        assert!(delta.len() < changed.len());
+        assert!(delta.starts_with(SYNC_BEGIN) && delta.ends_with(SYNC_END));
+    }
+
+    #[test]
+    fn reliability_unknown_sequences_bypass_until_full_redraw() {
+        for unknown in [
+            b"\x1b[3 q".as_slice(),
+            b"\x1b]52;c;dGVzdA==\x07",
+            b"\x1b[?1049h",
+            b"\x1bPpayload\x1b\\",
+            b"\x1b[9mstrike",
+            b"\x1b[",
+            b"\xff",
+            "👩\u{200d}💻".as_bytes(),
+            "♥\u{fe0f}".as_bytes(),
+            "e\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}".as_bytes(),
+        ] {
+            let mut differ = AnsiFrameDiffer::default();
+            let first = full("hello");
+            differ.encode(&first, 80, 24, true);
+            assert_eq!(differ.encode(unknown, 80, 24, false), unknown);
+            assert_eq!(differ.encode(&first, 80, 24, false), first);
+            assert_eq!(differ.encode(&first, 80, 24, true), first);
+            assert!(differ.encode(&first, 80, 24, false).is_empty());
         }
     }
 
-    fn grid_filled(rows: u16, cols: u16, ch: char) -> CellGrid {
-        let cells = vec![cell(ch); rows as usize * cols as usize];
-        CellGrid::from_cells(rows, cols, cells).unwrap()
-    }
-
     #[test]
-    fn first_frame_is_full_redraw() {
-        let next = grid_filled(2, 2, 'a');
-        assert_eq!(diff(None, &next), Diff::FullRedraw);
-    }
-
-    #[test]
-    fn dimension_change_forces_full_redraw() {
-        let prev = grid_filled(2, 2, 'a');
-        let next = grid_filled(3, 3, 'a');
-        assert_eq!(diff(Some(&prev), &next), Diff::FullRedraw);
-    }
-
-    #[test]
-    fn identical_grids_yield_empty_diff() {
-        let prev = grid_filled(4, 4, 'x');
-        let next = grid_filled(4, 4, 'x');
-        let d = diff(Some(&prev), &next);
-        assert!(d.is_noop());
-        assert_eq!(d.changed_cells(), 0);
-    }
-
-    #[test]
-    fn single_cell_change_emits_single_delta() {
-        let prev = grid_filled(3, 5, ' ');
-        let mut next = prev.clone();
-        next.set(1, 2, cell('X')).unwrap();
-
-        let d = diff(Some(&prev), &next);
-        match d {
-            Diff::Cells(c) => {
-                assert_eq!(c.len(), 1);
-                assert_eq!(c[0].row, 1);
-                assert_eq!(c[0].col, 2);
-                assert_eq!(c[0].cell.ch, 'X');
-            }
-            _ => panic!("expected Cells diff"),
+    fn reliability_resize_attach_and_extreme_sizes_require_raw_redraw() {
+        let mut differ = AnsiFrameDiffer::default();
+        let first = full("hello");
+        differ.encode(&first, 80, 24, true);
+        assert_eq!(
+            differ.encode(&first, 80, 24, true),
+            first,
+            "attach cannot receive a no-op"
+        );
+        assert_eq!(differ.encode(&first, 40, 12, false), first);
+        assert_eq!(differ.encode(&first, 40, 12, false), first);
+        for (cols, rows) in [(0, 24), (80, 0), (u16::MAX, u16::MAX)] {
+            assert_eq!(differ.encode(&first, cols, rows, true), first);
+            assert!(differ.parser.is_none());
         }
     }
 
     #[test]
-    fn full_row_change_emits_one_delta_per_col() {
-        let prev = grid_filled(2, 4, ' ');
-        let mut next = prev.clone();
-        for c in 0..4 {
-            next.set(1, c, cell('=')).unwrap();
+    fn reliability_sgr_validation_is_lossless_not_permissive() {
+        assert!(supported_sgr(b"1;38;2;255;0;12;48;5;200;0"));
+        for params in [
+            b"2".as_slice(),
+            b"5",
+            b"9",
+            b"38;2;256;0;0",
+            b"38;5",
+            b"4:3",
+            b"999999",
+        ] {
+            assert!(!supported_sgr(params));
         }
-        assert_eq!(diff(Some(&prev), &next).changed_cells(), 4);
-    }
-
-    #[test]
-    fn apply_roundtrip_yields_identical_grid() {
-        let prev = grid_filled(8, 8, ' ');
-        let mut next = prev.clone();
-        next.set(0, 0, cell('A')).unwrap();
-        next.set(7, 7, cell('Z')).unwrap();
-        next.set(3, 4, cell('M')).unwrap();
-
-        let d = diff(Some(&prev), &next);
-        let mut applied = prev.clone();
-        apply(&mut applied, &d, None).unwrap();
-        assert_eq!(applied, next);
-    }
-
-    #[test]
-    fn full_redraw_apply_requires_full_grid() {
-        let prev = grid_filled(2, 2, ' ');
-        let next = grid_filled(3, 3, ' ');
-        let d = diff(Some(&prev), &next);
-        assert_eq!(d, Diff::FullRedraw);
-
-        let mut applied = prev.clone();
-        let err = apply(&mut applied, &d, None).unwrap_err();
-        assert!(matches!(err, GridError::DimensionMismatch { .. }));
-
-        apply(&mut applied, &d, Some(&next)).unwrap();
-        assert_eq!(applied, next);
-    }
-
-    #[test]
-    fn out_of_bounds_set_is_rejected() {
-        let mut g = grid_filled(2, 2, ' ');
-        let err = g.set(5, 5, cell('q')).unwrap_err();
-        assert!(matches!(err, GridError::OutOfBounds { .. }));
-    }
-
-    #[test]
-    fn size_mismatch_is_rejected() {
-        let err = CellGrid::from_cells(2, 2, vec![cell(' '); 3]).unwrap_err();
-        assert!(matches!(err, GridError::SizeMismatch { .. }));
-    }
-
-    #[test]
-    fn cap_check_is_threshold_inclusive() {
-        // Below cap.
-        let small = CellGrid::new(10, 10);
-        assert!(!exceeds_cap(&small));
-    }
-
-    #[test]
-    fn attrs_bitwise_helpers() {
-        let a = Attrs::new(Attrs::BOLD | Attrs::ITALIC);
-        assert!(a.contains(Attrs::BOLD));
-        assert!(a.contains(Attrs::ITALIC));
-        assert!(!a.contains(Attrs::UNDERLINE));
-        assert_eq!(a.bits(), Attrs::BOLD | Attrs::ITALIC);
-    }
-
-    #[test]
-    fn color_default_distinct_from_zero_idx() {
-        // Sanity: indexed black (0) is NOT the same as Default.
-        assert_ne!(Color::Default, Color::Idx(0));
     }
 }

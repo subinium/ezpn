@@ -6,19 +6,22 @@
 //! the helpers in via `#[path]` so `tests/common/mod.rs` stays at the
 //! conventional location.
 //!
-//! Every scenario in this suite spawns the real `ezpn` binary and talks to
-//! it over a real Unix socket. They depend on the daemon honoring the
-//! `EZPN_TEST_SOCKET_DIR` environment variable so each test uses an isolated
-//! tempdir. Until that wiring lands in `src/main.rs` (tracked in this same
-//! issue), each scenario is gated with `#[ignore]` so `cargo test` is green
-//! by default.
+//! All scenarios execute against isolated real processes and Unix sockets.
+//! PTY scenarios also run the actual interactive client on a controlling TTY.
+
+#![cfg(unix)]
 
 #[path = "../common/mod.rs"]
 mod common;
 
+#[path = "../../src/vt100/mod.rs"]
+mod vt100;
+
 mod attach_smoke;
+mod cli_reliability;
 mod detach_reattach;
 mod ipc_version;
 mod kill_session;
 mod multi_client;
 mod signal_handling;
+mod terminal_reliability;

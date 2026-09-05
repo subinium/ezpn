@@ -12,7 +12,7 @@ cargo test
 cargo run -- 2 2          # try a 2x2 grid
 ```
 
-MSRV: **Rust 1.82**.
+MSRV: **Rust 1.88.0**, tested explicitly rather than through the pinned development toolchain.
 
 ## Workflow
 
@@ -36,10 +36,7 @@ MSRV: **Rust 1.82**.
 4. **Run pre-CI locally before pushing:**
 
    ```bash
-   cargo fmt -- --check
-   cargo clippy --all-targets -- -D warnings
-   cargo test
-   cargo build --release
+   python3 scripts/preflight.py --mode ci --ssh optional
    ```
 
    Optional but encouraged for `perf/`:
@@ -96,7 +93,7 @@ Body explains *why*. The diff explains *what*.
 ## Release & versioning
 
 - Semantic versioning. `0.MINOR.PATCH` until 1.0.
-- Releases are cut from `main` via annotated tags (`vX.Y.Z`) + `gh release create` + `cargo publish`.
+- Releases are cut from verified `main` via immutable annotated tags (`vX.Y.Z`). The Release workflow is the single publisher; do not also run local `cargo publish`.
 - See [`MAINTENANCE.md`](MAINTENANCE.md) for the full release pipeline.
 
 ## Module anatomy
@@ -105,22 +102,20 @@ The `src/` tree is grouped by concern, not by layer. Start at `main.rs` and foll
 
 ```
 src/
-├── main.rs                # ~140 lines, dispatcher only
-├── direct.rs              # `--no-daemon` entry: terminal setup → app::event_loop::run
-├── cli/
-│   ├── mod.rs
-│   ├── parse.rs           # parse_args, parse_args_from, parse_procfile, Config, LayoutSpec
-│   └── help.rs            # --help text (verbatim)
-├── app/                   # foreground (`--no-daemon`) runtime
-│   ├── mod.rs
-│   ├── state.rs           # InputMode, TextSelection, DragState, RenderUpdate, SnapshotExtra
-│   ├── render_ctl.rs      # frame composition, dirty-set helpers, geometry math
-│   ├── lifecycle.rs       # spawn/split/replace/resize/snapshot/clipboard helpers
-│   ├── bootstrap.rs       # build_initial_state + Procfile + command_launches
-│   ├── attach.rs          # cmd_ls/kill/rename/attach/init/from/doctor handlers
-│   ├── input_dispatch.rs  # handle_ipc_command (out-of-band command dispatch)
-│   └── event_loop.rs      # run() — main input → render loop
-├── server.rs              # daemon runtime (#17 will split this further)
+├── main.rs                # executable dispatch and terminal prerequisites
+├── cli.rs                 # shared checked argument parser and help
+├── attach.rs              # CLI session/workspace commands and read-only doctor
+├── bootstrap.rs           # foreground runtime, pane lifecycle and shared state
+├── server/
+│   ├── mod.rs             # daemon lifecycle, PTY drain and paced rendering
+│   ├── handshake.rs       # bounded accept/handshake workers
+│   ├── connection.rs      # client input and ordered byte-bounded output
+│   ├── input_modes.rs     # modal keyboard handling
+│   ├── actions.rs         # typed command dispatch
+│   ├── mouse.rs           # click, selection and mouse-report routing
+│   ├── ext_handlers.rs    # extended control commands
+│   ├── render_glue.rs     # frame composition and overlays
+│   └── status_bar.rs      # bounded declarative status-bar formatting
 ├── client.rs              # attach client
 ├── layout.rs              # layout tree, navigation, separator hit-testing
 ├── pane.rs                # PTY-backed pane
@@ -129,19 +124,25 @@ src/
 ├── theme.rs               # TOML theme + truecolor/256/16 downgrade
 ├── workspace.rs           # snapshot save/load, TabSnapshot, PaneSnapshot
 ├── tab.rs                 # multi-tab manager
-├── project.rs             # .ezpn.toml loader + env interpolation
+├── project.rs             # .ezpn.toml layout and launch resolution
+├── env_interp.rs          # expansion and external-value sensitivity tracking
 ├── session.rs             # session naming, socket paths, auto-attach
 ├── ipc.rs                 # ezpn-ctl IPC channel
 ├── protocol.rs            # wire protocol (client ↔ daemon)
-├── signals.rs             # SIGINT / SIGTERM handling
-├── snapshot_blob.rs       # v3 scrollback codec
+├── signals.rs             # signal wakeups and handler lifetime
+├── terminal_state.rs      # streaming terminal extension state
+├── vt100/                 # private MIT parser with documented boundary fixes
 ├── copy_mode.rs           # tmux-style copy mode
 ├── config.rs              # ~/.config/ezpn/config.toml loader
 └── bin/
     └── ezpn-ctl.rs        # `ezpn-ctl` companion binary
 ```
 
-When adding a helper, ask: does it mutate `(Layout, panes)`? Goes in `app/lifecycle.rs`. Is it render orchestration? `app/render_ctl.rs`. Is it a CLI subcommand handler? `app/attach.rs`. Otherwise pick the smallest existing module that already imports the same dependencies — don't create a new file for one function.
+Keep shared pane lifecycle helpers in `bootstrap.rs`, daemon-only rendering in
+`server/render_glue.rs`, and CLI session commands in `attach.rs`. Follow existing
+ownership boundaries and avoid unrelated extraction while fixing behavior.
+Changes to bundled `vt100` require upstream provenance and real boundary
+regressions; do not silently replace it with an unpatched registry dependency.
 
 ## Code of conduct
 
