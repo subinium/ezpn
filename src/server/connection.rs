@@ -456,6 +456,8 @@ mod transport_tests {
     #[test]
     fn input_burst_larger_than_queue_is_delivered_without_disconnect() {
         let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         let (tx, rx) = mpsc::sync_channel(1);
         let bytes = Arc::new(AtomicUsize::new(0));
         let closed = Arc::new(AtomicBool::new(false));
@@ -465,14 +467,19 @@ mod transport_tests {
             closed: Arc::clone(&closed),
         };
         let worker = std::thread::spawn(move || client_reader(server, tx, bytes, closed));
-        for width in 1..=256 {
-            protocol::write_msg(
-                &mut peer,
-                protocol::C_RESIZE,
-                &protocol::encode_resize(width, 24),
-            )
-            .unwrap();
-        }
+        // Linux accounts socket writes by packet overhead, not just payload
+        // bytes. Drain concurrently so the test cannot deadlock the producer
+        // against the deliberately one-slot application queue.
+        let producer = std::thread::spawn(move || {
+            for width in 1..=256 {
+                protocol::write_msg(
+                    &mut peer,
+                    protocol::C_RESIZE,
+                    &protocol::encode_resize(width, 24),
+                )
+                .unwrap();
+            }
+        });
         for expected in 1..=256 {
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
             loop {
@@ -488,7 +495,10 @@ mod transport_tests {
                 }
             }
         }
-        drop(peer);
+        // Drop closes backpressure even on an assertion panic; the peer has
+        // its own write deadline, so neither worker can wait indefinitely.
+        drop(receiver);
+        producer.join().unwrap();
         worker.join().unwrap();
     }
 
